@@ -4,6 +4,7 @@ APHCP builds a reusable resource of experimental protein–ligand structures. Th
 
 This repository contains the project source, workflows, migrations, tests, and public configuration templates. Production data, run records, and local deployment settings are managed separately.
 
+- **Independent review:** [review guide](docs/public/review.md) · [verification snapshot](docs/public/status.md).
 - `src/` contains the control interface and local Dashboard.
 - `scripts/` contains metadata, structure, annotation and registration tools.
 - `workflow/`, `migrations/`, and `tests/` contain workflow definitions, the SQLite schema and verification code.

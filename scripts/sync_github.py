@@ -6,11 +6,14 @@ import re
 import subprocess
 import tempfile
 
+from public_review_status import SOURCES, STATUS, render, runtime_fingerprint
+
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = 'https://github.com/BZJRDXY/APHCP.git'
 BRANCH = 'refs/heads/main'
 SYNCED = 'refs/aphcp/github-public'
 RULE = 'docs/governance/代码同步规则.md'
+REVIEW_GUIDE = 'docs/public/review.md'
 TOP = {'.gitattributes', '.gitignore', 'pyproject.toml', 'requirements-local.txt', 'requirements-server.txt', 'LICENSE', '.streamlit/config.toml'}
 CONFIG = {'deployment.example.yaml', 'project.yaml', 'environment.yaml', 'temporal_split.yaml'}
 SECRET = re.compile(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|'
@@ -35,7 +38,7 @@ def git(*args, env=None, data=None, allow_missing=False):
 
 def included(name):
     p = PurePosixPath(name)
-    if name in TOP or name == RULE or name == 'workflow/Snakefile':
+    if name in TOP or name in {RULE, REVIEW_GUIDE, 'workflow/Snakefile'}:
         return True
     if len(p.parts) < 2 or any(part.startswith('.') for part in p.parts):
         return False
@@ -47,7 +50,7 @@ def included(name):
             group == 'config' and len(p.parts) == 2 and p.name in CONFIG)
 
 
-def snapshot():
+def snapshot(require_receipts=False):
     source = set(git('ls-files', '--cached', '--others', '--exclude-standard', '-z').decode('utf8').split('\0'))
     readme = 'README.github.md' if (ROOT/'README.github.md').is_file() else 'README.md'
     source.add(readme)
@@ -73,9 +76,21 @@ def snapshot():
         if SECRET.search(data) or len(data) > 2_000_000:
             raise ValueError(f'Review this file before publishing: {name}')
         payload['README.md' if name == readme else name] = data
-    required = {'README.md', RULE, 'pyproject.toml', 'scripts/sync_github.py', 'src/aphcp_control/__main__.py'}
+    required = {'README.md', RULE, REVIEW_GUIDE, 'pyproject.toml', 'scripts/sync_github.py',
+                'src/aphcp_control/__main__.py'}
     if not required <= payload.keys():
         raise ValueError(f'Missing public source: {sorted(required - payload.keys())}')
+    fingerprint = runtime_fingerprint(payload)
+    if (ROOT / SOURCES).is_file():
+        payload[STATUS] = render(ROOT, fingerprint).encode('utf-8')
+    elif require_receipts:
+        raise ValueError('Publish from the project workspace with its accepted private receipt selection.')
+    else:
+        payload[STATUS] = (ROOT / STATUS).read_bytes()
+        if f'Public runtime fingerprint (SHA-256): `{fingerprint}`'.encode() not in payload[STATUS]:
+            raise ValueError('Published status does not cover this checkout; regenerate from accepted receipts.')
+    if SECRET.search(payload[STATUS]):
+        raise ValueError('Private value in generated public status')
     return payload
 
 
@@ -120,16 +135,23 @@ def sync(new_tree, message):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--push', action='store_true', help='publish the verified source snapshot')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--push', action='store_true', help='publish the verified source snapshot')
+    mode.add_argument('--show-status', action='store_true', help='preview the exact generated public summary')
     parser.add_argument('--expect-tree', help='abort if the current snapshot differs from a reviewed tree')
     parser.add_argument('--message', default='Sync APHCP project code')
     args = parser.parse_args()
-    payload = snapshot(); new_tree = tree(payload)
+    payload = snapshot(require_receipts=args.push)
+    if args.show_status:
+        print(payload[STATUS].decode('utf-8'), end='')
+        return
+    new_tree = tree(payload)
     if args.expect_tree and args.expect_tree != new_tree:
         parser.error('working snapshot changed since preview')
     print(f'Public tree: {new_tree} ({len(payload)} files)', flush=True)
     if args.push:
         sync(new_tree, args.message)
+        (ROOT / STATUS).write_bytes(payload[STATUS])
     else:
         print('\n'.join(sorted(payload)))
 

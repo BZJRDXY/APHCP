@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 .snakemake/
 config/deployment.local.yaml
+config/public_review_sources.local.json
 .streamlit/secrets.toml
 *.sqlite
 *.sqlite3
