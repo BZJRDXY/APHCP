@@ -1,0 +1,12 @@
+ssh:
+  host: aphcp.example.org
+  user: aphcp
+  identity: ~/.ssh/id_ed25519
+  connect_timeout: 6
+server:
+  base_python: /opt/aphcp/env/bin/python
+  code_root: /srv/aphcp/code
+  data_root: /srv/aphcp/data
+  upstream_root: /srv/aphcp/upstream
+dashboard:
+  refresh_seconds: 10

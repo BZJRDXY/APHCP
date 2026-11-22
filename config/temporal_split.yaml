@@ -1,0 +1,11 @@
+version: temporal-draft-v002
+cutoff_date: '2021-09-30'
+cutoff_status: ACCEPTED_V3
+comparison_field: entry_release_date
+comparison_field_status: PROVISIONAL_REQUIRES_CONFIRMATION
+pre_cutoff_operator: null
+post_cutoff_operator: null
+validation_source: null
+split_rules_status: PENDING_DECISION_BEFORE_PRODUCTION
+missing_date_status: TEMPORAL_DATE_UNKNOWN
+enabled_for_production: false

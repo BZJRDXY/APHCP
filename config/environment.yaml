@@ -1,0 +1,8 @@
+local:
+  python_verified: 3.13.9
+  lock: requirements-local.txt
+server:
+  python_target: 3.10.21
+  journal_mode: delete
+  lock: requirements-server.txt
+  acceptance: pending_server_approval

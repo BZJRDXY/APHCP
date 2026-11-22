@@ -1,0 +1,38 @@
+<style>
+.stApp {font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;}
+[data-testid="stHeader"] {background: rgba(245,248,252,.90);}
+[data-testid="stMainBlockContainer"] {max-width: 1376px; padding: 3.55rem clamp(1rem,3vw,3rem) 3rem;}
+[data-testid="stSidebarContent"] {border-right:1px solid #284158;}
+[data-testid="stSidebarUserContent"] {padding-top:1.7rem;}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {color:#b8c9da;}
+[data-testid="stSidebar"] [role="radiogroup"] {gap:.28rem;}
+[data-testid="stSidebar"] [role="radiogroup"] label {padding:.35rem .42rem; margin-right:.3rem; border-radius:.5rem;}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {background:#223e55;}
+.ap-brand {display:flex;align-items:center;gap:.75rem;margin-bottom:1rem;}
+.ap-mark {font-weight:750;color:#072334;background:#65d3dc;border-radius:.6rem;width:2.2rem;height:2.2rem;display:grid;place-items:center;}
+.ap-brand strong {color:#f5faff;letter-spacing:.085em;font-size:1.23rem;}
+.ap-brand small {color:#adbdce;display:block;font-size:.73rem;margin-top:.1rem;}
+.ap-hero {border-radius:1.15rem;padding:1.45rem clamp(1rem,3vw,2.25rem);color:#f7fdff;background:radial-gradient(ellipse at 92% -35%,#227980 0%,transparent 55%),linear-gradient(105deg,#132d4a,#19465f 75%);border:1px solid #224c63;position:relative;overflow:hidden;}
+.ap-hero::after {content:'';position:absolute;right:-70px;top:-158px;width:355px;height:355px;border:1px solid #77bed238;border-radius:50%;box-shadow:0 0 0 27px #77bed215,0 0 0 58px #77bed211;pointer-events:none;}
+.ap-hero h1 {color:#f3faff;font-size:clamp(1.5rem,4vw,2.25rem);padding:0;margin:.24rem 0 .38rem;line-height:1.18;letter-spacing:-.03em;}
+.ap-hero p {color:#d4e6ee;font-size:.92rem;margin:0;max-width:61ch;line-height:1.55;}
+.ap-kicker {font-size:.66rem;font-weight:750;letter-spacing:.13em;color:#86e6e7;}
+.ap-compact {margin:.28rem 0 .45rem;}
+.ap-compact h1 {font-size:clamp(1.55rem,4vw,2.1rem);padding:0;}
+.ap-compact p {color:#51667d;margin:0;font-size:.86rem;}
+.ap-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;}
+.ap-grid.three {grid-template-columns:repeat(3,minmax(0,1fr));}
+.ap-metric {background:#fff;border:1px solid #dce7f0;border-radius:.85rem;padding:.85rem 1rem;min-width:0;box-shadow:0 3px 10px #153b6410;}
+.ap-metric label {display:block;color:#52687d;font-size:.78rem;font-weight:650;}
+.ap-value {display:block;color:#13324e;font-size:clamp(1.16rem,2.5vw,1.85rem);font-weight:740;letter-spacing:-.035em;margin:.12rem 0 .06rem;overflow-wrap:anywhere;}
+.ap-metric small {color:#536b82;font-size:.71rem;line-height:1.35;display:block;}
+.ap-badge {display:inline-flex;align-items:center;gap:.35rem;font-size:.73rem;font-weight:700;border-radius:1rem;padding:.13rem .62rem;line-height:1.45;white-space:normal;}
+.ap-good {color:#085b50;background:#dff3ec;}.ap-warn {color:#85420b;background:#fff0d4;}.ap-bad {color:#8c2f37;background:#fde8e9;}.ap-neutral {color:#3b5470;background:#e7eff8;}
+.ap-strip {display:flex;flex-wrap:wrap;gap:.35rem .6rem;align-items:center;margin:.1rem 0 .25rem;font-size:.78rem;color:#45617a;}
+.ap-step {display:grid;grid-template-columns:2rem 1fr auto;align-items:center;gap:.66rem;border-top:1px solid #e2eaf3;padding:.63rem 0;}
+.ap-step:first-child{border-top:0;}.ap-step b{font-size:.87rem;color:#18364e;}.ap-step small{display:block;color:#587088;font-size:.72rem;}
+.ap-step .ap-num {font-variant-numeric:tabular-nums;font-size:.72rem;font-weight:700;color:#157486;border-radius:.5rem;background:#e6f4f7;display:grid;place-items:center;width:1.8rem;height:1.8rem;}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stPlotlyChart"]{min-width:0;}
+@media(max-width:900px){.ap-grid,.ap-grid.three{grid-template-columns:repeat(2,minmax(0,1fr));}.ap-value{font-size:1.35rem;}}
+@media(max-width:640px){[data-testid="stMainBlockContainer"]{padding:3.5rem .8rem 1.7rem;}.ap-hero{padding:1.05rem;}.ap-grid,.ap-grid.three{gap:.42rem;}.ap-metric{padding:.6rem;}.ap-metric label{font-size:.70rem;}.ap-metric small{font-size:.66rem;}.ap-step{grid-template-columns:1.6rem 1fr;gap:.46rem;}.ap-step .ap-badge{grid-column:2;justify-self:start;}[data-testid="stMain"] [data-testid="stHorizontalBlock"] {flex-wrap:wrap;}[data-testid="stMain"] [data-testid="stColumn"]{flex:1 1 235px;min-width:0;}}
+</style>

@@ -1,0 +1,13 @@
+project: APHCP
+config_version: setup-m0-v004
+authority: V3.0
+authority_document: 'docs/APHCP_长期蛋白配体资源平台与模块化项目管理方案.md'
+workspace_root: '.'
+physical_data_root: /srv/aphcp/data
+environment_lock: /srv/aphcp/code/deploy/environment.lock
+stage: M0_COMPLETED
+active_batch: null
+metadata_inventory_approved: false
+coordinate_download_approved: false
+atlas_asset_import_approved: false
+production_approved: false

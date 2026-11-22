@@ -1,0 +1,30 @@
+import os
+import shlex
+import sys
+from pathlib import Path
+
+
+ROOT = Path(workflow.basedir).parent
+TEST_ROOT = Path(config["test_root"]).resolve()
+PYTHON = sys.executable
+FIXTURE = ROOT / "tests" / "fixtures" / "m0_work_items.json"
+DONE = str(TEST_ROOT / "reports" / "snakemake.done.json")
+
+
+rule all:
+    input:
+        DONE
+
+
+rule m0_recovery_smoke:
+    output:
+        DONE
+    run:
+        options = ["env", "PYTHONPATH=" + str(ROOT / "src"), PYTHON, "-B",
+                   "-m", "aphcp_control", "--data-root", str(TEST_ROOT), "trial",
+                   "--fixture", str(FIXTURE), "--git-commit", config["commit"],
+                   "--env-lock", config["environment_lock"]]
+        if "interrupt_after" in config:
+            options += ["--interrupt-after", str(config["interrupt_after"])]
+        Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
+        shell(shlex.join(options) + " > " + shlex.quote(output[0]))
