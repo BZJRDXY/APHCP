@@ -101,16 +101,16 @@ def observation(row, entry, review, original_role_evidence, roots):
 
 
 def add_batch(db, run, seal, started):
-    label = run.name
+    label = seal.get("label", run.name)
     db.execute('INSERT INTO config_version VALUES (?,?,?)', (label, digest(seal), str(run/'frozen_catalog.json')))
-    db.execute('''INSERT INTO batch(id,module_id,status,source_release,input_manifest,config_version,candidate_count)
+    db.execute('''INSERT OR IGNORE INTO batch(id,module_id,status,source_release,input_manifest,config_version,candidate_count)
                   VALUES (?,'holo','OBSERVATIONS_STAGED','wwPDB-fixed-mmCIF',?,?,?)''',
-               (label, str(run/'frozen_catalog.json'), label, seal['expected']))
-    db.execute('INSERT INTO task VALUES (?,?,?,?,?)', (label, label, 'Holo 结构观察目录', label, 'OBSERVATIONS_STAGED'))
+               (run.name, str(run/'frozen_catalog.json'), label, seal['expected']))
+    db.execute('INSERT INTO task VALUES (?,?,?,?,?)', (label, run.name, 'Holo 结构观察目录', label, 'OBSERVATIONS_STAGED'))
     db.execute('''INSERT INTO run(id,batch_id,task_id,status,git_commit,code_version,config_version,config_hash,
                   source_release,input_manifest_hash,environment_lock_hash,host,start_time_utc,report_path,input_records)
                   VALUES (?,?,?,'OBSERVATIONS_STAGED',?,?,?,?,?,?,?,?,?,?,?)''',
-               (label, label, label, seal['git_head'], VERSION, label, digest(seal), 'wwPDB-fixed-mmCIF', digest(seal),
+               (label, run.name, label, seal['git_head'], VERSION, label, digest(seal), 'wwPDB-fixed-mmCIF', digest(seal),
                 seal['runtime_hash'], 'Pro5000', started, str(run/'catalog_receipt.json'), seal['expected']))
 
 
@@ -134,7 +134,7 @@ def add_observation(db, label, sid, row, entry, stamp):
     if previous:
         saved = json.loads(previous['error_message'])
         require(saved['identity'] == json.loads(json.dumps(ident)), 'observation_key_collision')
-        rank = {'OBSERVED': 0, 'PREPARATION_USE_RECORDED': 1, 'REVIEW': 2, 'REGISTERED': 3, 'CONFLICT': 4}
+        rank = {'OBSERVED': 0, 'PREPARATION_USE_RECORDED': 1, 'REVIEW': 2, 'REGISTERED': 3, 'CONFLICT': 4, 'TECHNICAL_FAILURE': -1}
         if rank[row['status']] > rank[saved['status']]:
             saved, row = row | {'aliases': saved.get('aliases', [])}, saved
         saved.setdefault('aliases', []).append({k: row[k] for k in ('key', 'evidence_layer', 'status', 'files')})
@@ -217,23 +217,113 @@ def build(args):
     print(json.dumps(receipt))
 
 
-def lookup(args):
-    run = args.run.resolve()
-    root = run.parent.parent
-    with connect(database(frozen_registry_root(root, run)), readonly=True) as db:
-        if args.pdb:
-            matches = db.execute('SELECT error_message FROM run_item WHERE run_id=? AND stage=? AND pdb_id=? ORDER BY object_id',
-                                 (run.name, STAGE, args.pdb.upper()))
-        else:
-            matches = db.execute('SELECT error_message FROM run_item WHERE run_id=? AND stage=? AND object_id=?',
-                                 (run.name, STAGE, args.system))
-        rows = [json.loads(x[0]) for x in matches]
-    if args.verify_files:
-        for row in rows:
-            for asset in row.get('files', {}).values():
-                file_ref(asset['path'], (root/'runs',), asset.get('sha256'))
-    print(json.dumps(rows, ensure_ascii=False))
+def append_increment(root, run, seed, evidence_path, chemistry_path, git_head):
+    """Append one increment to its isolated copy of the previous catalog."""
+    from types import SimpleNamespace
 
+    started = time.monotonic()
+    dbpath = database(frozen_registry_root(root, run, create=True))
+    seed_path, seed_hash = seed_registry(root, run, SimpleNamespace(seed_run=seed))
+    if not dbpath.exists():
+        backup(seed_path, dbpath)
+    label = run.name + '-observations'
+    data = read(evidence_path)
+    reviews_path = run/'review_results.json'
+    reviews = {key(r): r for r in read(reviews_path)} if reviews_path.exists() else {}
+    classified = {key(r): r['classification'] for r in jsonl(chemistry_path)}
+    require(set(classified) == {key(r) for r in data['candidates']}, 'increment_catalog_chemistry_keys_differ')
+    seal = {'version': VERSION, 'label': label, 'expected': len(data['candidates']), 'git_head': git_head,
+            'runtime_hash': digest(sys.version), 'seed_sha256': seed_hash, 'code_sha256': sha(__file__),
+            'inputs': {str(p): sha(p) for p in (evidence_path, chemistry_path, *([reviews_path] if reviews_path.exists() else []))}}
+    f = run/'frozen_catalog.json'
+    if f.exists():
+        require(read(f) == seal, 'catalog_inputs_changed_use_new_run')
+    else:
+        write(f, seal)
+    with connect(dbpath) as db:
+        db.execute('BEGIN IMMEDIATE')
+        prior = db.execute('SELECT config_hash,error_summary FROM run WHERE id=?', (label,)).fetchone()
+        if prior:
+            require(prior[0] == digest(seal), 'catalog_registry_seal_changed')
+            receipt = json.loads(prior[1])
+        else:
+            add_batch(db, run, seal, utc_now())
+            labels = Counter(); canonical_count = 0; entries = {}
+            stamp = utc_now()
+            for row in data['candidates']:
+                k = key(row); p = k[1]; review = reviews.get(k, {})
+                if p not in entries:
+                    discovery = file_ref(row['discovery_path'], (root/'runs',), row['discovery_sha256'])
+                    entries[p] = read(discovery['path'])
+                entry = entries[p]
+                if row['prior_status'] == 'EXPORTED_READBACK':
+                    known = {k: review, review.get('system_id'): review}
+                    sid, record = observation(row | {'classification': classified[k]}, entry, known,
+                                              row['role_evidence_after'], (root/'runs',))
+                    if sid:
+                        require(not review.get('system_id') or review['system_id'] == sid, 'review_and_observation_identity_conflict')
+                        if review.get('disposition') == 'TECHNICAL_FAILURE':
+                            record.update(status='TECHNICAL_FAILURE', m3_reasons=review['reasons'])
+                else:
+                    status = 'TECHNICAL_FAILURE' if row['prior_status'] == 'EXPORT_TECHNICAL_FAILURE' else 'NOT_EXPORTED'
+                    sid, record = None, {'key': k, 'status': status, 'reason': row.get('export_reason'), 'type': classified[k]}
+                labels[record['status']] += 1
+                canonical_count += add_observation(db, label, sid, record, entry, stamp)
+            for p, evidence in data['entry_evidence'].items():
+                db.execute('INSERT OR IGNORE INTO pdb_entry VALUES (?,?,?)', (p, None, None))
+                db.execute('INSERT INTO run_item VALUES (?,?,?,?,?,?,?,?,?,?)',
+                           (label, 'entry', p, p, STAGE, evidence['state'], None,
+                            json.dumps({'pdb_id': p, 'status': evidence['state'], 'entry_evidence': evidence,
+                                        'source_run': data['source_run']}), None, stamp))
+            require(not db.execute('PRAGMA foreign_key_check').fetchone(), 'catalog_foreign_key_error')
+            duration = round(time.monotonic()-started, 3)
+            receipt = {'status': 'OBSERVATIONS_STAGED', 'source_rows': len(data['candidates']),
+                       'input_entries': len(data['entries']), 'queryable_systems': canonical_count, 'outcomes': dict(labels),
+                       'registry': str(dbpath), 'seed_sha256': seed_hash, 'elapsed_s': duration}
+            db.execute("UPDATE run SET end_time_utc=?,elapsed_seconds=?,success_records=?,uncertain_records=?,error_summary=? WHERE id=?",
+                       (utc_now(), duration, canonical_count, labels['REVIEW']+labels['OBSERVED'], json.dumps(receipt), label))
+    if not (run/'catalog_receipt.json').exists():
+        write(run/'catalog_receipt.json', receipt)
+    return receipt
+
+
+def lookup_records(run, *, pdb=None, system=None, verify_files=False, limit=None):
+    run = Path(run).resolve()
+    root = run.parent.parent
+    require(bool(pdb) != bool(system), 'specify_pdb_or_system')
+    with connect(database(frozen_registry_root(root, run)), readonly=True) as db:
+        column, value = ('pdb_id', pdb.upper()) if pdb else ('object_id', system)
+        grouped = defaultdict(list)
+        for item in db.execute(f'''SELECT run_id,object_id,object_type,error_message FROM run_item
+            WHERE stage=? AND {column}=? ORDER BY object_type DESC, object_id, run_id''', (STAGE, value)):
+            grouped[item['object_type'], item['object_id']].append((item['run_id'], json.loads(item['error_message'])))
+        decisions = defaultdict(list)
+        if any('system_id' in records[0][1] for records in grouped.values()):
+            for rid, path, result in recorded_assessments(db, root/'runs', pdb=pdb.upper() if pdb else None, system=system):
+                if result.get('system_id'):
+                    decisions[result['system_id']].append((rid, path, result))
+        rows = []
+        for records in grouped.values():
+            if limit is not None and len(rows) >= limit:
+                break
+            rid, row = records[-1]
+            if row.get('system_id') in decisions:
+                decision = resolve_decisions(decisions[row['system_id']])
+                row = row | {'status': decision['disposition'], 'm3_reasons': decision.get('reasons', []),
+                             'current_decision_id': decision.get('current_decision_id'), 'decision_state': decision.get('decision_state')}
+            if len(records) > 1 or row.get('entry_evidence'):
+                row = row | {'observations': [{'run': run_id, 'status': r['status'], 'key': r.get('key'),
+                                               'entry_evidence': r.get('entry_evidence')} for run_id, r in records]}
+            if verify_files:
+                for asset in row.get('files', {}).values():
+                    file_ref(asset['path'], (root/'runs',), asset.get('sha256'))
+            rows.append(row)
+    return rows
+
+
+def lookup(args):
+    print(json.dumps(lookup_records(args.run, pdb=args.pdb, system=args.system,
+                                    verify_files=args.verify_files), ensure_ascii=False))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

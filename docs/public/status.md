@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `62fab046341ac930ea5099109f641b8ee1ad38325f72e0256172b5ad3e90eb1f`
+Public runtime fingerprint (SHA-256): `786f8698a5e0197e83343572c8cf25bd15c2c4a50ded2c54340f26321349f24b`
 
 ## M1 · Metadata inventory
 
@@ -25,9 +25,15 @@ Public runtime fingerprint (SHA-256): `62fab046341ac930ea5099109f641b8ee1ad38325
 - **29** candidate systems, **21** structures read back. **4** newly confirmed in this isolated staging batch and **17** held with files retained. These numbers are separate from the historical totals above.
 - A test-only `REVIEW` → `REGISTERED` transition preserved the same system and files, retained both decisions, and was independent of run order. Replaying the real batch reused its outputs.
 
+## M3 · First continuous production batch (unpublished)
+
+- Independently verified: **2026-11-22T18:28:55+00:00**. First release dates from **2018-02-07** (included) to **2018-02-15** (excluded).
+- **359** exact-revision originals verified; **3,844** candidates, **3,497** read back and **3,497** new retrievable systems. **69** confirmed in staging; **3,428** held for review. Unified catalog: **46,525** retrievable systems.
+- **145,717,825 bytes** of archival response bodies; **1456.0 s** for the production pipeline in this window. Replaying the same input reused committed phases. In a separate control, the resume command repaired one failed Entry without modifying prior results.
+
 ## Open review
 
-- Measure sustained throughput on a separately approved production increment; the bounded pilot is not a scale estimate.
+- Reduce repeat Assembly preparation during independent readback for entries with many systems; measure throughput on the next authorized window.
 - Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.
 
 See the [review guide](review.md) for scope, evidence definitions and review instructions.

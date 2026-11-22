@@ -78,6 +78,25 @@ class PublicReviewStatusTest(unittest.TestCase):
         self.assertIn('Current public runtime is not covered by this evidence', page)
         self.assertIn('2026-01-02T01:00:00+00:00', page)
 
+    def test_continuous_summary_requires_replay_and_safe_aggregate(self):
+        values = {'status': 'STAGED_COMPLETE', 'pending_technical': [], 'window': ['2018-02-07', '2018-02-15'],
+                  'verified_utc': '2026-01-04T09:00:00+08:00', 'pipeline_seconds': 123.4,
+                  'frozen_entries': 3, 'originals_verified': 3, 'entry_statuses': {'REVIEW': 3},
+                  'candidates': 5, 'structural_states': {'EXPORTED_READBACK': 4, 'REVIEW': 1},
+                  'review_dispositions': {'REGISTERED': 2, 'REVIEW': 1}, 'archive_network_bytes': 12345,
+                  'new_catalog_queryable': 4, 'catalog_queryable_total': 10, 'same_input_reused': True,
+                  'unified_lookup_verified': True, 'targeted_retry_verified': True,
+                  'examples': ['PRIVATE_EXAMPLE_ID']}
+        self.put('continuous.json', values)
+        self.write(self.root / SOURCES, self.sources | {'m3_continuous_verification': 'continuous.json'})
+        page = render(self.root, self.runtime)
+        self.assertIn('**3** exact-revision originals verified', page)
+        self.assertIn('**4** new retrievable systems', page)
+        self.assertNotIn('PRIVATE_EXAMPLE', page)
+        self.put('continuous.json', values | {'same_input_reused': False})
+        with self.assertRaisesRegex(ValueError, 'Continuous M3 verification or replay is incomplete'):
+            render(self.root, self.runtime)
+
     def test_changed_rollup_or_replay_cannot_be_published(self):
         self.put('rerun.json', self.first | {'database_registration_reused': True, 'results_sha256': 'e'*64})
         with self.assertRaisesRegex(ValueError, 'registration and replay receipts disagree'):

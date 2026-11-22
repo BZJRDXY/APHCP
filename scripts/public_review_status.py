@@ -13,6 +13,7 @@ OBSERVATIONS = (*REGISTRATION, 'OBSERVED', 'PREPARATION_USE_RECORDED')
 PENDING = {
     'm3_new_batch': 'Use a genuinely new input batch to verify registration and chemistry annotation end to end.',
     'm3_effective_decision': 'Verify that lookup selects the effective scientific decision while retaining its history.',
+    'm3_long_tail': 'Reduce repeat Assembly preparation during independent readback for entries with many systems; measure throughput on the next authorized window.',
     'm3_scale': 'Measure sustained throughput on a separately approved production increment; the bounded pilot is not a scale estimate.',
     'm3_connectivity': 'Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.'
 }
@@ -90,6 +91,32 @@ def pilot_section(root, source):
 """
 
 
+def production_section(root, source):
+    batch, _ = receipt(root, source)
+    frozen = count(batch['frozen_entries']); originals = count(batch['originals_verified'])
+    structures = batch['structural_states']; decisions = batch['review_dispositions']
+    fetched = count(batch['archive_network_bytes']); systems = count(batch['new_catalog_queryable'])
+    require(batch['status'] == 'STAGED_COMPLETE' and not batch['pending_technical'] and
+            frozen == originals == sum(map(count, batch['entry_statuses'].values())) and
+            count(batch['candidates']) == sum(map(count, structures.values())) and
+            sum(map(count, decisions.values())) <= count(structures['EXPORTED_READBACK']) and
+            systems <= structures['EXPORTED_READBACK'] and
+            count(batch['catalog_queryable_total']) >= systems and batch['same_input_reused'] is True and
+            batch['unified_lookup_verified'] is True and batch['targeted_retry_verified'] is True,
+            'Continuous M3 verification or replay is incomplete')
+    left, right = map(date.fromisoformat, batch['window'])
+    elapsed = batch['pipeline_seconds']
+    require(left < right and type(elapsed) in (int, float) and 0 < elapsed < 86400 * 30,
+            'Invalid continuous production window or measurement')
+    return f'''## M3 · First continuous production batch (unpublished)
+
+- Independently verified: **{utc(batch['verified_utc'])}**. First release dates from **{left}** (included) to **{right}** (excluded).
+- **{frozen:,}** exact-revision originals verified; **{count(batch['candidates']):,}** candidates, **{structures['EXPORTED_READBACK']:,}** read back and **{systems:,}** new retrievable systems. **{count(decisions.get('REGISTERED',0)):,}** confirmed in staging; **{count(decisions.get('REVIEW',0)):,}** held for review. Unified catalog: **{batch['catalog_queryable_total']:,}** retrievable systems.
+- **{fetched:,} bytes** of archival response bodies; **{elapsed:.1f} s** for the production pipeline in this window. Replaying the same input reused committed phases. In a separate control, the resume command repaired one failed Entry without modifying prior results.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -146,6 +173,7 @@ def render(root: Path, current_runtime: str):
     m1_link = code_link(m1.get('verified_public_runtime_sha256'), current_runtime)
     m3_link = code_link(m3.get('verified_public_runtime_sha256'), current_runtime)
     pilot = pilot_section(root, src['m3_pilot_verification']) if src.get('m3_pilot_verification') else ''
+    production = production_section(root, src['m3_continuous_verification']) if src.get('m3_continuous_verification') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -168,7 +196,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}## Open review
+{pilot}{production}## Open review
 
 {pending}
 

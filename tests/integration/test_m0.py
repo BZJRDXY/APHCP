@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
+from aphcp_control import observation_lookup
 from aphcp_control import transport
 from aphcp_control.queries import query, query_args
 from aphcp_control.registry import backup, connect, database, migrate
@@ -127,7 +128,8 @@ class M0Tests(unittest.TestCase):
         path = ROOT / "src" / "aphcp_dashboard" / "app.py"
         with patch.object(transport, "fetch", side_effect=fixture_query) as read, patch.object(
             transport, "fetch_inventory", return_value={"data": {"state": "absent"}, "queried_at": "测试 UTC 时间"}
-        ) as inventory:
+        ) as inventory, patch.object(observation_lookup, "fetch_observations", return_value={
+                "data": {"state": "absent"}, "queried_at": "测试 UTC 时间"}) as observations:
             app = AppTest.from_file(str(path), default_timeout=12).run()
             self.assertFalse(list(app.exception))
             self.assertEqual(read.call_count, 0, "Receipt-first homepage should not prefetch the registry")
@@ -138,8 +140,20 @@ class M0Tests(unittest.TestCase):
             app.radio(key="nav").set_value("pdb").run()
             app.text_input[0].set_value("1M17")
             next(button for button in app.button if button.label == "查询 PDB").click().run()
-            self.assertTrue(any("三个来源均未找到" in msg.value for msg in app.info))
+            self.assertTrue(any("已查询的来源均未找到" in msg.value for msg in app.info))
             self.assertTrue(inventory.called)
+            self.assertTrue(observations.called)
+            observations.return_value = {"queried_at": "测试 UTC 时间", "data": {
+                "state": "found", "catalog_run": "holo-m3-test-phase-001", "matching": 1, "omitted": 0,
+                "records": [{"status": "REVIEW", "system_id": "test-system", "chemical_type": "UNKNOWN",
+                             "files": {"system_cif": "system.cif"}}]}}
+            next(button for button in app.button if button.label == "刷新本页").click().run()
+            self.assertFalse(list(app.exception))
+            self.assertTrue(any("holo-m3-test-phase-001" in line.value for line in app.caption))
+            self.assertTrue(any("待核" in str(table.value) and "UNKNOWN" in str(table.value) for table in app.dataframe))
+            observations.side_effect = transport.QueryError("离线", "目录断开")
+            next(button for button in app.button if button.label == "刷新本页").click().run()
+            self.assertTrue(any("上次缓存" in line.value and "目录断开" in line.value for line in app.caption))
             app.radio(key="nav").set_value("batches").run()
             before = read.call_count
             read.side_effect = transport.QueryError("离线", "测试断开")

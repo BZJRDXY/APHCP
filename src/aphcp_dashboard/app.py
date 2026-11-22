@@ -13,6 +13,7 @@ import yaml
 
 from aphcp_control import transport
 from aphcp_control.inventory_lookup import canonical_id
+from aphcp_control import observation_lookup
 from aphcp_control.queries import query_args
 from aphcp_dashboard import evidence
 
@@ -114,7 +115,7 @@ def chart(fig, key, height=210):
 
 def server_key(settings):
     ssh, server = settings['ssh'], settings['server']
-    return ssh['user'], ssh['host'], ssh['identity'], server['data_root'], server['code_root']
+    return ssh['user'], ssh['host'], ssh['identity'], server['data_root'], server['code_root'], (settings.get('dashboard', {}).get('observation_catalog') or {}).get('controller')
 
 
 def cached_payload(key, retrieval, settings, *, force=False, ttl=45):
@@ -345,7 +346,7 @@ def m2_page(e):
 
 
 def pdb_page(e, settings, force):
-    heading('PDB 搜索','精确查询：已验收 M1 母表、M2 结构证据和正式 SQLite 分开呈现')
+    heading('PDB 搜索','精确查询：已验收 M1 母表、M2 回执、M3 暂存目录和正式 SQLite 分开呈现')
     if 'pdb_input' not in st.session_state:
         st.session_state.pdb_input=st.query_params.get('pdb','')
     with st.form('pdb_query'):
@@ -372,27 +373,31 @@ def pdb_page(e, settings, force):
     force=submitted or force
     if settings:
         # Start the independent reads together, but mutate Streamlit state on its own thread.
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             preload={}
             for key, fetch in [(('inventory',identifier),lambda:transport.fetch_inventory(settings,identifier)),
-                               (('registry','pdb',identifier),lambda:transport.fetch(settings,'pdb',identifier))]:
+                               (('registry','pdb',identifier),lambda:transport.fetch(settings,'pdb',identifier)),
+                               (('observations',identifier),lambda:observation_lookup.fetch_observations(settings,identifier))]:
                 endpoint=server_key(settings)
                 item=st.session_state.get('registry_cache',{}).get((endpoint,*key)); now=datetime.now(timezone.utc)
                 if force or not item or (now-item['attempted']).total_seconds()>=45:
                     preload[key]=pool.submit(fetch)
             inv=cached_payload(('inventory',identifier),lambda:preload['inventory',identifier].result() if ('inventory',identifier) in preload else transport.fetch_inventory(settings,identifier),settings,force=force)
             reg=cached_payload(('registry','pdb',identifier),lambda:preload['registry','pdb',identifier].result() if ('registry','pdb',identifier) in preload else transport.fetch(settings,'pdb',identifier),settings,force=force)
+            obs=cached_payload(('observations',identifier),lambda:preload['observations',identifier].result() if ('observations',identifier) in preload else observation_lookup.fetch_observations(settings,identifier),settings,force=force)
     else:
         inv=cached_payload(('inventory',identifier),None,settings); reg=registry_fetch(settings,'pdb',identifier)
+        obs=cached_payload(('observations',identifier),None,settings)
     inventory=(inv.get('payload') or {}).get('data') or {}; official=(reg.get('payload') or {}).get('data') or {}
+    observed=(obs.get('payload') or {}).get('data') or {}
     entry=inventory.get('candidate')
     no_entry = '未找到' if inventory.get('state')=='absent' else '未能确认'
     metric_grid([('M1 候选盘点','已盘点' if entry else no_entry,'冻结母表 · 非结构验收'),
                  ('M2 结构证据','已有案例' if cases else '未见本地回执',f'{len(cases)} 份本地案例回执'),
                  ('正式 SQLite','有登记条目' if official.get('entry') else ('无登记条目' if reg.get('payload') else '未能确认'),'登记条目不等于正式结构入库或发布')])
-    if not entry and not cases and not official.get('entry'):
-        if inventory.get('state')=='absent' and reg.get('payload') and not inv.get('stale') and not reg.get('stale'):
-            st.info('三个来源均未找到该 PDB ID。')
+    if not entry and not cases and not official.get('entry') and not observed.get('matching'):
+        if inventory.get('state')=='absent' and reg.get('payload') and not inv.get('stale') and not reg.get('stale') and observed.get('state')=='absent' and not obs.get('stale'):
+            st.info('已查询的来源均未找到该 PDB ID。')
         else: st.info('可用来源未找到；至少一个远端来源不可用或不完整。')
     st.markdown('**M1 · 已验收母表**'); query_status(inv,'M1 只读查询')
     if entry:
@@ -414,6 +419,27 @@ def pdb_page(e, settings, force):
         st.markdown('**M2 · 本地结构证据**')
         for i,item in enumerate(cases):
             with st.container(border=True): case_detail(item, f'pdb-case-{i}')
+    st.markdown('**M3 · 统一结构暂存目录**'); query_status(obs,'统一目录只读查询')
+    if observed.get('using_previous_catalog'):
+        st.caption('新批目录尚未落盘，以下依据上个已完成快照。')
+    if observed.get('matching'):
+        labels={'REGISTERED':'暂存确认','REVIEW':'待核','OBSERVED':'仅结构观察',
+                'OUT_OF_SCOPE':'范围排除','NOT_EXPORTED':'未导出','TECHNICAL_FAILURE':'技术失败'}
+        st.caption(f"{observed['catalog_run']} · {observed['matching']} 条目录记录 · 暂存未发布")
+        rows=observed['records']
+        records([{'状态':labels.get(x['status'],x['status']),'体系':x.get('system_id') or x.get('candidate_key'),
+                  '修订':x.get('revision'),'组装':x.get('assembly'),'配体类型':x.get('chemical_type')} for x in rows],
+                height=230,key='m3-current-observations')
+        if observed['omitted']:
+            st.caption(f"仅显示前 {len(rows)} 条，另有 {observed['omitted']} 条；完整查询用 Pro5000 目录入口。")
+        with st.expander('体系文件和判定依据'):
+            chosen=st.selectbox('选择结构或记录',range(len(rows)),key='m3-observation-detail',
+                format_func=lambda i:rows[i].get('system_id') or rows[i].get('candidate_key') or labels.get(rows[i]['status'],rows[i]['status']))
+            st.json(rows[chosen],expanded=True)
+    elif observed.get('state')=='absent':
+        st.caption('当前统一目录未找到该 PDB。')
+    elif observed.get('state')=='pending':
+        st.caption('当前批次的首个目录快照尚未完成。')
     st.markdown('**正式 SQLite 明细**'); query_status(reg,'登记查询')
     if official.get('entry'):
         for name,label in [('entry','登记条目'),('versions','结构版本'),('files','文件及取数'),('history','阶段记录')]:

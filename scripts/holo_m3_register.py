@@ -434,7 +434,17 @@ def seed_registry(root,current,args):
     with connect(db,readonly=True) as con:
         require(con.execute('SELECT COUNT(*) FROM release').fetchone()[0]==0,'seed_registry_not_unpublished')
         row=con.execute('SELECT output_manifest_hash FROM run WHERE id=?',(source.name+'-run',)).fetchone()
-        require(row and sha(source/'review_results.json')==row[0],'seed_run_manifest_mismatch')
+        if row:
+            require(sha(source/'review_results.json') == row[0], 'seed_run_manifest_mismatch')
+        else:
+            for label in (source.name+'-observations', source.name):
+                record = con.execute('SELECT config_hash,error_summary FROM run WHERE id=? AND status=?',
+                                     (label, 'OBSERVATIONS_STAGED')).fetchone()
+                if record:
+                    require(digest(read(source/'frozen_catalog.json')) == record[0] and
+                            read(source/'catalog_receipt.json') == json.loads(record[1]), 'seed_catalog_manifest_mismatch')
+                    break
+            require(record, 'seed_run_manifest_missing')
     return db.resolve(),sha(db)
 
 

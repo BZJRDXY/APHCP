@@ -10,3 +10,8 @@ server:
   upstream_root: /srv/aphcp/upstream
 dashboard:
   refresh_seconds: 10
+  # Optional: copy to deployment.local.yaml and supply the deployed staging Run names.
+  # observation_catalog:
+  #   controller: holo-m3-production-example
+  #   code_run: holo-m3-execution-example
+  #   python_relative_to_code_root: venv/bin/python
