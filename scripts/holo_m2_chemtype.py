@@ -967,10 +967,63 @@ def execute(run,ref,jobs,controls_only=False):
     print(f'annotated: {len(base_ids)} baseline / {len(new_ids)} incremental candidates / {len(entries)} entries; {summary["elapsed_s"]} s',flush=True)
 
 
+def annotate_batch(evidence_path, reference_run, output, jobs):
+    """Classify a frozen candidate batch with the validated historical method and references."""
+    start=time.monotonic(); src=load(evidence_path); records=src['candidates']; batch=src['batch']
+    ids={(r['pdb_id'],r['candidate_key']) for r in records}
+    if (len(ids)!=len(records) or len(records)!=src['expected_candidates'] or
+            len(set(src['entries']))!=len(src['entries']) or len(src['entries'])!=src['expected_entries'] or
+            any(x['batch']!=batch or x['pdb_id'] not in src['entries'] for x in records)):
+        raise ValueError('Frozen chemistry evidence count or identity mismatch')
+    ref=reference_run.resolve(strict=True); study=load(ref/'summary.json'); receipt=load(ref/'source_receipt.json')
+    method=study['method']
+    if study['version']!=VERSION or method not in {'plus_bird','plus_chebi','plus_rdkit'}:
+        raise ValueError('Unsupported validated chemistry method')
+    files={}
+    for name in ('CCD','BIRD','ChEBI 257'):
+        r=receipt[name]; path=Path(r['path']).resolve(strict=True)
+        if not path.is_relative_to(ref/'sources') or path.stat().st_size!=r['bytes'] or sha256(path)!=r['sha256']:
+            raise ValueError(f'Chemical reference changed: {name}')
+        files[name]=path
+    from rdkit import rdBase
+    seal={'candidate_evidence_sha256':sha256(evidence_path),'code_sha256':sha256(Path(__file__)),
+          'reference_receipt_sha256':sha256(ref/'source_receipt.json'),'method':method,
+          'version':VERSION,'gemmi':gemmi.__version__,'rdkit':rdBase.rdkitVersion}
+    output=Path(output); proof=output.with_suffix('.receipt.json')
+    if proof.is_file():
+        previous=load(proof)
+        if previous['seal']!=seal or previous['results_sha256']!=sha256(output):
+            raise ValueError('Sealed chemistry outputs changed; use a new Run')
+        return previous | {'reused':True,'elapsed_s':round(time.monotonic()-start,3)}
+    made=[x for _,rows_ in from_sources(records,[],jobs) for x in rows_] if records else []
+    codes={m['ccd'] for x in made for m in x['partner']['members'] if m.get('ccd')}
+    ccd=ccd_table(files['CCD'],codes) if codes else {}
+    bird=bird_table(files['BIRD']) if made else {}
+    ontology,_=chebi_ontology(files['ChEBI 257'],{k for d in ccd.values() for k in d['inchikeys']}) if ccd else ({},None)
+    classify=classifier(ccd,bird,ontology); classes=Counter(); coverage=Counter()
+    with jsonl_output(output) as emit:
+        for row in sorted(made,key=lambda x:(x['pdb_id'],x['candidate_key'])):
+            partner=row.pop('partner'); stages,labels=classify(partner); ann=stages[method]
+            classes[ann['primary_class']]+=1; coverage[ann['annotation_status']]+=1
+            emit({k:row[k] for k in ('batch','pdb_id','candidate_key','revision','source_sha256')} |
+                 {'chemical_identity':partner['identity'],'partner_identity_evidence':partner,
+                  'classification':ann,'sources_of_labels':labels,'method_version':VERSION,'chosen_stage':method,
+                  'classification_changes_existing_decision':False})
+    summary={'seal':seal,'batch':batch,'entries':len(src['entries']),'candidates':len(made),'primary_classes':dict(classes),
+             'annotation_states':dict(coverage),'results_sha256':sha256(output),'elapsed_s':round(time.monotonic()-start,3)}
+    write(proof,summary)
+    return summary | {'reused':False}
+
+
 if __name__=='__main__':
     a=argparse.ArgumentParser();a.add_argument('run',type=Path);a.add_argument('--jobs',type=int,default=16)
     a.add_argument('--collect-only',action='store_true');a.add_argument('--controls-only',action='store_true')
+    a.add_argument('--batch-evidence',type=Path);a.add_argument('--reference-run',type=Path)
     args=a.parse_args();r=args.run;ref=r.parent/REF
-    if args.collect_only:
+    if args.batch_evidence or args.reference_run:
+        if not (args.batch_evidence and args.reference_run) or args.collect_only or args.controls_only:
+            a.error('Incremental mode requires both --batch-evidence and --reference-run')
+        print(pack(annotate_batch(args.batch_evidence,args.reference_run,r/'chemical_labels.jsonl',args.jobs)),flush=True)
+    elif args.collect_only:
         z,_=collect_evidence(r,ref,args.jobs);print(pack({k:v for k,v in z.items() if k!='baseline_ccds'}),flush=True)
     else:execute(r,ref,args.jobs,args.controls_only)

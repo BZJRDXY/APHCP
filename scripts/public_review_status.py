@@ -13,6 +13,8 @@ OBSERVATIONS = (*REGISTRATION, 'OBSERVED', 'PREPARATION_USE_RECORDED')
 PENDING = {
     'm3_new_batch': 'Use a genuinely new input batch to verify registration and chemistry annotation end to end.',
     'm3_effective_decision': 'Verify that lookup selects the effective scientific decision while retaining its history.',
+    'm3_scale': 'Measure sustained throughput on a separately approved production increment; the bounded pilot is not a scale estimate.',
+    'm3_connectivity': 'Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.'
 }
 SHA = re.compile(r'[0-9a-f]{64}')
 
@@ -62,6 +64,30 @@ def code_link(verified, current):
     if verified == current:
         return 'The accepted evidence covers this public runtime fingerprint.'
     return f'Current public runtime is not covered by this evidence (verified runtime: `{verified}`).'
+
+
+def pilot_section(root, source):
+    pilot, _ = receipt(root, source)
+    transition = pilot['transition']
+    keys = ('INDEX_MATCH', 'INDEX_VERSION_MISMATCH', 'NO_LIGAND_ANNOTATION')
+    routes = counts(pilot['strata'], keys)
+    exported = counts(pilot['entry_routes_with_readback'], keys)
+    states = counts(pilot['m3_outcomes'], REGISTRATION)
+    systems = pilot['system_statuses']
+    require(pilot['status'] == 'PASS' and pilot['formal_release_count'] == 0 and
+            pilot['protected_registries_unchanged'] is True and pilot['replay_preserved_files_and_results'] is True and
+            all(transition[k] is True for k in ('test_only','reverse_order_pass','same_system','same_files','catalog_pass')) and
+            sum(routes.values()) == pilot['entries'] and all(0 < exported[k] <= routes[k] for k in keys) and
+            sum(map(count,systems.values())) == pilot['candidate_count'] and
+            sum(states.values()) == pilot['registration_count'] == systems['EXPORTED_READBACK'],
+            'Incremental M3 pilot receipt is incomplete or inconsistent')
+    return f"""## M3 · New-batch pilot (unpublished)
+
+- Independently verified: **{utc(pilot['verified_utc'])}**. **{sum(routes.values()):,}** new entries: **{routes[keys[0]]:,}** same-revision, **{routes[keys[1]]:,}** different-revision, and **{routes[keys[2]]:,}** without PLINDER ligand annotations.
+- **{count(pilot['candidate_count']):,}** candidate systems, **{systems['EXPORTED_READBACK']:,}** structures read back. **{states['REGISTERED']:,}** newly confirmed in this isolated staging batch and **{states['REVIEW']:,}** held with files retained. These numbers are separate from the historical totals above.
+- A test-only `REVIEW` → `REGISTERED` transition preserved the same system and files, retained both decisions, and was independent of run order. Replaying the real batch reused its outputs.
+
+"""
 
 
 def render(root: Path, current_runtime: str):
@@ -119,6 +145,7 @@ def render(root: Path, current_runtime: str):
     m3_on = date.fromisoformat(m3['verified_on']).isoformat()
     m1_link = code_link(m1.get('verified_public_runtime_sha256'), current_runtime)
     m3_link = code_link(m3.get('verified_public_runtime_sha256'), current_runtime)
+    pilot = pilot_section(root, src['m3_pilot_verification']) if src.get('m3_pilot_verification') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -141,7 +168,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-## Open review
+{pilot}## Open review
 
 {pending}
 

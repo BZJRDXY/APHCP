@@ -20,6 +20,7 @@ import gemmi
 from aphcp_control.registry import backup, connect, database, migrate, utc_now
 from aphcp_control.queries import pdb as pdb_query
 from holo_candidate_batch import revision_from_cif
+from holo_m3_decisions import resolve as resolve_decisions
 from holo_m2_blind_structure import ContactContext, explicit_role_names, instances_for, normalize, role
 from holo_role_evidence import assess, build_role_context, role_source
 from holo_v1_export import describe_instances, export, output_label, rows, text
@@ -28,6 +29,7 @@ RULE='holo-m3-v1-staging-2'
 STATE='M3_STAGING_UNPUBLISHED'
 PDB=re.compile(r'^[A-Z0-9]{4}$')
 KEY=re.compile(r'^[a-f0-9]{24}$')
+BATCH=re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$')
 RUN_ID=re.compile(r'^holo-m3-[a-z0-9-]+$')
 QC_FIELDS=('coordinate_identity','experimental_fidelity','topology','partner_scope_qc')
 
@@ -121,13 +123,19 @@ def memo(store, key, get):
     return store[key]
 
 
-def read_manifest(path):
+def read_manifest(path, *, incremental=False):
     x=read(path); roster=x if isinstance(x,list) else x['review_candidates']
     require(roster and (isinstance(x,list) or x.get('review_count',len(roster))==len(roster)), 'empty_or_inconsistent_input_manifest')
     result=[]; ids=set()
     for n in roster:
         pb=n['pdb_id']; ck=n.get('candidate', n.get('candidate_key')); bid=str(n.get('batch','2000'))
-        require(PDB.fullmatch(pb) and KEY.fullmatch(ck) and bid in {'200','2000'},'invalid_input_identity')
+        valid_batch = ('batch' in n and BATCH.fullmatch(bid)) if incremental else bid in {'200','2000'}
+        require(PDB.fullmatch(pb) and KEY.fullmatch(ck) and valid_batch,'invalid_input_identity')
+        if 'supersedes' in n:
+            refs=n['supersedes']
+            require(isinstance(refs,list) and refs and all(isinstance(x,str) and '/' in x for x in refs)
+                    and len(refs)==len(set(refs)) and isinstance(n.get('decision_basis'),str)
+                    and n['decision_basis'].strip(), 'invalid_decision_supersession')
         require((bid,pb,ck) not in ids,'duplicate_input_candidate'); ids.add((bid,pb,ck));result.append((bid,pb,ck,n))
     return result
 
@@ -186,8 +194,8 @@ def assess_candidate(key,n,b,c,roots,m2,cache,shared):
     if not all(b.get(k) for k in ('source_path','system_path','mapping_path','system_sha256','discovery_path')):
         return work | {'reasons':['accepted_disk_structure_not_available']}
     get_ref=lambda path,expected=None:memo(shared,('file',str(path),expected),lambda:file_ref(path,roots,expected))
-    raw=get_ref(b['source_path'],b['source_sha256']); cif=get_ref(b['system_path'],b['system_sha256']); mapping=get_ref(b['mapping_path'])
-    discovery=get_ref(b['discovery_path'])
+    raw=get_ref(b['source_path'],b['source_sha256']); cif=get_ref(b['system_path'],b['system_sha256']); mapping=get_ref(b['mapping_path'],b.get('mapping_sha256'))
+    discovery=get_ref(b['discovery_path'],b.get('discovery_sha256'))
     refs={'source_mmcif':raw,'system_cif':cif,'source_mapping':mapping,'discovery':discovery}
     verifier=export
     if b.get('historical_result'):
@@ -311,7 +319,10 @@ def review_group(group):
         except (ValueError, OSError, KeyError, RuntimeError) as e:
             ans={'batch':key[0],'pdb_id':p,'candidate_key':ck,'disposition':'TECHNICAL_FAILURE','reasons':[str(e)],
                  'revision':(b or {}).get('revision')}
-        results.append((position,ans,ans is cached))
+        reused=ans is cached
+        if n.get('supersedes') and ans.get('system_id'):
+            ans=ans | {'supersedes': sorted(n['supersedes']), 'decision_basis': n['decision_basis']}
+        results.append((position,ans,reused))
     return results
 
 def canonical_id(prefix,data):return f'{prefix}:{digest(data)[:28]}'
@@ -327,6 +338,11 @@ def index_review_results(registry_root, stamp, reports, seal, path_to_results, b
         if prev:
             require(prev['config_hash']==digest(seal) and prev['output_manifest_hash']==out_hash,'staged_run_inputs_or_results_changed')
             return row_counts(db),True
+        for result in reports:
+            if result.get('supersedes'):
+                sid=result['system_id']
+                old=[(rid,path,r) for rid,path,r in recorded_assessments(db, registry_root.parent.parent/'runs', system=sid)]
+                resolve_decisions([*old,(run,str(path_to_results),result)])
         db.execute('INSERT INTO config_version VALUES (?,?,?)',(cv,digest(seal),str(stamp)))
         db.execute('''INSERT INTO batch(id,module_id,status,source_release,input_manifest,config_version,candidate_count,next_step)
                       VALUES (?,'holo',?,'wwPDB-fixed-mmCIF',?,?,?,?)''',(label,STATE,seal['manifest'],cv,len(reports),'暂存，等待发布授权'))
@@ -422,12 +438,40 @@ def seed_registry(root,current,args):
     return db.resolve(),sha(db)
 
 
+def incremental_inputs(root, inp, keys):
+    spec=read(inp); require(spec.get('schema')=='aphcp-m3-increment-v1','unsupported_increment_manifest')
+    evidence_ref=spec['candidate_evidence']; chem_ref=spec['chemistry']
+    evidence_path=Path(evidence_ref['path']).resolve(); chem_path=Path(chem_ref['path']).resolve()
+    file_ref(evidence_path,(root/'runs',),evidence_ref['sha256']); file_ref(chem_path,(root/'runs',),chem_ref['sha256'])
+    bundle=read(evidence_path)
+    source=Path(bundle['source_run']).resolve(strict=True)
+    require(source.parent==root/'runs' and source.name.startswith('holo-m2-') and source.is_dir(),'invalid_increment_source_run')
+    def keyed(rows):
+        items={(x['batch'],x['pdb_id'],x['candidate_key']):x for x in rows}
+        require(len(items)==len(rows),'duplicate_increment_evidence')
+        return items
+    base=keyed(bundle['candidates']); annotations=keyed(list(jsonl(chem_path)))
+    require(BATCH.fullmatch(bundle['batch']) and all(k[0]==bundle['batch'] for k in base)
+            and len(bundle['entries'])==bundle['expected_entries']==len(set(bundle['entries']))
+            and len(base)==bundle['expected_candidates'] and keys<=base.keys()
+            and all(k[1] in bundle['entries'] for k in base) and base.keys()==annotations.keys(),
+            'increment_evidence_does_not_cover_frozen_input')
+    return (source,),{bundle['batch']:source},base,annotations,{},(evidence_path,chem_path)
+
+
 def execute(args):
     start=time.monotonic(); begin=utc_now(); root=args.root.resolve(); r=args.run.resolve(); ig=frozen_registry_root(root,r,create=not args.review_only)
-    old=r.parent/'holo-m2-final2000-20261122a'; ref=r.parent/'holo-m2-full-reconciliation-20261122a'; chem=r.parent/'holo-m2-chemtype-20261122a'
-    roots=tuple(z.resolve() for z in (old,ref,r.parent/'holo-m2-blind200-20261122a'))
-    inp=args.manifest.resolve(); manifest=read_manifest(inp); keys={(a,b,c) for a,b,c,_ in manifest}
-    ledger_paths=(ref/'system_attribution.jsonl',ref/'historical_deltas.json',chem/'results/baseline_system_labels.jsonl',chem/'results/supplemental_system_labels.jsonl')
+    inp=args.manifest.resolve(); config=read(inp)
+    incremental=isinstance(config,dict) and 'schema' in config
+    manifest=read_manifest(inp,incremental=incremental); keys={(a,b,c) for a,b,c,_ in manifest}
+    if incremental:
+        roots,source_by_batch,base,annotations,deltas,ledger_paths=incremental_inputs(root,inp,keys)
+    else:
+        old=r.parent/'holo-m2-final2000-20261122a'; ref=r.parent/'holo-m2-full-reconciliation-20261122a'; chem=r.parent/'holo-m2-chemtype-20261122a'
+        roots=tuple(z.resolve() for z in (old,ref,r.parent/'holo-m2-blind200-20261122a'))
+        source_by_batch={'2000':roots[0],'200':roots[2]}
+        ledger_paths=(ref/'system_attribution.jsonl',ref/'historical_deltas.json',chem/'results/baseline_system_labels.jsonl',chem/'results/supplemental_system_labels.jsonl')
+        base,annotations,deltas=pool_rows(ref,chem,keys)
     deps=Path(__file__).resolve().parent
     runtime={k:importlib.metadata.version(k) for k in ['gemmi','numpy','scipy']} | {'python':sys.version.split()[0]}
     seed=seed_registry(root,r,args)
@@ -435,17 +479,19 @@ def execute(args):
           'workspace_git_head':args.git_head,'runtime':runtime,'dependencies':{
           str(x.relative_to(deps)):sha(x) for x in sorted([*deps.glob('holo*.py'),*deps.glob('src/aphcp_control/*.py'),*deps.glob('migrations/*.sql')])},
           'inputs':{str(q):sha(q) for q in ledger_paths}}
+    if incremental:
+        build=read(next(iter(source_by_batch.values()))/'build_inputs.json')
+        seal['incremental_source_code']={k:build[k] for k in ('algorithm','fingerprint','code_files')}
     if seed:seal['seed_registry']={'path':str(seed[0]),'sha256':seed[1]}
     seal_path=r/'frozen_staging.json'; data=r/'review_results.json'; current=read(data) if data.exists() else []
     if seal_path.exists():require(read(seal_path)==seal,'staging_input_or_code_changed_use_a_new_run')
     by_old={(x['batch'],x['pdb_id'],x['candidate_key']):x for x in current}
-    base, annotations, deltas=pool_rows(ref,chem,keys)
     groups=defaultdict(list)
     for position,(batch,p,k,n) in enumerate(manifest):
         key=(batch,p,k); b=base.get(key)
         delta=deltas.get((p,k)) if b and b.get('historical_retest') else None
         groups[(batch,p)].append((position,key,n,b,annotations.get(key),delta,roots,
-                                  old if batch=='2000' else roots[2],by_old.get(key)))
+                                  source_by_batch[batch],by_old.get(key)))
     if len(groups)==1 or args.jobs==1:
         reviewed=list(map(review_group,groups.values()))
     else:
@@ -473,38 +519,40 @@ def execute(args):
     write(r/('rerun_receipt.json' if db_reuse else 'registration_receipt.json'),states);print(raw_json(states))
 
 
+def recorded_assessments(db, runs, *, system=None, pdb=None):
+    criteria, value=('object_id',system) if system else ('pdb_id',pdb) if pdb else (None,None)
+    suffix=f' AND run_item.{criteria}=?' if criteria else ''
+    matched=db.execute("""SELECT DISTINCT run.id,run.report_path,run.output_manifest_hash FROM run
+        JOIN run_item ON run.id=run_item.run_id WHERE run_item.stage='M3_REVIEW'"""+suffix,
+        (value,) if criteria else ()).fetchall()
+    for rec in matched:
+        run_id=rec['id']; f=read_only_path(rec['report_path'],(runs,))
+        require(f.name=='review_results.json' and f.parent.name+'-run'==run_id and sha(f)==rec['output_manifest_hash'], 'staging_result_file_changed')
+        for x in read(f):
+            if (system and x.get('system_id')!=system) or (pdb and x['pdb_id']!=pdb):continue
+            sid=x.get('system_id')
+            if sid:
+                found=db.execute("SELECT status FROM run_item WHERE run_id=? AND object_id=? AND stage='M3_REVIEW'",(run_id,sid)).fetchone()
+                require(found and found['status']==x['disposition'],'registry_and_science_receipt_disagree')
+            yield run_id,str(f),x
+
+
 def lookup(args):
     r=args.run.resolve(); root=r.parent.parent; batch=frozen_registry_root(root,r)
     with connect(database(batch),readonly=True) as db:
-        criteria, value=('object_id',args.system) if args.system else ('pdb_id',args.pdb.upper())
-        matched=db.execute(f"""SELECT DISTINCT run.id,run.report_path,run.output_manifest_hash FROM run
-            JOIN run_item ON run.id=run_item.run_id WHERE run_item.{criteria}=? AND run_item.stage='M3_REVIEW'
-            ORDER BY run.id""", (value,)).fetchall()
-        require(matched,'staging_record_not_found')
+        value=args.system or args.pdb.upper()
         by_identity=defaultdict(list); verified=set()
-        for rec in matched:
-            run_id=rec['id']; f=read_only_path(rec['report_path'],(root/'runs',))
-            require(f.name=='review_results.json' and f.parent.name+'-run'==run_id and sha(f)==rec['output_manifest_hash'], 'staging_result_file_changed')
-            for x in read(f):
-                if (x.get('system_id') if args.system else x['pdb_id'])!=value:continue
-                sid=x.get('system_id')
-                if sid:
-                    found=db.execute("SELECT status FROM run_item WHERE run_id=? AND object_id=? AND stage='M3_REVIEW'",(run_id,sid)).fetchone()
-                    require(found and found['status']==x['disposition'],'registry_and_science_receipt_disagree')
-                    if args.verify_files:
-                        for asset in x['files'].values():
-                            proof=(asset['path'],asset['sha256'])
-                            if proof not in verified:
-                                require(sha(proof[0])==proof[1],'retrieval_asset_sha256_differs'); verified.add(proof)
-                ident=sid or ('candidate',x['batch'],x['pdb_id'],x['candidate_key'])
-                by_identity[ident].append((run_id,str(f),x))
+        for run_id,f,x in recorded_assessments(db, root/'runs', system=args.system, pdb=args.pdb.upper() if args.pdb else None):
+            sid=x.get('system_id')
+            if sid and args.verify_files:
+                for asset in x['files'].values():
+                    proof=(asset['path'],asset['sha256'])
+                    if proof not in verified:
+                        file_ref(proof[0],(root/'runs',),proof[1]); verified.add(proof)
+            ident=sid or ('candidate',x['batch'],x['pdb_id'],x['candidate_key'])
+            by_identity[ident].append((run_id,f,x))
         require(by_identity,'staging_record_not_found')
-        rows_=[]
-        for observations in by_identity.values():
-            # Keep each contributing run visible, even if the canonical object is reused.
-            row=observations[0][2]
-            rows_.append(row | {'provenance':[{'run_id':rid,'report':f,'batch':x['batch'],'candidate_key':x['candidate_key'],
-                                              'disposition':x['disposition'],'files':x.get('files',{})} for rid,f,x in observations]})
+        rows_=[resolve_decisions(group) for _,group in sorted(by_identity.items(),key=lambda x:str(x[0]))]
         if args.asset:
             require(len(rows_)==1 and args.asset in rows_[0].get('files',{}),'unique_system_asset_required')
             print(rows_[0]['files'][args.asset]['path']);return

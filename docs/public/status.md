@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `022b72a5415f7e7728eea58c4d826462276d800430eb5e872b4e1a784a0189ee`
+Public runtime fingerprint (SHA-256): `62fab046341ac930ea5099109f641b8ee1ad38325f72e0256172b5ad3e90eb1f`
 
 ## M1 · Metadata inventory
 
@@ -19,9 +19,15 @@ Public runtime fingerprint (SHA-256): `022b72a5415f7e7728eea58c4d826462276d80043
 - **2,344** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: Unknown: the historical Run is not pinned to a public runtime fingerprint.
 
+## M3 · New-batch pilot (unpublished)
+
+- Independently verified: **2026-11-22T17:22:50+00:00**. **9** new entries: **3** same-revision, **3** different-revision, and **3** without PLINDER ligand annotations.
+- **29** candidate systems, **21** structures read back. **4** newly confirmed in this isolated staging batch and **17** held with files retained. These numbers are separate from the historical totals above.
+- A test-only `REVIEW` → `REGISTERED` transition preserved the same system and files, retained both decisions, and was independent of run order. Replaying the real batch reused its outputs.
+
 ## Open review
 
-- Use a genuinely new input batch to verify registration and chemistry annotation end to end.
-- Verify that lookup selects the effective scientific decision while retaining its history.
+- Measure sustained throughput on a separately approved production increment; the bounded pilot is not a scale estimate.
+- Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.
 
 See the [review guide](review.md) for scope, evidence definitions and review instructions.

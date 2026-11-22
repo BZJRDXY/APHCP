@@ -1,7 +1,7 @@
 """Index verified structure files in the existing APHCP staging registry."""
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
@@ -10,10 +10,11 @@ import time
 
 from holo_m3_register import (
     canonical_id, connect, context_gate, database, digest, file_ref,
-    frozen_registry_root, jsonl, read, read_only_path, require, seed_registry,
+    frozen_registry_root, jsonl, read, read_only_path, recorded_assessments, require, seed_registry,
     sha, utc_now, write,
 )
 from aphcp_control.registry import backup
+from holo_m3_decisions import resolve as resolve_decisions
 
 
 STAGE = 'STRUCTURE_OBSERVATION'
@@ -37,21 +38,20 @@ def input_observations(inputs, selected):
 
 
 def review_records(db, runs):
-    statuses = {}
-    for run in db.execute('SELECT DISTINCT r.* FROM run r JOIN run_item i ON i.run_id=r.id WHERE i.stage=?',
-                          ('M3_REVIEW',)):
-        report = read_only_path(run['report_path'], (runs,))
-        require(sha(report) == run['output_manifest_hash'], 'staged_review_hash_differs')
-        for result in read(report):
-            k = key(result)
-            previous = statuses.setdefault(k, result)
-            require(previous['disposition'] == result['disposition'] and
-                    previous.get('system_id') == result.get('system_id'), 'conflicting_staged_review')
-    return statuses
+    by_identity = defaultdict(list)
+    candidate_identities = defaultdict(set)
+    for rid, path, result in recorded_assessments(db, runs):
+        k = key(result)
+        identity = result.get('system_id') or k
+        candidate_identities[k].add(identity)
+        by_identity[identity].append((rid, path, result))
+    resolved = {identity: resolve_decisions(group) for identity, group in by_identity.items()}
+    # A changed partner composition is a different identity; keep both rather than pick by run order.
+    return {k: {identity: resolved[identity] for identity in ids} for k, ids in candidate_identities.items()}
 
 
 def observation(row, entry, review, original_role_evidence, roots):
-    if (review.get('disposition') == 'OUT_OF_SCOPE' or
+    if (review.get(key(row), {}).get('disposition') == 'OUT_OF_SCOPE' or
             context_gate({'role_evidence': {'matches': [{'text': entry['source_title']}]}}) or
             context_gate({'role_evidence': original_role_evidence})):
         return None, {'key': key(row), 'status': 'OUT_OF_SCOPE'}
@@ -77,7 +77,7 @@ def observation(row, entry, review, original_role_evidence, roots):
         'altloc_scope': artifact['altloc_policy'],
     }
     sid = canonical_id('holo:' + row['pdb_id'], identity)
-    require(not review.get('system_id') or review['system_id'] == sid, 'observation_and_staged_identity_differ')
+    review = review.get(sid, {})
     cls = row['classification']
     status = review.get('disposition') or ('PREPARATION_USE_RECORDED' if row['intake_after'] == 'EXCLUDED' else 'OBSERVED')
     files = {
@@ -93,6 +93,8 @@ def observation(row, entry, review, original_role_evidence, roots):
         'evidence_layer': row['evidence_layer'], 'type': cls, 'role': role_review.get('status', row['role_after']),
         'role_evidence': role_review.get('source_evidence', original_role_evidence),
         'm3_reasons': review.get('reasons', []),
+        'current_decision_id': review.get('current_decision_id'), 'decision_state': review.get('decision_state'),
+        'm3_readback_qc': review.get('qc'),
         'qc': {fld: row.get(fld) for fld in ('coordinate_identity', 'experimental_fidelity', 'topology', 'partner_scope_qc')},
         'files': files,
     }
@@ -132,7 +134,7 @@ def add_observation(db, label, sid, row, entry, stamp):
     if previous:
         saved = json.loads(previous['error_message'])
         require(saved['identity'] == json.loads(json.dumps(ident)), 'observation_key_collision')
-        rank = {'OBSERVED': 0, 'PREPARATION_USE_RECORDED': 1, 'REVIEW': 2, 'REGISTERED': 3}
+        rank = {'OBSERVED': 0, 'PREPARATION_USE_RECORDED': 1, 'REVIEW': 2, 'REGISTERED': 3, 'CONFLICT': 4}
         if rank[row['status']] > rank[saved['status']]:
             saved, row = row | {'aliases': saved.get('aliases', [])}, saved
         saved.setdefault('aliases', []).append({k: row[k] for k in ('key', 'evidence_layer', 'status', 'files')})
@@ -209,7 +211,7 @@ def build(args):
                    'outcomes': dict(labels), 'registry': str(dbpath), 'seed_sha256': seed_hash, 'elapsed_s': duration}
         db.execute('''UPDATE run SET end_time_utc=?,elapsed_seconds=?,input_records=?,success_records=?,
                       uncertain_records=?,error_summary=? WHERE id=?''',
-                   (utc_now(), duration, len(ingested), canonical_count, labels['OBSERVED']+labels['REVIEW'],
+                   (utc_now(), duration, len(ingested), canonical_count, labels['OBSERVED']+labels['REVIEW']+labels['CONFLICT'],
                     json.dumps(receipt), run.name))
     write(run/'catalog_receipt.json', receipt)
     print(json.dumps(receipt))

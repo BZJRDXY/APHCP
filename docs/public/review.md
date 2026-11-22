@@ -21,7 +21,7 @@ Start with the [latest published verification snapshot](status.md). It separates
 | --- | --- |
 | Inventory, association and cross-window reconciliation | [Window runner](../../scripts/m1_holo_windows.py), [rollup](../../scripts/m1_holo_rollup.py) |
 | Discovery, structure export and provenance | [Native candidates](../../scripts/holo_native_candidates.py), [source mapping](../../scripts/holo_source_mapping.py), [V1 export](../../scripts/holo_v1_export.py) |
-| Chemistry, registration and readback | [Chemistry](../../scripts/holo_m2_chemtype.py), [registration and lookup](../../scripts/holo_m3_register.py), [observation catalog](../../scripts/holo_m3_observations.py) |
+| Chemistry, registration and readback | [Chemistry](../../scripts/holo_m2_chemtype.py), [new-batch driver](../../scripts/holo_m3_increment.py), [registration and lookup](../../scripts/holo_m3_register.py), [decision history](../../scripts/holo_m3_decisions.py), [observation catalog](../../scripts/holo_m3_observations.py) |
 | Small reproducible checks | [Synthetic operations input](../../tests/fixtures/m0_work_items.json), [integration test](../../tests/integration/test_m0.py), [synthetic receipt example](../../tests/integration/test_public_review_status.py) |
 
 Run the synthetic receipt-to-summary check with Python 3.10 or newer:
