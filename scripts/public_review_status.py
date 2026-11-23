@@ -227,6 +227,39 @@ def three_main_section(root, name, runtime):
 '''
 
 
+def archive_admission_section(root, name):
+    r, _ = receipt(root, name)
+    retry, main = r['existing_gaps'], r['mixed_load']
+    commit = retry['code_commit']
+    require(re.fullmatch(r'[0-9a-f]{40}', commit) and commit == main['code_commit'] and
+            retry['status'] == main['status'] == 'PASS_BOUNDED_EXECUTION' and
+            retry['final']['partitions'] == 13 and main['final']['partitions'] == 16 and
+            retry['retry_input'] - retry['merged_total'] == retry['final']['pending'] == main['retry_input'] and
+            main['retry_input'] + main['new_gaps'] - main['merged_total'] == main['final']['pending'] and
+            all(x['staging_releases'] == 0 and x['no_next_preflight'] for x in (retry, main)),
+            'Archive admission production evidence does not reconcile')
+    after = count(main['merged_total']) - count(main['merged_during_main'])
+    final = main['final']
+    head = sum(count(b['head']['local_queue_timeout']) for b in main['main_batches'].values())
+    sent = sum(count(b['head']['sent']) for b in main['main_batches'].values())
+    get = sum(count(b['get']['partial_body_timeout']) for b in main['main_batches'].values())
+    require(after >= 0 and count(final['settled']) + count(final['pending']) + count(final['unattempted']) ==
+            count(main['source_reconcile']), 'Archive admission final totals do not reconcile')
+    go = r['gate']
+    require(go in ('HOLD_BACKLOG', 'HOLD_OTHER', 'PASS_BOUNDED_SCALE'), 'Unknown archive admission decision')
+    phrase = {'HOLD_BACKLOG': 'Expansion was held because retries did not keep up.',
+              'HOLD_OTHER': 'Expansion was held pending further engineering evidence.',
+              'PASS_BOUNDED_SCALE': 'The measured window met the bounded scale gate.'}[go]
+    return f'''## M3 · Archive admission and retry capacity (unpublished)
+
+- Verified **{utc(main['verified_utc'])}** against execution commit `{commit}`. From **{retry['retry_input']:,}** existing gaps, **{retry['merged_total']:,}** were recovered and merged before the next main batch.
+- Batches 14–16 attempted **{main['main_input']:,}** entries. **{sent:,}** HEAD requests reached HTTP; **{head:,}** timed out waiting locally. Main GET had **{get:,}** partial-body timeouts. The shared archive slot limit was unchanged.
+- **{main['new_gaps']:,}** new technical gaps appeared. **{main['merged_during_main']:,}** were merged during production and **{after:,}** more at shutdown, leaving **{final['pending']:,}** pending overall. {phrase}
+- **{final['settled']:,} / {main['source_reconcile']:,}** rolling entries were settled. The staging catalog contained **{count(main['catalog_count']):,}** retrievable systems; no dataset release was created.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -294,6 +327,7 @@ def render(root: Path, current_runtime: str):
     production_gate = rolling_gate_section(root, src['m3_rolling_production_gate']) if src.get('m3_rolling_production_gate') else ''
     after_ten = after_ten_section(root, src['m3_after_ten']) if src.get('m3_after_ten') else ''
     three_main = three_main_section(root, src['m3_three_main'], current_runtime) if src.get('m3_three_main') else ''
+    admission = archive_admission_section(root, src['m3_archive_admission']) if src.get('m3_archive_admission') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -316,7 +350,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}## Open review
 
 {pending}
 

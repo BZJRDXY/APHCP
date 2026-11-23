@@ -141,6 +141,26 @@ class PublicReviewStatusTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Three-batch production totals'):
             render(self.root, self.runtime)
 
+    def test_archive_admission_keeps_backlog_and_release_separate(self):
+        base = {'status': 'PASS_BOUNDED_EXECUTION', 'no_next_preflight': True,
+                'staging_releases': 0, 'code_commit': 'a'*40}
+        retry = base | {'retry_input': 9, 'merged_total': 7, 'final': {'partitions': 13, 'pending': 2}}
+        main = base | {'verified_utc': '2026-01-04T01:00:00Z', 'retry_input': 2, 'new_gaps': 3,
+                       'merged_total': 2, 'merged_during_main': 1, 'main_input': 30, 'source_reconcile': 100,
+                       'catalog_count': 95, 'final': {'partitions': 16, 'pending': 3, 'settled': 60, 'unattempted': 37},
+                       'main_batches': {'b0014': {'head': {'local_queue_timeout': 0, 'sent': 10},
+                                                   'get': {'partial_body_timeout': 2}}},
+                       'catalog_run': 'PRIVATE_CATALOG_RUN'}
+        self.write(self.root / SOURCES, self.sources | {'m3_archive_admission': 'admission.json'})
+        self.put('admission.json', {'existing_gaps': retry, 'mixed_load': main, 'gate': 'HOLD_BACKLOG'})
+        page = render(self.root, self.runtime)
+        self.assertIn('leaving **3** pending overall', page)
+        self.assertIn('Expansion was held because retries did not keep up', page)
+        self.assertNotIn('PRIVATE_CATALOG_RUN', page)
+        self.put('admission.json', {'existing_gaps': retry, 'mixed_load': main | {'retry_input': 1}, 'gate': 'HOLD_BACKLOG'})
+        with self.assertRaisesRegex(ValueError, 'Archive admission production evidence does not reconcile'):
+            render(self.root, self.runtime)
+
     def test_changed_rollup_or_replay_cannot_be_published(self):
         self.put('rerun.json', self.first | {'database_registration_reused': True, 'results_sha256': 'e'*64})
         with self.assertRaisesRegex(ValueError, 'registration and replay receipts disagree'):

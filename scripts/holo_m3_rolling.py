@@ -360,6 +360,12 @@ def rolling(a):
             'index':str(a.index),'reference_run':str(a.reference_run), 'git_head':a.git_head,
             'code_sha256':sha(__file__), 'execution_files':{f.name:sha(f) for f in sorted(code.glob('holo*.py'))},
             'batch_size':a.batch_size}
+    balance = None
+    if getattr(a,'balance_retries',False):
+        high = min(a.max_pending, max(12, a.batch_size//12))
+        balance = {'high':high,'low':high//2,'budget_s':a.balance_budget,
+                   'stop_after':a.stop_after_partition,'retry_only':a.retry_only}
+        config['retry_balance'] = balance
     a.pump_retry=lambda:None
     with ExitStack() as stack:
         lock=stack.enter_context((run/'rolling.lock').open('a'))
@@ -604,6 +610,7 @@ def rolling(a):
             reap()
             # Coalesce ready files for one source partition. The merge is durable
             # and relatively expensive even for a single Entry; bound the wait.
+            merge_floor = 3*a.retry_jobs if balance else max(2,a.retry_jobs)
             for bid,remaining in list(pending.items()):
                 if request.is_file(): return
                 rows=[]; checks=[]; oldest_ready=time.time()
@@ -614,28 +621,33 @@ def rolling(a):
                         rows.append(row); checks.append(state['check'] | {'retry_attempt':state['attempts']})
                         epoch=state.get('finished_epoch',state['next_epoch']-15*2**(state['attempts']-1))
                         oldest_ready=min(oldest_ready,epoch)
-                if rows and (force or len(rows)==len(remaining) or len(rows)>=max(2,a.retry_jobs)
+                if rows and (force or len(rows)==len(remaining) or len(rows)>=merge_floor
                              or time.time()-oldest_ready>=120):
                     label=f'{bid}-r{retries[bid]+1:02d}'
                     process(label,rows,{'input_digest':digest(rows),'checks':checks,'elapsed_s':0})
 
         def next_retry():
-            epochs=[]; exhausted=0; ready=0
+            epochs=[]; exhausted=0; ready=0; oldest_actionable=None
             for bid,remaining in pending.items():
                 for pdb in remaining:
                     state=job_state(retry_rows(bid)[pdb]); ep=state['next_epoch']
                     if unmerged(bid,pdb,state): ready+=1
                     elif state['attempts']<a.max_retries or state.get('state')=='STARTED': epochs.append(ep)
-                    else: exhausted+=1
-            return min(epochs,default=None),exhausted,ready
+                    else:
+                        exhausted+=1
+                        continue
+                    age=sealed_at[bid]
+                    oldest_actionable=age if oldest_actionable is None else min(age,oldest_actionable)
+            return min(epochs,default=None),exhausted,ready,oldest_actionable
 
         def retry_status():
-            count=sum(map(len,pending.values())); _,exhausted,ready=next_retry()
+            count=sum(map(len,pending.values())); _,exhausted,ready,actionable=next_retry()
             oldest=min((sealed_at[bid] for bid,keys in pending.items() if keys),default=None)
             by_batch={bid:len(keys) for bid,keys in pending.items() if keys}
             return {'queued':count,'queued_by_partition':by_batch,
                     'running':sum(not f.done() for f in active_jobs.values()),'exhausted':exhausted,
-                    'verified_waiting_for_catalog':ready,
+                    'verified_waiting_for_catalog':ready, 'retryable_not_ready':count-exhausted-ready,
+                    'oldest_actionable_wait_s':round(max(0,time.time()-actionable),1) if actionable is not None else None,
                     'oldest_wait_s':round(max(0,time.time()-oldest),1) if oldest is not None else None,
                     'settled_by_retry':sum(read(f).get('settled',0) for f in receipts.glob('b*-r*.json'))}
 
@@ -651,15 +663,58 @@ def rolling(a):
                 schedule(pool); last_pump=now
             if now-last_retry_report>=15:
                 write(run/'retry_progress.json',retry_status()); last_retry_report=now
+        def balance_backlog(next_label, closing=False):
+            # One durable hold per boundary; a supervisor restart keeps the same deadline.
+            evidence=run/'retry_balance'
+            evidence.mkdir(exist_ok=True)
+            balance_path=evidence/(f'{next_label}.json' if not closing else 'closing.json')
+            state=read(balance_path) if balance_path.is_file() else {}
+            if state.get('state')=='DRAINING':
+                require(state['next_partition']==next_label and state['closing']==closing,
+                        'retry_balance_checkpoint_boundary_changed')
+            elif state.get('state')=='DRAIN_TIMEOUT':
+                return 'PAUSED_RETRY_DRAIN_TIMEOUT'
+            elif state.get('state')=='DRAINED':
+                return None
+            else:
+                stats=retry_status()
+                total=stats['queued']; actionable=total-stats['exhausted']
+                if not actionable or (not closing and actionable<balance['high'] and total<a.max_pending):
+                    return None
+                target=0 if closing else min(balance['low'],max(0,a.max_pending-stats['exhausted']-1))
+                state={'state':'DRAINING','next_partition':next_label,'closing':closing,'target_actionable':target,
+                       'started_utc':utc_now(),'started_epoch':time.time(),'initial':stats}
+                write(balance_path,state)
+            progress('RETRY_BALANCING')
+            while not request.is_file():
+                pump()
+                stats=retry_status(); actionable=stats['queued']-stats['exhausted']
+                if actionable<=state['target_actionable']:
+                    write(balance_path,state | {'state':'DRAINED','finished_utc':utc_now(),'final':stats})
+                    return None
+                if time.time()-state['started_epoch']>=balance['budget_s']:
+                    write(balance_path,state | {'state':'DRAIN_TIMEOUT','finished_utc':utc_now(),'final':stats})
+                    return 'PAUSED_RETRY_DRAIN_TIMEOUT'
+                ready=stats['verified_waiting_for_catalog']
+                if ready:
+                    collect(force=ready>=actionable-state['target_actionable'])
+                if active_jobs: wait(active_jobs.values(),timeout=.5,return_when=FIRST_COMPLETED)
+                else: time.sleep(.5)
+            return 'PAUSED_AT_BOUNDARY'
+
         with ThreadPoolExecutor(max_workers=1) as ahead, ThreadPoolExecutor(max_workers=a.retry_jobs) as pool:
             a.pump_retry=pump
             future=None; consecutive_failures=0; completed_here=0; pause_reason=None
             if not unstarted and stop_after is not None and not retry_only:
-                write(run/'retry_progress.json',retry_status()); progress('PAUSED_OBSERVATION_LIMIT'); return
+                drain_reason=balance_backlog(None,closing=True) if balance else None
+                pause_reason=drain_reason or 'PAUSED_OBSERVATION_LIMIT'
             for i,part in enumerate(unstarted):
                 if request.is_file(): break
                 collect()
                 if request.is_file(): break
+                if balance:
+                    pause_reason=balance_backlog(part['id'])
+                    if pause_reason or request.is_file(): break
                 if sum(map(len,pending.values()))>=a.max_pending:
                     pause_reason='PAUSED_RETRY_BACKLOG'; break
                 schedule(pool)
@@ -682,17 +737,18 @@ def rolling(a):
                     pause_reason='PAUSED_SOURCE_FAILURE'; break
                 if ((a.max_main_batches is not None and completed_here>=a.max_main_batches) or
                     (stop_after is not None and i+1==len(unstarted))):
-                    pause_reason='PAUSED_OBSERVATION_LIMIT'; break
+                    drain_reason=balance_backlog(None,closing=True) if balance else None
+                    pause_reason=drain_reason or 'PAUSED_OBSERVATION_LIMIT'; break
             if not pause_reason and not request.is_file():
                 # Drain bounded retries at the end; don't keep retrying forever.
                 last_merge=time.monotonic()
                 while not request.is_file():
                     pump()
-                    wake,_,ready=next_retry(); now=time.monotonic()
+                    wake,_,ready,_=next_retry(); now=time.monotonic()
                     no_more=not active_jobs and wake is None
                     if ready and (no_more or now-last_merge>=15):
                         collect(force=no_more); last_merge=time.monotonic()
-                        wake,_,ready=next_retry()
+                        wake,_,ready,_=next_retry()
                     if not active_jobs and wake is None and not ready: break
                     if active_jobs: wait(active_jobs.values(),timeout=.5,return_when=FIRST_COMPLETED)
                     else: time.sleep(.5 if wake is None else min(.5,max(.01,wake-time.time())))
@@ -731,6 +787,8 @@ def main():
     p.add_argument('--retry-jobs',type=int,default=3)
     p.add_argument('--max-retries',type=int,default=3)
     p.add_argument('--max-pending',type=int,default=550)
+    p.add_argument('--balance-retries',action='store_true',help='Drain bounded actionable backlog at partition boundaries')
+    p.add_argument('--balance-budget',type=int,default=900,help='Maximum seconds allowed for one balance hold')
     limit=p.add_mutually_exclusive_group()
     limit.add_argument('--max-main-batches',type=int)
     limit.add_argument('--stop-after-partition',type=int,help='Absolute plan ordinal; safe across automatic restarts')
@@ -739,7 +797,7 @@ def main():
     p.add_argument('--plan-only',action='store_true')
     a=p.parse_args()
     if (min(a.jobs,a.fetch_jobs,a.batch_size,a.reserve_gib,a.primary_budget,a.max_pending,a.max_retries)<1 or
-        a.max_retries>6 or not 1<=a.retry_jobs<=a.archive_ancillary<a.fetch_jobs or
+        a.max_retries>6 or a.balance_budget<1 or not 1<=a.retry_jobs<=a.archive_ancillary<a.fetch_jobs or
         (a.max_main_batches is not None and a.max_main_batches<1) or
         (a.stop_after_partition is not None and a.stop_after_partition<1)):
         p.error('invalid scheduling limits')

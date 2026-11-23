@@ -120,10 +120,10 @@ def transport(root,url):
             assert retry_slot==1 and a.head(pin,.5)['availability']=='VERIFIED'
         with a.slot('head') as (head_slot,_):
             assert head_slot==0
-            check=a.head(pin,.18); assert check['availability']!='VERIFIED' and check['request']['phase']=='QUEUE'
+            check=a.head(pin,.18,queue_seconds=.18); assert check['availability']!='VERIFIED' and check['request']['phase']=='QUEUE'
             assert .17<=check['request']['queued_s']<=.28 and 'started_monotonic' not in check['request']
         with a.slot('range',time.monotonic()+.1) as (retry_slot,_): assert retry_slot==1
-    return {'timeouts':deadlines,'max_parallel_across_processes':max_parallel,'max_ancillary':max_ancillary,'reserved_auxiliary_lanes_verified':True,'head_queue_total_budget_verified':True,
+    return {'timeouts':deadlines,'max_parallel_across_processes':max_parallel,'max_ancillary':max_ancillary,'reserved_auxiliary_lanes_verified':True,'head_queue_budget_verified':True,
             'single_primary_attempt':True,'recovered_committed_source_proof':True,'retry_limit_enforced':True}
 
 
@@ -207,12 +207,16 @@ def scheduler(root, url, *, child_mode=None):
                       acceptance=acc,batch_size=2,jobs=1,fetch_jobs=4,reserve_gib=0,primary_budget=1,
                       archive_ancillary=2,retry_jobs=1,max_retries=1,max_pending=6,max_main_batches=None,
                       stop_after_partition=(1 if child_mode=='stop' else 3),plan_only=False)
+    if child_mode in ('balance-kill','balance-timeout'):
+        a.balance_retries=True; a.balance_budget=1 if child_mode=='balance-timeout' else 12
+        a.max_pending=2; a.retry_only=False
     wave=[]
     waiting=False
     def retry(run,row,archive,previous,known,n,consumed=0,prefer_ranges=False):
         t=time.monotonic(); identity=row['source']; p=identity['pdb_id']; wave.append((p,waiting,t))
         time.sleep(.14)
-        state={'attempts':1,'next_epoch':0,'state':'READY','check':identity | {'retry_network_bytes':0,'availability':'VERIFIED'}}
+        state=({'attempts':0,'next_epoch':time.time()+60,'state':'FAILED'} if child_mode=='balance-timeout' else
+               {'attempts':1,'next_epoch':0,'state':'READY','check':identity | {'retry_network_bytes':0,'availability':'VERIFIED'}})
         key=digest(tuple(identity[k] for k in rolling.SPEC)); queue=run/'retry_cache'/key
         queue.mkdir(exist_ok=True,parents=True); durable_json(queue/'attempt.json',state)
         return state
@@ -224,7 +228,13 @@ def scheduler(root, url, *, child_mode=None):
             with subprocess.Popen([sys.executable,'-c','import time; time.sleep(2.6)']) as child:
                 assert rolling.wait_stage(child,a.pump_retry)==0
             waiting=False
-        pending=keys if child_mode is None and label in ('b0001','b0002') else []
+        if child_mode=='balance-kill' and label=='b0002':
+            saved=read(run/'retry_balance'/'b0002.json'); marker=read(root/'balance_killed.json')
+            assert saved['state']=='DRAINED' and saved['final']['queued'] < 2
+            assert saved['started_epoch']==marker['started_epoch']
+            durable_json(root/'balance_resumed.json',saved)
+        pending=keys if (child_mode is None and label in ('b0001','b0002') or
+                         child_mode in ('balance-kill','balance-timeout') and label=='b0001') else []
         if child_mode=='download' and label=='b0001':
             frozen=pin(PDB) | {'expected_bytes':len(BODY)}
             proof=done/'source_proofs'/f'{PDB}.json'; marker=root/'killed_download.json'
@@ -256,7 +266,14 @@ def scheduler(root, url, *, child_mode=None):
             os.kill(os.getpid(),signal.SIGKILL)
     if child_mode=='kill' and (root/'killed_receipt.json').is_file():
         durable_json(root/'replay_start.json',{'time':time.monotonic()})
-    with patch.multiple(rolling,stage_batch=stage,retry_download=retry,once=once,
+    def save(path,value):
+        durable_json(path,value)
+        marker=root/'balance_killed.json'
+        if child_mode=='balance-kill' and path==run/'retry_balance'/'b0002.json' and not marker.is_file():
+            assert value['state']=='DRAINING' and value['next_partition']=='b0002'
+            durable_json(marker,value)
+            os.kill(os.getpid(),signal.SIGKILL)
+    with patch.multiple(rolling,stage_batch=stage,retry_download=retry,once=once,write=save,
                         Archive=lambda *a,**kw: Archive(*a,**kw,local_test=True)):
         rolling.rolling(a)
     if child_mode is not None:
@@ -279,7 +296,8 @@ def real_supervised(root,url):
         args=[sys.executable,'-B',__file__,'--journal-child',str(where),url,mode]
         assert supervise(run,args,limit=2,backoff=.05,lease_wait=4)==0
         status=read(run/'supervisor_status.json'); assert status['state']=='NORMAL_EXIT'
-        assert read(run/'rolling_progress.json')['status']=='PAUSED_OBSERVATION_LIMIT'
+        expected='PAUSED_RETRY_DRAIN_TIMEOUT' if mode=='balance-timeout' else 'PAUSED_OBSERVATION_LIMIT'
+        assert read(run/'rolling_progress.json')['status']==expected
         return where,run,status
     where,run,status=run_site('kill'); evidence=read(where/'killed_receipt.json')
     assert status['restarts']==1 and evidence['head']=='holo-m3-test-seed'
@@ -292,7 +310,16 @@ def real_supervised(root,url):
     download,trial,state=run_site('download')
     assert state['restarts']==1 and read(trial/'rolling_progress.json')['new_settled_entries']==5
     assert (download/'killed_download.json').is_file()
-    return {'verified_download_proof_reused_after_real_exit':True,'signal':'SIGKILL','automatic_restarts':1,'waited_for_descendant_lease':True,
+    balanced,balance_run,state=run_site('balance-kill')
+    assert state['restarts']==1 and (balanced/'balance_resumed.json').is_file()
+    assert read(balance_run/'rolling_progress.json')['new_settled_entries']==5
+    assert read(balance_run/'retry_progress.json')['queued']==0
+    _,held,state=run_site('balance-timeout')
+    assert state['restarts']==0 and read(held/'rolling_progress.json')['partitions_completed']==1
+    assert read(held/'retry_balance'/'b0002.json')['state']=='DRAIN_TIMEOUT'
+    assert not (held/'receipts'/'b0002.json').is_file()
+    return {'durable_balance_resumed_after_SIGKILL':True,'balance_timeout_stops_primary':True,
+            'verified_download_proof_reused_after_real_exit':True,'signal':'SIGKILL','automatic_restarts':1,'waited_for_descendant_lease':True,
             'receipt_hash_preserved':True,'unique_records_after_restart':2,'intentional_stop_restarts':0}
 
 
