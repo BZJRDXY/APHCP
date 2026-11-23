@@ -116,6 +116,31 @@ class PublicReviewStatusTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Production recovery gate evidence is incomplete'):
             render(self.root, self.runtime)
 
+    def test_three_main_separates_live_recovery_and_shutdown(self):
+        batch = {'frozen': 5, 'first_pending': 1, 'pending_at_stop': 0, 'settled_at_stop': 5}
+        values = {
+            'status': 'PASS_BOUNDED_EXECUTION', 'verified_utc': '2026-01-04T01:00:00Z',
+            'execution_commit': 'a'*40, 'verified_public_runtime_sha256': self.runtime,
+            'batch': {'b0011': batch, 'b0012': batch, 'b0013': batch | {'pending_at_stop': 1, 'settled_at_stop': 4}},
+            'progress': {'status': 'PAUSED_OBSERVATION_LIMIT', 'partitions_completed': 13,
+                         'new_settled_entries': 64, 'attempted_pending_count': 1, 'unattempted_entries': 15},
+            'catalog': {'REGISTERED': 2, 'REVIEW': 8, 'NOT_EXPORTED': 1}, 'frozen_rolling_entries': 80,
+            'mainline': {'new_gaps': 3, 'merged_before_or_at_third_commit': 1,
+                         'merged_after_third_commit': 1, 'backlog_at_third_commit': 2},
+            'partition_14_preflight_or_dispatch': False, 'sqlite_integrity_ok': True,
+            'sqlite_foreign_keys_ok': True, 'controller_exit_clean': True, 'staging_release_count': 0,
+            'query_checks': [{'path': 'PRIVATE_ASSET_PATH'}],
+        }
+        self.put('three-main.json', values)
+        self.write(self.root / SOURCES, self.sources | {'m3_three_main': 'three-main.json'})
+        page = render(self.root, self.runtime)
+        self.assertIn('**1** were recovered and merged by the last main seal and **1** more at shutdown', page)
+        self.assertIn('**10** retrievable systems', page)
+        self.assertNotIn('PRIVATE_ASSET_PATH', page)
+        self.put('three-main.json', values | {'mainline': values['mainline'] | {'backlog_at_third_commit': 1}})
+        with self.assertRaisesRegex(ValueError, 'Three-batch production totals'):
+            render(self.root, self.runtime)
+
     def test_changed_rollup_or_replay_cannot_be_published(self):
         self.put('rerun.json', self.first | {'database_registration_reused': True, 'results_sha256': 'e'*64})
         with self.assertRaisesRegex(ValueError, 'registration and replay receipts disagree'):

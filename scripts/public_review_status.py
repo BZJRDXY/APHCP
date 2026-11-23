@@ -192,6 +192,41 @@ def after_ten_section(root, name):
 '''
 
 
+
+def three_main_section(root, name, runtime):
+    r, _ = receipt(root, name)
+    progress, main, catalog = r['progress'], r['mainline'], r['catalog']
+    batches = r['batch']
+    require(sorted(batches) == ['b0011', 'b0012', 'b0013'] and
+            r['status'] == 'PASS_BOUNDED_EXECUTION' and progress['status'] == 'PAUSED_OBSERVATION_LIMIT' and
+            progress['partitions_completed'] == 13 and r['partition_14_preflight_or_dispatch'] is False and
+            all(r[k] is True for k in ('sqlite_integrity_ok', 'sqlite_foreign_keys_ok', 'controller_exit_clean')) and
+            sum(count(b['first_pending']) for b in batches.values()) == count(main['new_gaps']) and
+            sum(count(b['pending_at_stop']) for b in batches.values()) == count(progress['attempted_pending_count']) and
+            count(r['staging_release_count']) == 0,
+            'Three-batch production boundary or per-batch evidence does not reconcile')
+    attempted = sum(count(b['frozen']) for b in batches.values())
+    during, after = count(main['merged_before_or_at_third_commit']), count(main['merged_after_third_commit'])
+    settled, pending, unattempted = (count(progress[k]) for k in
+                                     ('new_settled_entries', 'attempted_pending_count', 'unattempted_entries'))
+    frozen = count(r['frozen_rolling_entries'])
+    q = sum(count(catalog.get(k, 0)) for k in ('OBSERVED', 'PREPARATION_USE_RECORDED', 'REGISTERED', 'REVIEW'))
+    commit = r['execution_commit']
+    require(isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit) and
+            settled + pending + unattempted == frozen and
+            sum(count(b['settled_at_stop']) for b in batches.values()) + pending == attempted and
+            during + count(main['backlog_at_third_commit']) == main['new_gaps'] and
+            after + pending == main['backlog_at_third_commit'],
+            'Three-batch production totals or source commit do not reconcile')
+    return f'''## M3 · Three consecutive production batches (unpublished)
+
+- Verified **{utc(r['verified_utc'])}** against execution commit `{commit}`. {code_link(r.get('verified_public_runtime_sha256'), runtime)}
+- Batches 11–13 attempted **{attempted:,}** entries. **{main['new_gaps']:,}** technical gaps appeared; **{during:,}** were recovered and merged by the last main seal and **{after:,}** more at shutdown, leaving **{pending:,}**. Batch 14 was neither preflighted nor dispatched. Three batches do not establish sustained recovery capacity or a full-catalog ETA.
+- **{settled:,} / {frozen:,}** rolling entries were settled and **{unattempted:,}** had not started. The staging catalog contained **{q:,}** retrievable systems, including **{catalog.get('REGISTERED', 0):,}** confirmed in staging. Database integrity, foreign keys and file retrieval were checked. No dataset release was created.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -258,6 +293,7 @@ def render(root: Path, current_runtime: str):
     recovery = recovery_section(root, src['m3_rolling_recovery']) if src.get('m3_rolling_recovery') else ''
     production_gate = rolling_gate_section(root, src['m3_rolling_production_gate']) if src.get('m3_rolling_production_gate') else ''
     after_ten = after_ten_section(root, src['m3_after_ten']) if src.get('m3_after_ten') else ''
+    three_main = three_main_section(root, src['m3_three_main'], current_runtime) if src.get('m3_three_main') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -280,7 +316,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}## Open review
 
 {pending}
 

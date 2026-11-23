@@ -58,6 +58,12 @@ Public runtime fingerprint (SHA-256): `790d6af2f4dc1a26969f054c0bdadfea7feccecbf
 - With the same 34-system staging input, registration took **23.1 → 5.8 s**. The database integrity and foreign-key checks still ran, and the review result hash and registry counts matched.
 - Same-input replay preserved **174** checked evidence files, including the catalog, receipts, and source proofs.
 
+## M3 · Three consecutive production batches (unpublished)
+
+- Verified **2026-11-23T14:08:48+00:00** against execution commit `e13dbfebe264886e8e37d167e709b66d668a3eac`. The accepted evidence covers this public runtime fingerprint.
+- Batches 11–13 attempted **1,369** entries. **237** technical gaps appeared; **31** were recovered and merged by the last main seal and **19** more at shutdown, leaving **187**. Batch 14 was neither preflighted nor dispatched. Three batches do not establish sustained recovery capacity or a full-catalog ETA.
+- **6,682 / 233,639** rolling entries were settled and **226,770** had not started. The staging catalog contained **73,031** retrievable systems, including **1,357** confirmed in staging. Database integrity, foreign keys and file retrieval were checked. No dataset release was created.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.
