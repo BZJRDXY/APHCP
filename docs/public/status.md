@@ -71,10 +71,16 @@ Public runtime fingerprint (SHA-256): `d898ce742d067a3c4ffa24464a6bf94eded7cd64c
 - **180** new technical gaps appeared. **15** were merged during production and **60** more at shutdown, leaving **107** pending overall. Expansion was held because retries did not keep up.
 - **8,412 / 233,639** rolling entries were settled. The staging catalog contained **80,058** retrievable systems; no dataset release was created.
 
+## M3 · Bounded rolling-production launch (unpublished)
+
+- Batches 17–19 passed the gate at **2026-11-23T17:14:34+00:00** using `49ef3c74d7ee72fcababdd9f4764389df24d4c58`. Automatic pause and resumption occurred under production load. File retrieval, same-input replay, and the closing backlog check passed.
+- **1,650** new entries were attempted; **110** retry entries were recovered. At the gate, **10,166 / 233,639** rolling entries were settled, **3** technical entries had exhausted retries, and no actionable retries remained.
+- The staging catalog then contained **88,623** retrievable systems, including **1,933** confirmed in staging. No dataset release was created.
+- The subsequent run was independently observed after launch at **2026-11-23T17:15:56+00:00** and is capped at absolute batch **100**. This is launch evidence, not a live status or completion claim.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.
 - Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.
-- Verify that sustained recovery keeps pace with mainline technical gaps before resuming large-scale rolling production.
 
 See the [review guide](review.md) for scope, evidence definitions and review instructions.

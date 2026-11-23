@@ -260,6 +260,35 @@ def archive_admission_section(root, name):
 '''
 
 
+def balanced_scale_section(root, name):
+    r, _ = receipt(root, name)
+    audit, gate, launch = (r[k] for k in ('audit', 'gate', 'launch'))
+    total = count(audit['source_reconcile'])
+    final = audit['final']
+    pending, exhausted = count(final['pending']), count(audit['terminal_retry']['exhausted'])
+    retrieved = count(audit['catalog_count'])
+    registered = count(audit['catalog_dispositions']['REGISTERED'])
+    commit = audit['code_commit']
+    require(re.fullmatch(r'[0-9a-f]{40}', commit) and audit['status'] == 'PASS_BOUNDED_EXECUTION' and
+            audit['staging_releases'] == 0 and audit['no_next_preflight'] is True and
+            count(final['partitions']) == 19 and registered <= retrieved and
+            count(final['settled']) + pending + count(final['unattempted']) == total and pending == exhausted and
+            gate['allowed'] is True and gate['same_input_replay'] is True and gate['target'] == 100 and
+            gate['current_actionable'] == gate['observed_main_head_local_timeouts'] == 0 and
+            any(k != 'closing' and b['state'] == 'DRAINED' for k, b in audit['balance_boundaries'].items()) and
+            launch['observed_supervisor'] in ('RUNNING', 'RECOVERY_BACKOFF', 'NORMAL_EXIT') and
+            launch['absolute_stop'] == 100 and launch['execution_commit'] == commit,
+            'Missing reconciled balance pilot or verified bounded launch')
+    return f'''## M3 · Bounded rolling-production launch (unpublished)
+
+- Batches 17–19 passed the gate at **{utc(gate['checked_utc'])}** using `{commit}`. Automatic pause and resumption occurred under production load. File retrieval, same-input replay, and the closing backlog check passed.
+- **{count(audit['main_input']):,}** new entries were attempted; **{count(audit['merged_total']):,}** retry entries were recovered. At the gate, **{count(final['settled']):,} / {total:,}** rolling entries were settled, **{exhausted:,}** technical entries had exhausted retries, and no actionable retries remained.
+- The staging catalog then contained **{retrieved:,}** retrievable systems, including **{registered:,}** confirmed in staging. No dataset release was created.
+- The subsequent run was independently observed after launch at **{utc(launch['observed_utc'])}** and is capped at absolute batch **100**. This is launch evidence, not a live status or completion claim.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -328,6 +357,7 @@ def render(root: Path, current_runtime: str):
     after_ten = after_ten_section(root, src['m3_after_ten']) if src.get('m3_after_ten') else ''
     three_main = three_main_section(root, src['m3_three_main'], current_runtime) if src.get('m3_three_main') else ''
     admission = archive_admission_section(root, src['m3_archive_admission']) if src.get('m3_archive_admission') else ''
+    balanced = balanced_scale_section(root, src['m3_balanced_scale']) if src.get('m3_balanced_scale') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -350,7 +380,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}## Open review
 
 {pending}
 
