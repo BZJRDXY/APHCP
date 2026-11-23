@@ -12,6 +12,7 @@ import time
 from holo_m2_chemtype import annotate_batch
 from holo_m3_register import frozen_registry_root, require, read, sha, write, file_ref
 from holo_m3_observations import append_increment
+from holo_archive_runtime import sync_path
 
 
 def once(path, doc):
@@ -63,10 +64,18 @@ def prior_inputs(m2, batch, selected=None):
             'entry_evidence':evidence,'candidates':candidates}, nominations
 
 
+def owner_lease(a):
+    return tuple(getattr(a, "controller_lease_fd", ()))
+
+
 def submit_m2(a, m2):
     here = Path(__file__).resolve().parent
-    subprocess.run([sys.executable, '-B', str(here/'holo_m2_blind.py'), str(m2), '--index', str(a.index),
-                    '--jobs', str(a.jobs), '--fetch-jobs', str(a.fetch_jobs)], check=True)
+    cmd=[sys.executable,'-B',str(here/'holo_m2_blind.py'),str(m2),'--index',str(a.index),
+         '--jobs',str(a.jobs),'--fetch-jobs',str(a.fetch_jobs)]
+    if getattr(a,'archive_slots',None):
+        cmd+=['--archive-slots',str(a.archive_slots),'--archive-limit',str(a.archive_limit),
+              '--archive-ancillary',str(a.archive_ancillary),'--primary-budget',str(a.primary_budget)]
+    subprocess.run(cmd,check=True,pass_fds=owner_lease(a))
 
 
 def link_cached_raw(previous, target, pdb):
@@ -113,7 +122,7 @@ def stage(a, root, run, m2, seed, keep, previous_successes):
         here = Path(__file__).resolve().parent
         subprocess.run([sys.executable,'-B',str(here/'holo_m3_register.py'),'register','--root',str(root),
                         '--run',str(run),'--manifest',str(manifest),'--git-head',a.git_head,'--jobs',str(a.jobs),
-                        '--seed-run',str(seed)],check=True)
+                        '--seed-run',str(seed)],check=True,pass_fds=owner_lease(a))
     catalog = append_increment(root,run,seed,in_f,out_f,a.git_head)
     review_file = run/'review_results.json'
     reviews = read(review_file) if review_file.is_file() else []
@@ -130,6 +139,9 @@ def stage(a, root, run, m2, seed, keep, previous_successes):
                'review_dispositions':dict(Counter(r['disposition'] for r in reviews)), 'chemistry':chem,
                'catalog':catalog, 'm2_pending':sorted(m2_retry), 'm3_pending':sorted(m3_retry), 'settled_keys':settled,
                'skipped_prior_successes':len(retry_catalogued), 'elapsed_s':round(time.monotonic()-started,3)}
+    # The catalog transaction has returned and closed before advertising its receipt.
+    registry=Path(catalog['registry']); sync_path(registry); sync_path(registry.parent)
+    sync_path(registry.parent.parent); sync_path(registry.parent.parent.parent); sync_path(run.parent)
     write(run/'phase_receipt.json', receipt)
     return receipt
 
@@ -158,7 +170,7 @@ def run_pipeline(a):
                 result=read(done)
                 require(set(result['selected'])<=pending and result['previous_catalog_run']==str(seed), 'phase_sequence_changed')
             else:
-                if len(executed)>=a.passes:
+                if (index>0 and getattr(a,'defer_pending',False)) or len(executed)>=a.passes:
                     break
                 if index==0:
                     selected=pending; source=m2; process=not a.adopt_m2
@@ -197,6 +209,10 @@ if __name__=='__main__':
     parser.add_argument('--adopt-m2',action='store_true',help='Use an existing frozen M2 Run without writing to it')
     parser.add_argument('--passes',type=int,default=2,help='Maximum new phases per invocation')
     parser.add_argument('--fetch-jobs',type=int,default=16)
+    parser.add_argument('--defer-pending',action='store_true',help='Replay sealed phases but never start a new retry phase')
+    parser.add_argument('--controller-lease-fd',type=int,action='append',default=[],help=argparse.SUPPRESS)
+    parser.add_argument('--archive-slots',type=Path); parser.add_argument('--archive-limit',type=int,default=24)
+    parser.add_argument('--archive-ancillary',type=int,default=6); parser.add_argument('--primary-budget',type=float,default=30)
     parser.add_argument('--batch',required=True)
     parser.add_argument('--expected-entries',type=int,required=True)
     parser.add_argument('--git-head',required=True)

@@ -118,6 +118,24 @@ def production_section(root, source, heading="First continuous production batch"
 '''
 
 
+def recovery_section(root, name):
+    r, _ = receipt(root, name)
+    first, later = r['fourth_batch'], r['isolated']
+    require(r['scope'] == 'ISOLATED_ONLY' and r['live_head_unchanged'] is True and
+            count(first['entries']) == count(first['reused']) + count(first['recovered']) and
+            count(later['settled']) == count(later['entries']) and
+            later['next_primary_before_retry'] is True and later['replay_unchanged'] is True and
+            count(later['retry_receipts']) == 1 and count(first['releases']) == 0,
+            'Missing completed isolated rolling recovery evidence')
+    return f'''## M3 · Rolling recovery control (isolated, unpublished)
+
+- Verified: **{utc(r['verified_utc'])}**. The interrupted batch reconciled **{first['entries']:,}** entries in an isolated catalog: **{first['reused']:,}** reused, **{first['recovered']:,}** recovered. The live catalog pointer was left in place.
+- A separate **{later['entries']:,}**-entry control sealed its next primary batch before the slow-file retry merged. A bounded Range retry recovered the previously partial archive bodies. The retry wave merged once, and replay did not change committed receipts.
+- This is engineering verification on already scoped entries. Sustained production throughput and the live controller handoff are outside this control.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -181,6 +199,7 @@ def render(root: Path, current_runtime: str):
         require(gate['accepted'] is True and 300 <= count(gate['frozen_entries']) <= 500,
                 'Missing bounded production scale gate')
         production += production_section(root, next_window, 'Scale gate: second continuous production batch')
+    recovery = recovery_section(root, src['m3_rolling_recovery']) if src.get('m3_rolling_recovery') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -203,7 +222,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}## Open review
+{pilot}{production}{recovery}## Open review
 
 {pending}
 

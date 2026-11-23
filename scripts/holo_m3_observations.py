@@ -296,7 +296,7 @@ def lookup_records(run, *, pdb=None, system=None, verify_files=False, limit=None
         column, value = ('pdb_id', pdb.upper()) if pdb else ('object_id', system)
         grouped = defaultdict(list)
         for item in db.execute(f'''SELECT run_id,object_id,object_type,error_message FROM run_item
-            WHERE stage=? AND {column}=? ORDER BY object_type DESC, object_id, run_id''', (STAGE, value)):
+            WHERE stage=? AND {column}=? ORDER BY object_type DESC, object_id, updated_at, run_id''', (STAGE, value)):
             grouped[item['object_type'], item['object_id']].append((item['run_id'], json.loads(item['error_message'])))
         decisions = defaultdict(list)
         if any('system_id' in records[0][1] for records in grouped.values()):

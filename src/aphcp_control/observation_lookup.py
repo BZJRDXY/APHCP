@@ -35,7 +35,15 @@ def catalog_view(root, controller, bundle, pdb):
             seed = Path(spec['seed_run'])
             if seed.parent != runs or not re.fullmatch(r'holo-m3-[a-z0-9-]+-phase-\d{3}', seed.name):
                 raise ValueError('Invalid rolling catalog seed')
-            pattern = rf'(?:{re.escape(seed.name)}|{re.escape(controller)}-b\d{{4}}(?:-r\d{{2}})?-phase-\d{{3}})'
+            owners = [controller]
+            if inherited := spec.get('continued_from'):
+                legacy = Path(inherited)
+                if (legacy.parent != runs or legacy.resolve(strict=True) != legacy or
+                        not re.fullmatch(r'holo-m3-[a-z0-9-]+', legacy.name) or legacy.name == controller):
+                    raise ValueError('Invalid previous rolling controller')
+                owners.append(legacy.name)
+            batch_owner = '|'.join(map(re.escape, owners))
+            pattern = rf'(?:{re.escape(seed.name)}|(?:{batch_owner})-b\d{{4}}(?:-r\d{{2,}})?-phase-\d{{3}})'
     if (not re.fullmatch(pattern, label) or (runs/label).resolve()!=runs/label or
             not (runs/label/'phase_receipt.json').is_file()):
         raise ValueError('Invalid catalog head')

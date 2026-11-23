@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `84883fe9ae26f0f092857269ae0e196e9344d0ac11c1dbd3c056af07f3dfcf23`
+Public runtime fingerprint (SHA-256): `3cc862b34e288a51d076e2b862aa1d9699d7646919806b2e86fd705ca14c0cda`
 
 ## M1 · Metadata inventory
 
@@ -36,6 +36,12 @@ Public runtime fingerprint (SHA-256): `84883fe9ae26f0f092857269ae0e196e9344d0ac1
 - Independently verified: **2026-11-23T06:18:02+00:00**. First release dates from **2018-02-22** (included) to **2018-03-01** (excluded).
 - **325** exact-revision originals verified; **2,174** candidates, **2,035** read back and **2,035** new retrievable systems. **72** confirmed in staging; **1,963** held for review. Unified catalog: **48,560** retrievable systems.
 - **115,424,513 bytes** of archival response bodies; **456.5 s** for the production pipeline in this window. Replaying the same input reused committed phases. In a separate control, the resume command repaired one failed Entry without modifying prior results.
+
+## M3 · Rolling recovery control (isolated, unpublished)
+
+- Verified: **2026-11-23T08:51:36+00:00**. The interrupted batch reconciled **550** entries in an isolated catalog: **547** reused, **3** recovered. The live catalog pointer was left in place.
+- A separate **34**-entry control sealed its next primary batch before the slow-file retry merged. A bounded Range retry recovered the previously partial archive bodies. The retry wave merged once, and replay did not change committed receipts.
+- This is engineering verification on already scoped entries. Sustained production throughput and the live controller handoff are outside this control.
 
 ## Open review
 

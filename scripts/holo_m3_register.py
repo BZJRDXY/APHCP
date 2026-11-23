@@ -59,9 +59,8 @@ def digest(x):return hashlib.sha256(raw_json(x).encode()).hexdigest()
 
 
 def write(path,x):
-    path=Path(path); tmp=path.with_suffix(path.suffix+'.tmp')
-    with tmp.open('w',encoding='utf8',newline='\n') as f:f.write(json.dumps(x,ensure_ascii=False,sort_keys=True,indent=2)+'\n')
-    tmp.replace(path)
+    from holo_archive_runtime import durable_json
+    durable_json(Path(path),x)
 
 
 def read_only_path(path, allowed):
