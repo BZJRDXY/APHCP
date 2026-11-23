@@ -97,6 +97,25 @@ class PublicReviewStatusTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Continuous M3 verification or replay is incomplete'):
             render(self.root, self.runtime)
 
+    def test_rolling_gate_separates_residual_queue_and_preserves_scope(self):
+        batch = {'frozen': 5, 'pending_final': [], 'wall_from_previous_gate_s': 45.5}
+        values = {'status': 'PAUSED_OBSERVATION_LIMIT', 'verified_utc': '2026-01-04T01:00:00Z',
+                  'main_new_batches': {'b0005': batch, 'b0006': batch | {'pending_final': ['PRIVATE_EXAMPLE_ID']}},
+                  'pending': {'b0006': ['PRIVATE_EXAMPLE_ID']}, 'settled': 19, 'attempted': 20,
+                  'unattempted': 60, 'frozen_rolling_entries': 80, 'b4_reused': 4, 'b4_recovered': 1,
+                  'confirmed': 2, 'queryable': 24, 'releases': 0,
+                  'old_hashes_unchanged': True, 'observed_no_batch_7': True,
+                  'writer_locks_free': True, 'seed_records_preserved': True}
+        self.put('rolling-gate.json', values)
+        self.write(self.root / SOURCES, self.sources | {'m3_rolling_production_gate': 'rolling-gate.json'})
+        page = render(self.root, self.runtime)
+        self.assertIn('two new production batches attempted **10** entries', page)
+        self.assertIn('**19 / 80** frozen rolling entries', page)
+        self.assertNotIn('PRIVATE_EXAMPLE', page)
+        self.put('rolling-gate.json', values | {'observed_no_batch_7': False})
+        with self.assertRaisesRegex(ValueError, 'Production recovery gate evidence is incomplete'):
+            render(self.root, self.runtime)
+
     def test_changed_rollup_or_replay_cannot_be_published(self):
         self.put('rerun.json', self.first | {'database_registration_reused': True, 'results_sha256': 'e'*64})
         with self.assertRaisesRegex(ValueError, 'registration and replay receipts disagree'):

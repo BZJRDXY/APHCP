@@ -136,6 +136,32 @@ def recovery_section(root, name):
 '''
 
 
+def rolling_gate_section(root, name):
+    r, _ = receipt(root, name)
+    batches = r['main_new_batches']
+    pending = sum(len(v) for v in r['pending'].values())
+    require(r['status'] == 'PAUSED_OBSERVATION_LIMIT' and len(batches) == 2 and
+            all(r[key] is True for key in ('old_hashes_unchanged', 'observed_no_batch_7',
+                                           'writer_locks_free', 'seed_records_preserved')) and
+            count(r['settled']) + pending == count(r['attempted']) and
+            r['attempted'] + count(r['unattempted']) == count(r['frozen_rolling_entries']) and
+            count(r['confirmed']) <= count(r['queryable']) and count(r['releases']) == 0,
+            'Production recovery gate evidence is incomplete')
+    attempts = sum(count(b['frozen']) for b in batches.values())
+    pending_main = sum(len(b['pending_final']) for b in batches.values())
+    attempt_times = [b['wall_from_previous_gate_s'] for _, b in sorted(batches.items())]
+    require(attempts > 0 and 0 <= pending_main <= attempts and
+            all(type(t) in (float, int) and t > 0 for t in attempt_times), 'Invalid production recovery samples')
+    seal = ' / '.join(f'{t:.1f} s' for t in attempt_times)
+    return f'''## M3 · Bounded production recovery gate (unpublished)
+
+- Independently verified: **{utc(r['verified_utc'])}**. The previous controller was closed, its sealed history was preserved, and the interrupted batch was completed by reusing **{count(r['b4_reused']):,}** settled entries and recovering **{count(r['b4_recovered']):,}** missing ones.
+- Exactly two new production batches attempted **{attempts:,}** entries; **{pending_main:,}** were still pending in those batches at the observation limit. Successive batch seals took **{seal}**, including handoff/preflight where applicable. These observations do not establish a full-catalog ETA.
+- The staging catalog contained **{r['queryable']:,}** retrievable structures, including **{r['confirmed']:,}** confirmed in staging. Overall, **{r['settled']:,} / {r['frozen_rolling_entries']:,}** frozen rolling entries were settled; **{pending:,}** attempted entries remained pending. Production paused at the gate; no dataset release was created.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -200,6 +226,7 @@ def render(root: Path, current_runtime: str):
                 'Missing bounded production scale gate')
         production += production_section(root, next_window, 'Scale gate: second continuous production batch')
     recovery = recovery_section(root, src['m3_rolling_recovery']) if src.get('m3_rolling_recovery') else ''
+    production_gate = rolling_gate_section(root, src['m3_rolling_production_gate']) if src.get('m3_rolling_production_gate') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -222,7 +249,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}## Open review
+{pilot}{production}{recovery}{production_gate}## Open review
 
 {pending}
 

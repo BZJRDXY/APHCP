@@ -43,6 +43,12 @@ Public runtime fingerprint (SHA-256): `3cc862b34e288a51d076e2b862aa1d9699d764691
 - A separate **34**-entry control sealed its next primary batch before the slow-file retry merged. A bounded Range retry recovered the previously partial archive bodies. The retry wave merged once, and replay did not change committed receipts.
 - This is engineering verification on already scoped entries. Sustained production throughput and the live controller handoff are outside this control.
 
+## M3 · Bounded production recovery gate (unpublished)
+
+- Independently verified: **2026-11-23T09:21:00+00:00**. The previous controller was closed, its sealed history was preserved, and the interrupted batch was completed by reusing **547** settled entries and recovering **3** missing ones.
+- Exactly two new production batches attempted **1,100** entries; **57** were still pending in those batches at the observation limit. Successive batch seals took **398.2 s / 441.1 s**, including handoff/preflight where applicable. These observations do not establish a full-catalog ETA.
+- The staging catalog contained **59,036** retrievable structures, including **809** confirmed in staging. Overall, **3,243 / 233,639** frozen rolling entries were settled; **57** attempted entries remained pending. Production paused at the gate; no dataset release was created.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.
