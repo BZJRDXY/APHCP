@@ -64,6 +64,13 @@ Public runtime fingerprint (SHA-256): `d898ce742d067a3c4ffa24464a6bf94eded7cd64c
 - Batches 11–13 attempted **1,369** entries. **237** technical gaps appeared; **31** were recovered and merged by the last main seal and **19** more at shutdown, leaving **187**. Batch 14 was neither preflighted nor dispatched. Three batches do not establish sustained recovery capacity or a full-catalog ETA.
 - **6,682 / 233,639** rolling entries were settled and **226,770** had not started. The staging catalog contained **73,031** retrievable systems, including **1,357** confirmed in staging. Database integrity, foreign keys and file retrieval were checked. No dataset release was created.
 
+## M3 · Archive admission and retry capacity (unpublished)
+
+- Verified **2026-11-23T16:10:58+00:00** against execution commit `8000770af198e23a9afae98a6b7a4ff09d0d0127`. From **187** existing gaps, **185** were recovered and merged before the next main batch.
+- Batches 14–16 attempted **1,650** entries. **1,650** HEAD requests reached HTTP; **0** timed out waiting locally. Main GET had **170** partial-body timeouts. The shared archive slot limit was unchanged.
+- **180** new technical gaps appeared. **15** were merged during production and **60** more at shutdown, leaving **107** pending overall. Expansion was held because retries did not keep up.
+- **8,412 / 233,639** rolling entries were settled. The staging catalog contained **80,058** retrievable systems; no dataset release was created.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.
