@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `790d6af2f4dc1a26969f054c0bdadfea7feccecbf6f9a6a94b1573e577c81ce6`
+Public runtime fingerprint (SHA-256): `a2ddf520898e84b5b0c7f7915a5cfed0fafa41a1b5bf2b45230c7eae33e905a3`
 
 ## M1 · Metadata inventory
 
@@ -60,7 +60,7 @@ Public runtime fingerprint (SHA-256): `790d6af2f4dc1a26969f054c0bdadfea7feccecbf
 
 ## M3 · Three consecutive production batches (unpublished)
 
-- Verified **2026-11-23T14:08:48+00:00** against execution commit `e13dbfebe264886e8e37d167e709b66d668a3eac`. The accepted evidence covers this public runtime fingerprint.
+- Verified **2026-11-23T14:08:48+00:00** against execution commit `e13dbfebe264886e8e37d167e709b66d668a3eac`. Current public runtime is not covered by this evidence (verified runtime: `790d6af2f4dc1a26969f054c0bdadfea7feccecbf6f9a6a94b1573e577c81ce6`).
 - Batches 11–13 attempted **1,369** entries. **237** technical gaps appeared; **31** were recovered and merged by the last main seal and **19** more at shutdown, leaving **187**. Batch 14 was neither preflighted nor dispatched. Three batches do not establish sustained recovery capacity or a full-catalog ETA.
 - **6,682 / 233,639** rolling entries were settled and **226,770** had not started. The staging catalog contained **73,031** retrievable systems, including **1,357** confirmed in staging. Database integrity, foreign keys and file retrieval were checked. No dataset release was created.
 

@@ -1,10 +1,12 @@
 """Archive request limits and crash-safe publication for the rolling M3 runner."""
-from contextlib import contextmanager
+from collections import deque
+from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import Condition
 import time
 from urllib.parse import urlsplit
 
@@ -37,6 +39,10 @@ def durable_json(path, value):
         temp.unlink(missing_ok=True)
 
 
+class ArchiveAdmissionTimeout(TimeoutError):
+    """The request could not start before its local slot deadline."""
+
+
 class Archive:
     """One process-wide slot budget with protected main, HEAD, and retry lanes."""
     def __init__(self, folder, limit, ancillary, *, local_test=False, lease_fds=()):
@@ -45,6 +51,8 @@ class Archive:
         self.folder = Path(folder); self.folder.mkdir(parents=True, exist_ok=True)
         self.limit = limit; self.ancillary = ancillary; self.local_test = local_test
         self.lease_fds = tuple(lease_fds)
+        self._head_condition = Condition()
+        self._head_waiters = deque()
 
     @contextmanager
     def slot(self, kind, deadline=None, *, trace=None):
@@ -74,11 +82,44 @@ class Archive:
                     return
             remaining=.012 if deadline is None else min(.012,max(0,deadline-time.monotonic()))
             if remaining: time.sleep(remaining)
-        if trace is not None:
-            trace.update(kind=kind,queued_s=round(time.monotonic()-enqueued,4),phase='QUEUE',exit_code=28,body_bytes=0)
-        raise TimeoutError('Archive slot wait exhausted file budget')
+        self._admission_timeout(kind, enqueued, trace)
 
-    def request(self, url, kind, output, seconds, trace, *, headers=(), deadline=None):
+    @staticmethod
+    def _admission_timeout(kind, queued, trace):
+        if trace is not None:
+            trace.update(kind=kind, queued_s=round(time.monotonic()-queued, 4), phase='QUEUE',
+                         http_started=False, exit_code=28, body_bytes=0)
+        raise ArchiveAdmissionTimeout('Archive slot wait exhausted local admission budget')
+
+    @contextmanager
+    def _head_slot(self, queued, deadline, trace):
+        # The bounded lookahead and retry pools share this FIFO. Advance once a
+        # slot is acquired, so spare shared slots remain available in parallel.
+        token = object()
+        condition = self._head_condition
+        with condition:
+            self._head_waiters.append(token)
+        with ExitStack() as held:
+            try:
+                with condition:
+                    while self._head_waiters[0] is not token:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            self._admission_timeout('head', queued, trace)
+                        condition.wait(left)
+                try:
+                    slot = held.enter_context(self.slot('head', deadline, trace=trace))
+                except ArchiveAdmissionTimeout:
+                    self._admission_timeout('head', queued, trace)
+            finally:
+                with condition:
+                    self._head_waiters.remove(token)
+                    condition.notify_all()
+            yield slot
+
+    def request(self, url, kind, output, seconds, trace, *, headers=(), deadline=None, queue_deadline=None):
+        if queue_deadline is not None and (kind != 'head' or deadline is not None):
+            raise ValueError('Separate bounded admission is only supported for HEAD')
         parsed = urlsplit(url)
         protocol = '=https'
         if self.local_test and parsed.scheme == 'http' and parsed.hostname == '127.0.0.1':
@@ -88,12 +129,15 @@ class Archive:
             raise ValueError('archive request outside the fixed RCSB archive')
         output = Path(output)
         queued = time.monotonic()
-        with self.slot(kind, deadline, trace=trace) as (number, slot_fd):
+        admission = (self._head_slot(queued, queue_deadline, trace) if queue_deadline is not None
+                     else self.slot(kind, deadline, trace=trace))
+        with admission as (number, slot_fd):
             started = time.monotonic()
             remaining = min(seconds, deadline-started) if deadline is not None else seconds
             if remaining < .005:
-                raise TimeoutError('Archive file budget expired before request')
-            trace.update(kind=kind, slot=number, queued_s=round(started-queued, 4), started_monotonic=started)
+                self._admission_timeout(kind, queued, trace)
+            trace.update(kind=kind, slot=number, queued_s=round(started-queued, 4), started_monotonic=started,
+                         phase='HTTP', http_started=True)
             fmt = '%{http_code}\t%{size_download}\t%{time_starttransfer}\t%{time_total}'
             with tempfile.TemporaryFile() as header:
                 cmd = ['curl', '-q', '--silent', '--show-error', '--globoff', '--proto', protocol,
@@ -127,15 +171,20 @@ class Archive:
                 lines = raw.split('\n\n')[-1].splitlines()[1:]
                 return {k.lower():v.strip() for line in lines if ':' in line for k,v in [line.split(':',1)]}
 
-    def head(self, pin, seconds=12):
+    def head(self, pin, seconds=12, *, queue_seconds=150):
         from datetime import datetime, timezone
+        if seconds <= 0 or queue_seconds <= 0:
+            raise ValueError('HEAD requires positive HTTP and admission budgets')
         trace = {}; out = pin | {'checked_utc':datetime.now(timezone.utc).isoformat()}
         try:
-            fields = self.request(pin['source_url'], 'head', '/dev/null', seconds, trace,deadline=time.monotonic()+seconds)
+            fields = self.request(pin['source_url'], 'head', '/dev/null', seconds, trace,
+                                  queue_deadline=time.monotonic()+queue_seconds)
             n = int(fields.get('content-length', 0)); status = trace.get('http_status')
             if status==200 and n>0:
                 return out | {'status':status,'content_length':n,'final_url':pin['source_url'],
                               'availability':'VERIFIED','request':trace}
         except (OSError, ValueError) as e:
             out['error']=f'{type(e).__name__}: {e}'
-        return out | {'status':trace.get('http_status'),'availability':'DEFERRED_BEFORE_FREEZE','request':trace}
+        domain = 'LOCAL_ADMISSION' if trace.get('phase') == 'QUEUE' else 'ARCHIVE_RESPONSE'
+        return out | {'status':trace.get('http_status'),'availability':'DEFERRED_BEFORE_FREEZE',
+                      'failure_domain':domain,'request':trace}

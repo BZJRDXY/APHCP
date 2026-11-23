@@ -175,7 +175,8 @@ def prepare(run, label, rows, cache, jobs, archive):
         return archive.head(pin)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         checks=list(pool.map(probe,rows))
-    result={'input_digest':digest(rows),'checks':checks,'elapsed_s':round(time.monotonic()-start,3)}
+    result={'input_digest':digest(rows),'checks':checks,'elapsed_s':round(time.monotonic()-start,3),
+            'head_failures_by_domain':dict(Counter(c['failure_domain'] for c in checks if 'failure_domain' in c))}
     once(path,result)
     return result
 
@@ -195,8 +196,11 @@ def stage_batch(a, run, label, rows, seed, preflight):
     require(len(linked)==len(checks) and set(linked)=={identity(c) for c in checks}, 'rolling_preflight_does_not_cover_batch')
     allowed=[c for c in checks if c['availability']=='VERIFIED']
     deferred=sorted(c['pdb_id'] for c in checks if c['availability']!='VERIFIED')
+    local_deferred=sorted(c['pdb_id'] for c in checks if c.get('failure_domain')=='LOCAL_ADMISSION')
     if not allowed:
-        return {'status':'ARCHIVE_PENDING','catalog_run':seed.name,'total':len(rows),'pending':deferred,'settled':0,'network_bytes':0}
+        return {'status':'ADMISSION_PENDING' if len(local_deferred)==len(deferred) else 'ARCHIVE_PENDING',
+                'catalog_run':seed.name,'total':len(rows),'pending':deferred,'archive_deferred':deferred,
+                'head_admission_deferred':local_deferred,'settled':0,'network_bytes':0}
     m2.mkdir(exist_ok=True); m3.mkdir(exist_ok=True)
     inputs=m2/'inputs'; inputs.mkdir(exist_ok=True)
     once(inputs/'blind.json', [linked[identity(c)] for c in allowed])
@@ -225,7 +229,7 @@ def stage_batch(a, run, label, rows, seed, preflight):
                 raise subprocess.CalledProcessError(status,command)
     summary=read(current)
     require(read(m3/'increment_plan.json')['seed_run']==str(seed), 'rolling_seed_branch_disagrees')
-    return batch_outcome(runs,rows,m2,m3,summary,deferred,preflight,t)
+    return batch_outcome(runs,rows,m2,m3,summary,deferred,preflight,t) | {'head_admission_deferred':local_deferred}
 
 
 def batch_outcome(runs, rows, m2, m3, summary, deferred, preflight, started):
