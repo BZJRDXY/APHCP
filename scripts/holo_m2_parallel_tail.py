@@ -50,11 +50,15 @@ def assemble(r, tail, p, total, sig):
                 if q or row.get('shard_assembly_reference'): contexts.add(context)
             row.pop('shard_assembly_reference',None)
             if q:
+                assert context not in assemblies or assemblies[context]==q, 'Assembly evidence differs across slices'
                 assemblies[context]=q
                 if q['status']=='PASS':
-                    artifact=q['artifact']; src=shard/artifact['path']; dst=done/artifact['path']; dst.parent.mkdir(parents=True,exist_ok=True)
-                    assert sha256(src)==artifact['sha256']
-                    if not dst.exists(): os.link(src,dst)
+                    for name,expected in ((q['artifact']['path'],q['artifact']['sha256']),
+                                          (q['shared_evidence'],q['shared_evidence_sha256'])):
+                        src=shard/name; dst=done/name; dst.parent.mkdir(parents=True,exist_ok=True)
+                        assert sha256(src)==expected
+                        if dst.exists(): assert sha256(dst)==expected
+                        else: os.link(src,dst)
             reviewed.append(row)
     assert contexts<=set(assemblies), ('no elected Assembly writer',contexts,set(assemblies))
     for row in reviewed:
@@ -75,6 +79,26 @@ def assemble(r, tail, p, total, sig):
     atomic_json(entry,base); atomic_json(done/'receipt.json',{'entry':p,'slices':total,'eligible':len(ranks),'readback':base['structure_readback_pass'],
         'same_discovery_and_input':True,'source_sha256':digest,'assembled_utc':now(),'parent_core_sha256':sig})
     print('assembled',p,len(ranks),base['structure_readback_pass'],flush=True)
+
+
+def promote(run, tail, p, seconds):
+    """Publish verified slice outputs; the Entry receipt is the final write."""
+    done=tail/'assembled'/p
+    for folder in ('systems','assemblies'):
+        for src in (done/folder).rglob('*'):
+            if not src.is_file(): continue
+            dst=run/src.relative_to(done); dst.parent.mkdir(parents=True,exist_ok=True)
+            if dst.exists():
+                if sha256(src)!=sha256(dst): raise ValueError('Slice promotion found different existing artifact')
+            else: os.link(src,dst)
+    for folder in ('discovery','system_results'):
+        src=done/folder/f'{p}.json'; dst=run/folder/src.name
+        dst.parent.mkdir(parents=True,exist_ok=True)
+        # Copy the exact bytes that the merged Entry receipt hashes.
+        temp=dst.with_suffix('.promoting'); shutil.copyfile(src,temp); os.replace(temp,dst)
+    entry=read(done/'entry_results'/f'{p}.json')
+    entry['candidate_partition']['dispatch_to_promotion_s']=seconds
+    atomic_json(run/'entry_results'/f'{p}.json',entry)
 
 
 if __name__=='__main__': main()

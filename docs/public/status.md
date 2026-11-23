@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `3cc862b34e288a51d076e2b862aa1d9699d7646919806b2e86fd705ca14c0cda`
+Public runtime fingerprint (SHA-256): `5226d78b91f99606ce35a6bf507392a20a1990067dde3d991196b355d77265ac`
 
 ## M1 · Metadata inventory
 
@@ -49,9 +49,17 @@ Public runtime fingerprint (SHA-256): `3cc862b34e288a51d076e2b862aa1d9699d764691
 - Exactly two new production batches attempted **1,100** entries; **57** were still pending in those batches at the observation limit. Successive batch seals took **398.2 s / 441.1 s**, including handoff/preflight where applicable. These observations do not establish a full-catalog ETA.
 - The staging catalog contained **59,036** retrievable structures, including **809** confirmed in staging. Overall, **3,243 / 233,639** frozen rolling entries were settled; **57** attempted entries remained pending. Production paused at the gate; no dataset release was created.
 
+## M3 · Engineering verification after ten main batches (isolated)
+
+- Evidence snapshot **2026-11-23T13:13:10+00:00**: **107** of **160** existing technical gaps recovered; **53** remained at the snapshot. The main catalog pointer was unchanged and no new main batch started.
+- Verified that retries continue during a main-stage wait. In an isolated process interruption, recovery waited for the inherited writer lease and reused the committed receipt and source proof. Intentional exit did not restart.
+- Under the same 30-second transfer budget, whole GET verified **3 of 24** and Range verified **3 of 24**, with **24** and **66** requests respectively. The small-file Range threshold was retained.
+- On the same existing heavy entry, structure build took **183.4 → 74.9 s**; the separate independent review control took **149.4 → 49.9 s**, with equivalent candidate decisions and structure evidence. These are isolated timings, not whole-pipeline throughput.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.
 - Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.
+- Verify that sustained recovery keeps pace with mainline technical gaps before resuming large-scale rolling production.
 
 See the [review guide](review.md) for scope, evidence definitions and review instructions.

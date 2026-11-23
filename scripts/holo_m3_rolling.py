@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait, FIRST_COMPLETED
 from contextlib import ExitStack
 from csv import DictReader
 import datetime as dt
@@ -25,6 +25,11 @@ from holo_m3_register import (digest, file_ref, frozen_registry_root, jsonl,
                               read, require, sha, utc_now, write)
 
 GIB = 1 << 30
+TEMPORARY_INTERRUPTION = 75
+
+
+class InterruptedStage(RuntimeError):
+    pass
 SPEC = ('pdb_id', 'revision', 'source_url', 'file_type')
 PDB = re.compile(r'[0-9][A-Z0-9]{3}')
 REV = re.compile(r'\d+\.\d+')
@@ -175,6 +180,14 @@ def prepare(run, label, rows, cache, jobs, archive):
     return result
 
 
+def wait_stage(child, pump):
+    while True:
+        try:
+            return child.wait(timeout=.5)
+        except subprocess.TimeoutExpired:
+            pump()
+
+
 def stage_batch(a, run, label, rows, seed, preflight):
     t=time.monotonic()
     runs=a.root/'runs'; m3=runs/f'{run.name}-{label}'; m2=runs/f'holo-m2-{run.name.removeprefix("holo-m3-")}-{label}'
@@ -197,14 +210,19 @@ def stage_batch(a, run, label, rows, seed, preflight):
                     src=Path(proof['path']); require(src.is_relative_to(runs) and sha(src)==proof['sha256'], 'cached_raw_changed_after_preflight')
                     os.link(src,dst)
         pipeline=Path(__file__).resolve().with_name('holo_m3_increment.py')
-        subprocess.run([sys.executable,'-B',str(pipeline),'--root',str(a.root),'--m2-run',str(m2),'--m3-run',str(m3),
+        command=[sys.executable,'-B',str(pipeline),'--root',str(a.root),'--m2-run',str(m2),'--m3-run',str(m3),
                         '--batch',m3.name,'--seed-run',str(seed),'--index',str(a.index),'--reference-run',str(a.reference_run),
                         '--expected-entries',str(len(allowed)),'--jobs',str(a.jobs),'--fetch-jobs',str(a.fetch_jobs),
                         '--git-head',a.git_head,'--defer-pending','--archive-slots',str(a.archive.folder),
                         '--archive-limit',str(a.archive.limit),'--archive-ancillary',str(a.archive.ancillary),
                         '--primary-budget',str(a.primary_budget),
-                         *(v for fd in a.owner_fds for v in ('--controller-lease-fd',str(fd)))],
-                       check=True,pass_fds=a.owner_fds)
+                         *(v for fd in a.owner_fds for v in ('--controller-lease-fd',str(fd))) ]
+        with subprocess.Popen(command,pass_fds=a.owner_fds) as child:
+            status=wait_stage(child,a.pump_retry)
+            if status in (-9,TEMPORARY_INTERRUPTION):
+                raise InterruptedStage(f'Rolling increment interrupted: {status}')
+            if status:
+                raise subprocess.CalledProcessError(status,command)
     summary=read(current)
     require(read(m3/'increment_plan.json')['seed_run']==str(seed), 'rolling_seed_branch_disagrees')
     return batch_outcome(runs,rows,m2,m3,summary,deferred,preflight,t)
@@ -321,7 +339,8 @@ def retry_download(run, row, archive, previous, known_head, max_attempts, consum
                     check=check | {'verified_cached_file':verified}
                 else:
                     check=check | {'availability':'DEFERRED_BEFORE_FREEZE','error':proof.get('error')}
-        result={'pin':pin,'attempts':attempt,'next_epoch':time.time()+15*2**(attempt-1),
+        finished=time.time()
+        result={'pin':pin,'attempts':attempt,'finished_epoch':finished,'next_epoch':finished+15*2**(attempt-1),
                 'state':'READY' if check['availability']=='VERIFIED' else 'FAILED','check':check}
         write(status,result)
         return result
@@ -337,6 +356,7 @@ def rolling(a):
             'index':str(a.index),'reference_run':str(a.reference_run), 'git_head':a.git_head,
             'code_sha256':sha(__file__), 'execution_files':{f.name:sha(f) for f in sorted(code.glob('holo*.py'))},
             'batch_size':a.batch_size}
+    a.pump_retry=lambda:None
     with ExitStack() as stack:
         lock=stack.enter_context((run/'rolling.lock').open('a'))
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -353,6 +373,16 @@ def rolling(a):
                     'legacy_rolling_scope_differs')
         config.update(archive_limit=a.fetch_jobs,archive_ancillary=a.archive_ancillary,primary_budget=a.primary_budget,
                       max_retries=a.max_retries,retry_jobs=a.retry_jobs,max_pending=a.max_pending,continued_from=str(legacy) if legacy else None)
+        ancestors=[]; predecessor=legacy
+        while predecessor:
+            require(predecessor.parent==runs and predecessor not in [run,*ancestors], 'invalid_rolling_history_chain')
+            ancestors.append(predecessor)
+            parent=read(predecessor/'rolling_config.json').get('continued_from')
+            predecessor=Path(parent).resolve(strict=True) if parent else None
+            if predecessor:
+                prev_lock=stack.enter_context((predecessor/'rolling.lock').open('r'))
+                fcntl.flock(prev_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                a.owner_fds+=(prev_lock.fileno(),)
         if legacy:
             config['legacy_plan_sha256']=sha(legacy/'rolling_plan.json')
         once(run/'rolling_config.json',config)
@@ -370,7 +400,7 @@ def rolling(a):
         cache=cache_index(tuple(r for r in runs.glob('holo-m2-*') if (r/'source_proofs').is_dir()))
         receipts=run/'receipts'; receipts.mkdir(exist_ok=True)
         seed=a.seed_run; done=0; primary=set(); pending={}; retries=Counter(); bytes_network=0; started=time.monotonic(); sequence=0
-        by_id={p['id']:p for p in plan['partitions']}; consumed_attempts={}
+        by_id={p['id']:p for p in plan['partitions']}; consumed_attempts={}; sealed_at={}
         def progress(status, active=None):
             head={'catalog_run':seed.name}; pointer=run/'catalog_head.json'
             if not pointer.exists() or read(pointer)!=head: write(pointer,head)
@@ -381,7 +411,8 @@ def rolling(a):
                 'unresolved_by_partition':{k:sorted(v) for k,v in pending.items() if v},'network_bytes':bytes_network,
                 'invocation_elapsed_s':round(time.monotonic()-started,3),'free_disk_bytes':shutil.disk_usage(root).free})
         def rows_for(part):
-            f=(legacy or run)/'partitions'/f"{part['id']}.json"
+            rel=Path('partitions')/f"{part['id']}.json"
+            f=next((d/rel for d in [run,*ancestors] if (d/rel).is_file()), run/rel)
             require(sha(f)==part['sha256'],'rolling_partition_manifest_modified')
             return read(f)
         def load_receipt(label,saved):
@@ -401,6 +432,12 @@ def rolling(a):
             else:
                 require(bid not in primary and saved['total']==by_id[bid]['entries'],'rolling_primary_receipt_conflict')
                 primary.add(bid)
+                # Early controller versions did not serialize a commit time. Use
+                # the earliest original receipt, not this fork's copy time.
+                marked=saved.get('committed_utc')
+                sealed_at[bid]=(dt.datetime.fromisoformat(marked).timestamp() if marked else min(
+                    (d/'receipts'/f'{bid}.json').stat().st_mtime for d in [run,*ancestors]
+                    if (d/'receipts'/f'{bid}.json').is_file()))
             remaining=set(saved['pending'])
             pending[bid]=((pending[bid]-chosen)|remaining) if sep else remaining
             require(saved.get('settled',0)+len(remaining)==saved['total'],'rolling_receipt_entry_count_differs')
@@ -439,7 +476,14 @@ def rolling(a):
                     saved=legacy_phase(root,legacy,label,rows,seed)
                     require(saved is not None,'legacy_adoption_phase_missing')
                 else:
-                    preflight=prep.result() if hasattr(prep,'result') else (prep or prepare(run,label,rows,cache,a.archive.ancillary,a.archive))
+                    require(prep is not None,'rolling_dispatch_without_preflight')
+                    if hasattr(prep,'result'):
+                        while not prep.done():
+                            try: prep.result(timeout=.5)
+                            except FutureTimeout: a.pump_retry()
+                        preflight=prep.result()
+                    else:
+                        preflight=prep
                     saved=stage_batch(a,run,label,rows,seed,preflight)
                 saved |= {'previous_catalog':seed.name,'sequence':sequence+1,'committed_utc':utc_now(),
                           'filesystem_used_delta_bytes':free_before-shutil.disk_usage(root).free}
@@ -468,10 +512,38 @@ def rolling(a):
                 wanted=set(active['pdb_ids'])
                 subset=[row for row in rows_for(by_id[bid]) if row['source']['pdb_id'] in wanted]
                 require(len(subset)==len(wanted),'dispatch_source_plan_differs')
-                process(label,subset,adopt=active['adopt'])
+                stop=getattr(a,'stop_after_partition',None)
+                require('-r' in label or (not getattr(a,'retry_only',False) and
+                        (stop is None or int(bid[1:])<=stop)),'active_main_dispatch_outside_requested_limit')
+                reserved=run/'preflight'/f'{label}.json'
+                saved_prep=read(reserved) if reserved.is_file() else None
+                if not active['adopt'] and saved_prep is None:
+                    require('-r' not in label,'retry_dispatch_missing_preflight')
+                    saved_prep=prepare(run,label,subset,cache,a.archive.ancillary,a.archive)
+                process(label,subset,saved_prep,adopt=active['adopt'])
 
         (run/'preflight').mkdir(exist_ok=True)
-        active_jobs={}; partition_cache={}; known_checks={}
+        active_jobs={}; partition_cache={}; known_checks={}; partial_cache={}; cursor=0
+        retry_dir=run/'retry_cache'; inherited_cache=set()
+
+        def inherited_state(row):
+            # Keep exhausted/backoff and existing validated ranges across a controller fork.
+            key=digest(tuple(row['source'][k] for k in SPEC)); target=retry_dir/key
+            if key not in inherited_cache:
+                if not target.exists():
+                    src=next((d/'retry_cache'/key for d in ancestors if (d/'retry_cache'/key/'attempt.json').is_file()),None)
+                    if src:
+                        retry_dir.mkdir(exist_ok=True)
+                        scratch=retry_dir/f'{key}.inheriting'
+                        scratch.mkdir(exist_ok=True)
+                        shutil.copytree(src,scratch,dirs_exist_ok=True,ignore=shutil.ignore_patterns('*.lock','*.tmp','*.part.gz'))
+                        state=read(scratch/'attempt.json')
+                        if state.get('state')=='READY':
+                            # READY can be replayed from the original verified file; its path is immutable.
+                            require(state.get('check',{}).get('verified_cached_file'), 'inherited_ready_without_file')
+                        os.replace(scratch,target); sync_path(retry_dir)
+                inherited_cache.add(key)
+            return target/'attempt.json'
         def retry_rows(bid):
             if bid not in partition_cache:
                 partition_cache[bid]={row['source']['pdb_id']:row for row in rows_for(by_id[bid])}
@@ -479,82 +551,107 @@ def rolling(a):
 
         def head_for(bid,pdb):
             if bid not in known_checks:
-                paths=[run/'preflight'/f'{bid}.json']+([legacy/'preflight'/f'{bid}.json'] if legacy else [])
+                paths=[d/'preflight'/f'{bid}.json' for d in [run,*ancestors]]
                 check_file=next((f for f in paths if f.is_file()),None)
                 known_checks[bid]={c['pdb_id']:c for c in read(check_file)['checks']} if check_file else {}
             return known_checks[bid].get(pdb)
 
         def job_state(row):
-            key=tuple(row['source'][k] for k in SPEC)
-            path=run/'retry_cache'/digest(key)/'attempt.json'
+            path=inherited_state(row)
             return read(path) if path.is_file() else {'attempts':0,'next_epoch':0}
 
-        def schedule(pool):
-            if request.is_file(): return
-            ready=time.time()
-            for bid,remaining in pending.items():
-                for pdb in sorted(remaining):
-                    if len(active_jobs)>=a.retry_jobs: return
-                    if (bid,pdb) in active_jobs: continue
-                    row=retry_rows(bid)[pdb]; state=job_state(row)
-                    if unmerged(bid,pdb,state) or state['next_epoch']>ready: continue
-                    if state['attempts']>=a.max_retries and state.get('state')!='STARTED': continue
-                    pin=row['source']; primary_receipt=read(receipts/f'{bid}.json')
-                    origin=primary_receipt.get('m2_run'); partial=False
-                    if origin:
-                        proof=runs/origin/'source_proofs'/f'{pdb}.json'
-                        if proof.is_file():
-                            partial=any(x.get('exit_code')==28 and x.get('http_status')==200 and x.get('body_bytes',0)>0
-                                        for attempt in read(proof).get('attempts',[]) for x in attempt.get('requests',[]))
-                            if not partial:  # Legacy transfer receipts predate per-request timing.
-                                partial=any(x.get('http_status')==200 and x.get('body_bytes',0)>0 and 'Timeout' in x.get('error','')
-                                            for x in read(proof).get('attempts',[]))
-                    active_jobs[(bid,pdb)]=pool.submit(retry_download,run,row,a.archive,cache.get(identity(pin)),
-                                                       head_for(bid,pdb),a.max_retries,consumed_attempts.get((bid,pdb),0),partial)
-
-        def unmerged(bid,pdb,state):
-            return 'check' in state and state['attempts']>consumed_attempts.get((bid,pdb),0)
-
-        def collect():
+        def reap():
             for key,future in list(active_jobs.items()):
                 if future.done():
                     future.result(); del active_jobs[key]
-            if request.is_file(): return
-            in_flight={bid for bid,_ in active_jobs}
+
+        def schedule(pool):
+            nonlocal cursor
+            reap()
+            if request.is_file() or len(active_jobs)>=a.retry_jobs: return
+            ready=time.time(); batches=[bid for bid,items in pending.items() if items]
+            while batches and len(active_jobs)<a.retry_jobs:
+                dispatched=False
+                for step in range(len(batches)):
+                    ix=(cursor+step)%len(batches); bid=batches[ix]
+                    for pdb in sorted(pending[bid]):
+                        if (bid,pdb) in active_jobs: continue
+                        row=retry_rows(bid)[pdb]; state=job_state(row)
+                        if unmerged(bid,pdb,state) or state['next_epoch']>ready: continue
+                        if state['attempts']>=a.max_retries and state.get('state')!='STARTED': continue
+                        pin=row['source']; key=(bid,pdb)
+                        if key not in partial_cache:
+                            origin=read(receipts/f'{bid}.json').get('m2_run')
+                            proof=runs/origin/'source_proofs'/f'{pdb}.json' if origin else None
+                            attempts=read(proof).get('attempts',[]) if proof and proof.is_file() else []
+                            partial_cache[key]=any(
+                                (x.get('exit_code')==28 or 'Timeout' in x.get('error','')) and x.get('http_status')==200 and x.get('body_bytes',0)>0
+                                for attempt in attempts for x in [attempt,*attempt.get('requests',[])])
+                        active_jobs[key]=pool.submit(retry_download,run,row,a.archive,cache.get(identity(pin)),
+                                                      head_for(bid,pdb),a.max_retries,consumed_attempts.get(key,0),partial_cache[key])
+                        cursor=(ix+1)%len(batches); dispatched=True; break
+                    if dispatched: break
+                if not dispatched: break
+
+        def unmerged(bid,pdb,state):
+            return state.get('state')=='READY' and state['attempts']>consumed_attempts.get((bid,pdb),0)
+
+        def collect(force=False):
+            reap()
+            # Coalesce ready files for one source partition. The merge is durable
+            # and relatively expensive even for a single Entry; bound the wait.
             for bid,remaining in list(pending.items()):
-                # A bounded fetch wave writes one catalog increment, not one clone per file.
-                # Main partitions still advance while this wave finishes.
-                if bid in in_flight: continue
-                rows=[]; checks=[]
+                if request.is_file(): return
+                rows=[]; checks=[]; oldest_ready=time.time()
                 for pdb in sorted(remaining):
                     if (bid,pdb) in active_jobs: continue
                     row=retry_rows(bid)[pdb]; state=job_state(row)
                     if unmerged(bid,pdb,state):
                         rows.append(row); checks.append(state['check'] | {'retry_attempt':state['attempts']})
-                if rows:
+                        epoch=state.get('finished_epoch',state['next_epoch']-15*2**(state['attempts']-1))
+                        oldest_ready=min(oldest_ready,epoch)
+                if rows and (force or len(rows)==len(remaining) or len(rows)>=max(2,a.retry_jobs)
+                             or time.time()-oldest_ready>=120):
                     label=f'{bid}-r{retries[bid]+1:02d}'
                     process(label,rows,{'input_digest':digest(rows),'checks':checks,'elapsed_s':0})
 
         def next_retry():
-            epochs=[]; exhausted=0
+            epochs=[]; exhausted=0; ready=0
             for bid,remaining in pending.items():
                 for pdb in remaining:
                     state=job_state(retry_rows(bid)[pdb]); ep=state['next_epoch']
-                    if unmerged(bid,pdb,state): epochs.append(0)
+                    if unmerged(bid,pdb,state): ready+=1
                     elif state['attempts']<a.max_retries or state.get('state')=='STARTED': epochs.append(ep)
                     else: exhausted+=1
-            return min(epochs,default=None),exhausted
+            return min(epochs,default=None),exhausted,ready
 
         def retry_status():
-            count=sum(map(len,pending.values())); _,exhausted=next_retry()
-            oldest=min(((receipts/f'{bid}.json').stat().st_mtime for bid,keys in pending.items() if keys),default=None)
-            return {'queued':count,'running':sum(not f.done() for f in active_jobs.values()),'exhausted':exhausted,
+            count=sum(map(len,pending.values())); _,exhausted,ready=next_retry()
+            oldest=min((sealed_at[bid] for bid,keys in pending.items() if keys),default=None)
+            by_batch={bid:len(keys) for bid,keys in pending.items() if keys}
+            return {'queued':count,'queued_by_partition':by_batch,
+                    'running':sum(not f.done() for f in active_jobs.values()),'exhausted':exhausted,
+                    'verified_waiting_for_catalog':ready,
                     'oldest_wait_s':round(max(0,time.time()-oldest),1) if oldest is not None else None,
                     'settled_by_retry':sum(read(f).get('settled',0) for f in receipts.glob('b*-r*.json'))}
 
-        unstarted=[part for part in plan['partitions'] if part['id'] not in primary]
+        stop_after=getattr(a,'stop_after_partition',None); retry_only=getattr(a,'retry_only',False)
+        unstarted=[part for i,part in enumerate(plan['partitions'],1) if part['id'] not in primary
+                   and not retry_only and (stop_after is None or i<=stop_after)]
+        last_pump=0.0
+        last_retry_report=0.0
+        def pump():
+            nonlocal last_pump,last_retry_report
+            now=time.monotonic()
+            if now-last_pump>=.45:
+                schedule(pool); last_pump=now
+            if now-last_retry_report>=15:
+                write(run/'retry_progress.json',retry_status()); last_retry_report=now
         with ThreadPoolExecutor(max_workers=1) as ahead, ThreadPoolExecutor(max_workers=a.retry_jobs) as pool:
+            a.pump_retry=pump
             future=None; consecutive_failures=0; completed_here=0; pause_reason=None
+            if not unstarted and stop_after is not None and not retry_only:
+                write(run/'retry_progress.json',retry_status()); progress('PAUSED_OBSERVATION_LIMIT'); return
             for i,part in enumerate(unstarted):
                 if request.is_file(): break
                 collect()
@@ -562,14 +659,16 @@ def rolling(a):
                 if sum(map(len,pending.values()))>=a.max_pending:
                     pause_reason='PAUSED_RETRY_BACKLOG'; break
                 schedule(pool)
+                label=part['id']; rows=rows_for(part); adopt=bool(legacy and i==0 and
+                    (runs/f'{legacy.name}-{label}-phase-001'/'phase_receipt.json').is_file())
+                if future is None and not adopt:
+                    # A cold-start HEAD wave gets the preflight executor first.
+                    future=ahead.submit(prepare,run,label,rows,cache,a.archive.ancillary,a.archive)
+                lookahead=None
                 if i+1<len(unstarted) and (a.max_main_batches is None or completed_here+1<a.max_main_batches):
                     nxt=unstarted[i+1]
                     lookahead=ahead.submit(prepare,run,nxt['id'],rows_for(nxt),cache,a.archive.ancillary,a.archive)
-                else:
-                    lookahead=None
-                label=part['id']; adopt=bool(legacy and i==0 and
-                    (runs/f'{legacy.name}-{label}-phase-001'/'phase_receipt.json').is_file())
-                result=process(label,rows_for(part),future,adopt=adopt); future=lookahead
+                result=process(label,rows,future,adopt=adopt); future=lookahead
                 completed_here+=1
                 if request.is_file(): break
                 collect(); schedule(pool)
@@ -577,20 +676,28 @@ def rolling(a):
                 consecutive_failures=consecutive_failures+1 if len(result['pending'])*4>result['total'] else 0
                 if consecutive_failures>=3:
                     pause_reason='PAUSED_SOURCE_FAILURE'; break
-                if a.max_main_batches is not None and completed_here>=a.max_main_batches:
+                if ((a.max_main_batches is not None and completed_here>=a.max_main_batches) or
+                    (stop_after is not None and i+1==len(unstarted))):
                     pause_reason='PAUSED_OBSERVATION_LIMIT'; break
             if not pause_reason and not request.is_file():
                 # Drain bounded retries at the end; don't keep retrying forever.
+                last_merge=time.monotonic()
                 while not request.is_file():
-                    collect(); schedule(pool)
-                    wake,_=next_retry()
-                    if not active_jobs and wake is None: break
-                    if active_jobs: wait(active_jobs.values(),timeout=.25,return_when=FIRST_COMPLETED)
-                    else: time.sleep(min(.25,max(.01,wake-time.time())))
+                    pump()
+                    wake,_,ready=next_retry(); now=time.monotonic()
+                    no_more=not active_jobs and wake is None
+                    if ready and (no_more or now-last_merge>=15):
+                        collect(force=no_more); last_merge=time.monotonic()
+                        wake,_,ready=next_retry()
+                    if not active_jobs and wake is None and not ready: break
+                    if active_jobs: wait(active_jobs.values(),timeout=.5,return_when=FIRST_COMPLETED)
+                    else: time.sleep(.5 if wake is None else min(.5,max(.01,wake-time.time())))
+        a.pump_retry=lambda:None
         # No asynchronous writer is left when publishing an actual paused state.
         if request.is_file(): pause_reason='PAUSED_AT_BOUNDARY'
+        if retry_only and not pause_reason: pause_reason='PAUSED_RETRY_ONLY'
         if pause_reason:
-            if not request.is_file(): collect()
+            if not request.is_file(): collect(force=True)
             write(run/'retry_progress.json',retry_status())
             progress(pause_reason); return
         write(run/'retry_progress.json',retry_status())
@@ -620,15 +727,21 @@ def main():
     p.add_argument('--retry-jobs',type=int,default=3)
     p.add_argument('--max-retries',type=int,default=3)
     p.add_argument('--max-pending',type=int,default=550)
-    p.add_argument('--max-main-batches',type=int)
+    limit=p.add_mutually_exclusive_group()
+    limit.add_argument('--max-main-batches',type=int)
+    limit.add_argument('--stop-after-partition',type=int,help='Absolute plan ordinal; safe across automatic restarts')
+    limit.add_argument('--retry-only',action='store_true',help='Drain existing technical keys without opening a main partition')
     p.add_argument('--resume-paused',action='store_true')
     p.add_argument('--plan-only',action='store_true')
     a=p.parse_args()
     if (min(a.jobs,a.fetch_jobs,a.batch_size,a.reserve_gib,a.primary_budget,a.max_pending,a.max_retries)<1 or
         a.max_retries>6 or not 1<=a.retry_jobs<=a.archive_ancillary<a.fetch_jobs or
-        (a.max_main_batches is not None and a.max_main_batches<1)):
+        (a.max_main_batches is not None and a.max_main_batches<1) or
+        (a.stop_after_partition is not None and a.stop_after_partition<1)):
         p.error('invalid scheduling limits')
-    rolling(a)
+    try: rolling(a)
+    except InterruptedStage as exc:
+        print(str(exc),file=sys.stderr,flush=True); raise SystemExit(TEMPORARY_INTERRUPTION) from exc
 
 
 if __name__=='__main__':

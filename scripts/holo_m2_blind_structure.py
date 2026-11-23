@@ -1,6 +1,6 @@
 """Evidence and structure stages for the isolated blind M2 batch."""
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import csv
 import glob
 import json
@@ -360,7 +360,7 @@ def member_locus(r):
                              tuple((v['auth_asym'],v['auth_seq'],v['ccd']) for v in m['residues'])) for m in r['members'])))
 
 
-def one(run, spec, index, fingerprint, shard=None):
+def one(run, spec, index, fingerprint, shard=None, split_above=None):
     start=time.monotonic(); p=spec['pdb_id']; ver=spec['revision']; proof=read(run/'source_proofs'/f'{p}.json')
     rr=run/'entry_results'/f'{p}.json'; ledger=run/'discovery'/f'{p}.json'; sysfile=run/'system_results'/f'{p}.json'
     result={'pdb_id':p,'revision':ver,'index_source_revision':index['source_revision'],'index_rows':len(index['annotation']),
@@ -446,6 +446,8 @@ def one(run, spec, index, fingerprint, shard=None):
                             'models':models,'representative_model':rep,'source_title':title,'index_mapping':idx,
                             'unmapped_index_policy':'Native discovery was performed on all source contexts. Different/unknown index source revisions were not used for assembly/instance assignment.',
                             'native_observations':native,'candidate_selection':decisions})
+        if split_above is not None and sum(d['eligible_for_structure_review'] for d in decisions)>=split_above:
+            return p,'needs_slices'
         exported=[]; assembly_cache={}; mapping={}; complete={}; pending_export=[]
         for choice in decisions:
             n=source_by_key[choice['candidate_key']]; key=n['candidate_key']
@@ -517,9 +519,7 @@ def one(run, spec, index, fingerprint, shard=None):
                     out['candidate_intake']='PASS'
                 elif out['role_qc']=='NON_TARGET_EVIDENCED':
                     out['candidate_intake']='EXCLUDED'
-                if (exp or len(models)>1) and shard and shard[0]!=0:
-                    out['shard_assembly_reference']=True
-                if (exp or len(models)>1) and (not shard or shard[0]==0):
+                if exp or len(models)>1:
                     ckey=(aid,model)
                     if ckey not in complete:
                         try:
@@ -642,15 +642,48 @@ def build(run,plan,selected,index,jobs,fetch_counts,start):
     fingerprint=__import__('hashlib').sha256(json.dumps(signatures,sort_keys=True).encode()).hexdigest()
     atomic_json(run/'build_inputs.json',{'code_files':signatures,'fingerprint':fingerprint,'algorithm':VERSION,'checked_utc':now()})
     counts=Counter()
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
-        jobs={pool.submit(one,run,r,rows[r['pdb_id']],fingerprint):r['pdb_id'] for r in plan if r['pdb_id'] in selected}
-        for i, future in enumerate(as_completed(jobs),1):
-            try:
-                p,status=future.result()
-            except Exception as e:
-                p,status=jobs[future],'worker_failure';print(p,repr(e),flush=True)
-            counts[status]+=1
-            if i%10==0 or i==len(jobs) or status not in ('built','reused_verified'):
-                print('structure',i,'/',len(jobs),p,dict(counts),round(time.monotonic()-start,2),flush=True)
+    # Use the same worker budget for ordinary entries and proven large-entry slices.
+    from holo_m2_parallel_tail import assemble, dispatch, promote
+    slots=jobs; tail=run/'parallel_tail'; slices=4
+    split_above=256 if slots>=slices else None
+    targets={r['pdb_id']:r for r in plan if r['pdb_id'] in selected}
+    complete={}; started={}; total=len(targets)
+    with ProcessPoolExecutor(max_workers=slots) as pool:
+        pending={pool.submit(one,run,r,rows[p],fingerprint,split_above=split_above):(p,None)
+                 for p,r in targets.items()}
+        while pending:
+            finished,_=wait(pending,return_when=FIRST_COMPLETED)
+            for task in finished:
+                pdb,part=pending.pop(task)
+                try:
+                    p,status=task.result()
+                    if p!=pdb:
+                        raise ValueError('Structure worker returned a different PDB ID')
+                except Exception as e:
+                    status='worker_failure'; print(pdb,repr(e),flush=True)
+                if part is None and status=='needs_slices':
+                    started[pdb]=time.monotonic(); complete[pdb]=[]
+                    for i in range(slices):
+                        pending[pool.submit(dispatch,run,tail,targets[pdb],rows[pdb],fingerprint,i,slices)]=(pdb,i)
+                    continue
+                if part is not None:
+                    complete[pdb].append(status in ('built','reused_verified'))
+                    if len(complete[pdb])!=slices:
+                        continue
+                    try:
+                        if not all(complete[pdb]):
+                            raise ValueError('One or more candidate slices did not finish')
+                        assemble(run,tail,pdb,slices,fingerprint)
+                        promote(run,tail,pdb,round(time.monotonic()-started[pdb],3))
+                        status='built_sliced'
+                    except (AssertionError,OSError,ValueError) as exc:
+                        atomic_json(run/'entry_results'/f'{pdb}.json',{
+                            'pdb_id':pdb,'revision':targets[pdb]['revision'],'signature':fingerprint,
+                            'status':'TECHNICAL_FAILURE','failure_stage':'candidate_slice_merge',
+                            'error':str(exc) or type(exc).__name__})
+                        status='slice_failure'
+                counts[status]+=1; n=sum(counts.values())
+                if n%10==0 or n==total or status not in ('built','reused_verified'):
+                    print('structure',n,'/',total,pdb,dict(counts),round(time.monotonic()-start,2),flush=True)
     summarize(run,plan,{'finished_utc':now(),'fetch':fetch_counts,'index_snapshot':cache,'structure':counts,'elapsed_s':round(time.monotonic()-start,3)})
 

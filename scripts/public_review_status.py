@@ -16,6 +16,7 @@ PENDING = {
     'm3_long_tail': 'Reduce repeat Assembly preparation during independent readback for entries with many systems; measure throughput on the next authorized window.',
     'm3_rolling_measurement': 'Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.',
     'm3_scale': 'Measure sustained throughput on a separately approved production increment; the bounded pilot is not a scale estimate.',
+    'm3_retry_balance': 'Verify that sustained recovery keeps pace with mainline technical gaps before resuming large-scale rolling production.',
     'm3_connectivity': 'Keep partner-connection and role exceptions under review; the bounded pilot does not broaden scientific acceptance.'
 }
 SHA = re.compile(r'[0-9a-f]{64}')
@@ -162,6 +163,25 @@ def rolling_gate_section(root, name):
 '''
 
 
+def after_ten_section(root, name):
+    r, _ = receipt(root, name)
+    retry=r['retry']; paired=r['paired']; timing=r['timing']; control=r['control']
+    require(r['scope']=='ISOLATED_EXISTING_GAPS' and retry['input']==160 and
+            count(retry['recovered'])+count(retry['remaining'])==retry['input'] and
+            control['main_unchanged'] is True and count(control['main_batches'])==10 and
+            control['restart_verified'] is True and control['same_structural_evidence'] is True and
+            count(control['releases'])==0 and paired['whole']['n']==paired['ranges']['n']==24,
+            'Isolated after-ten evidence is incomplete or inconsistent')
+    return f'''## M3 · Engineering verification after ten main batches (isolated)
+
+- Evidence snapshot **{utc(r['verified_utc'])}**: **{retry['recovered']:,}** of **{retry['input']:,}** existing technical gaps recovered; **{retry['remaining']:,}** remained at the snapshot. The main catalog pointer was unchanged and no new main batch started.
+- Verified that retries continue during a main-stage wait. In an isolated process interruption, recovery waited for the inherited writer lease and reused the committed receipt and source proof. Intentional exit did not restart.
+- Under the same 30-second transfer budget, whole GET verified **{count(paired['whole']['verified'])} of 24** and Range verified **{count(paired['ranges']['verified'])} of 24**, with **{count(paired['whole']['requests'])}** and **{count(paired['ranges']['requests'])}** requests respectively. The small-file Range threshold was retained.
+- On the same existing heavy entry, structure build took **{timing['build_before_s']:.1f} → {timing['build_after_s']:.1f} s**; the separate independent review control took **{timing['review_before_s']:.1f} → {timing['review_after_s']:.1f} s**, with equivalent candidate decisions and structure evidence. These are isolated timings, not whole-pipeline throughput.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -227,6 +247,7 @@ def render(root: Path, current_runtime: str):
         production += production_section(root, next_window, 'Scale gate: second continuous production batch')
     recovery = recovery_section(root, src['m3_rolling_recovery']) if src.get('m3_rolling_recovery') else ''
     production_gate = rolling_gate_section(root, src['m3_rolling_production_gate']) if src.get('m3_rolling_production_gate') else ''
+    after_ten = after_ten_section(root, src['m3_after_ten']) if src.get('m3_after_ten') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -249,7 +270,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}## Open review
 
 {pending}
 

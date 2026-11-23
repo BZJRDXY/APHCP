@@ -508,6 +508,33 @@ def incremental_inputs(root, inp, keys):
     return (source,),{bundle['batch']:source},base,annotations,{},(evidence_path,chem_path)
 
 
+def timed_review_group(group):
+    started=time.monotonic(); answers=review_group(group)
+    return answers,round(time.monotonic()-started,3)
+
+
+def review_groups(groups,jobs):
+    work=[]
+    for (batch,pdb), group in groups.items():
+        slices=4 if jobs>=4 and len(group)>=256 else 1
+        work.extend(((batch,pdb),group[i::slices]) for i in range(slices))
+    started=time.monotonic(); pairs=[]; per_entry={}
+    def add(results):
+        for (key,_),(answers,elapsed) in zip(work,results,strict=True):
+            pairs.extend(answers)
+            info=per_entry.setdefault(key,{'batch':key[0],'pdb_id':key[1], 'candidates':0,
+                                           'reused':0,'slice_elapsed_s':[]})
+            info['candidates']+=len(answers); info['reused']+=sum(reused for _,_,reused in answers)
+            info['slice_elapsed_s'].append(elapsed)
+    if len(work)==1 or jobs==1:
+        add(map(timed_review_group,(group for _,group in work)))
+    else:
+        with ProcessPoolExecutor(max_workers=min(jobs,len(work))) as pool:
+            add(pool.map(timed_review_group,(group for _,group in work)))
+    return sorted(pairs), {'review_wall_s':round(time.monotonic()-started,3),
+                          'entries':[row for _,row in sorted(per_entry.items())]}
+
+
 def execute(args):
     start=time.monotonic(); begin=utc_now(); root=args.root.resolve(); r=args.run.resolve(); ig=frozen_registry_root(root,r,create=not args.review_only)
     inp=args.manifest.resolve(); config=read(inp)
@@ -541,12 +568,7 @@ def execute(args):
         delta=deltas.get((p,k)) if b and b.get('historical_retest') else None
         groups[(batch,p)].append((position,key,n,b,annotations.get(key),delta,roots,
                                   source_by_batch[batch],by_old.get(key)))
-    if len(groups)==1 or args.jobs==1:
-        reviewed=list(map(review_group,groups.values()))
-    else:
-        with ProcessPoolExecutor(max_workers=min(args.jobs,len(groups))) as pool:
-            reviewed=list(pool.map(review_group,groups.values()))
-    pairs=sorted(x for group in reviewed for x in group)
+    pairs,timing=review_groups(groups,args.jobs)
     results=[x for _,x,_ in pairs]; reused=sum(y for _,_,y in pairs)
     counts=Counter(x['disposition'] for x in results); assert sum(counts.values())==len(manifest)
     if args.review_only:
@@ -555,8 +577,11 @@ def execute(args):
     if current and results!=current:raise ValueError('Immutable staging review differs; keep prior result and use a new run')
     if not current:write(data,results)
     if not seal_path.exists():write(seal_path,seal)
+    clock=time.monotonic()
     if seed and not database(ig).exists():clone_sealed_registry(seed[0],database(ig))
     counts_db,db_reuse=index_review_results(ig,seal_path,results,seal,data,begin,round(time.monotonic()-start,3))
+    timing['registry_wall_s']=round(time.monotonic()-clock,3)
+    write(r/('rerun_review_timing.json' if db_reuse else 'per_pdb_m3_timing.json'),timing)
     states={'input_candidate_count':len(manifest),'input_entry_count':len({x[1] for x in manifest}),'dispositions':counts,
             'retained_review_systems':sum(x['disposition']=='REVIEW' and 'system_id' in x for x in results),
             'unique_registered_systems':len({x['system_id'] for x in results if x['disposition']=='REGISTERED'}),

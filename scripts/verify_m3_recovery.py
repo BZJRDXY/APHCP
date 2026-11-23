@@ -1,12 +1,15 @@
 """Run isolated Linux controls for the rolling downloader and its commit journal."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing
 import fcntl
 import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import multiprocessing as mp
 import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -19,6 +22,7 @@ from holo_archive_runtime import Archive, durable_json
 from holo_m2_blind import fetch
 import holo_m3_rolling as rolling
 from holo_m3_register import digest, read, sha
+from holo_m3_supervise import supervise
 
 PDB='1ABC'
 CIF=b'''data_1ABC
@@ -107,7 +111,19 @@ def transport(root,url):
     rec=rolling.retry_download(retry,row,a,None,None,2,consumed=1)
     assert rec['state']=='READY' and rec['attempts']==2 and rec['check']['retry_network_bytes']==0
     assert rolling.retry_download(retry,row,a,None,None,2,consumed=2) is None
-    return {'timeouts':deadlines,'max_parallel_across_processes':max_parallel,'max_ancillary':max_ancillary,
+    # Even if shared and main slots are occupied, HEAD and retry can make progress.
+    with ExitStack() as locks:
+        for slot in (2,3):
+            f=locks.enter_context((a.folder/f'{slot:03d}.lock').open('ab'))
+            fcntl.flock(f,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with a.slot('retry') as (retry_slot,_):
+            assert retry_slot==1 and a.head(pin,.5)['availability']=='VERIFIED'
+        with a.slot('head') as (head_slot,_):
+            assert head_slot==0
+            check=a.head(pin,.18); assert check['availability']!='VERIFIED' and check['request']['phase']=='QUEUE'
+            assert .17<=check['request']['queued_s']<=.28 and 'started_monotonic' not in check['request']
+        with a.slot('range',time.monotonic()+.1) as (retry_slot,_): assert retry_slot==1
+    return {'timeouts':deadlines,'max_parallel_across_processes':max_parallel,'max_ancillary':max_ancillary,'reserved_auxiliary_lanes_verified':True,'head_queue_total_budget_verified':True,
             'single_primary_attempt':True,'recovered_committed_source_proof':True,'retry_limit_enforced':True}
 
 
@@ -173,16 +189,126 @@ def journal(root, url, cut):
     return {'fault':cut,'same_receipt_hashes_after_replay':True,'unique_records':2,'competing_writer_refused':True}
 
 
+def scheduler(root, url, *, child_mode=None):
+    """Use the real rolling journal and waits, with bounded substitute stage work."""
+    runs=root/'runs'; run=runs/'holo-m3-test-scheduler'; seed=runs/'holo-m3-test-seed'
+    pin=lambda p: dict(pdb_id=p,revision='1.2',file_type='pdbx_mmcif_gzip',source_url=url+'/ok')
+    inputs=(('1ABC','1ABD'),('1ABE','1ABF'),('1ABG',))
+    acc=root/'acceptance.json'
+    if not (run/'rolling_plan.json').is_file():
+        (run/'partitions').mkdir(parents=True); seed.mkdir(); durable_json(seed/'phase_receipt.json',{})
+        durable_json(acc,{'accepted':True,'catalog_run':seed.name,'pending_technical':[]})
+        parts=[]
+        for i,ids in enumerate(inputs,1):
+            bid=f'b{i:04d}'; f=run/'partitions'/f'{bid}.json'
+            durable_json(f,[{'source':pin(p)} for p in ids]); parts.append({'id':bid,'entries':len(ids),'sha256':sha(f)})
+        durable_json(run/'rolling_plan.json',{'denominator':sum(map(len,inputs)),'exclusions':{},'scope':'test-only','partitions':parts})
+    a=SimpleNamespace(root=root,run=run,seed_run=seed,prior=[],m1=root,index=root,reference_run=root,git_head='test',
+                      acceptance=acc,batch_size=2,jobs=1,fetch_jobs=4,reserve_gib=0,primary_budget=1,
+                      archive_ancillary=2,retry_jobs=1,max_retries=1,max_pending=6,max_main_batches=None,
+                      stop_after_partition=(1 if child_mode=='stop' else 3),plan_only=False)
+    wave=[]
+    waiting=False
+    def retry(run,row,archive,previous,known,n,consumed=0,prefer_ranges=False):
+        t=time.monotonic(); identity=row['source']; p=identity['pdb_id']; wave.append((p,waiting,t))
+        time.sleep(.14)
+        state={'attempts':1,'next_epoch':0,'state':'READY','check':identity | {'retry_network_bytes':0,'availability':'VERIFIED'}}
+        key=digest(tuple(identity[k] for k in rolling.SPEC)); queue=run/'retry_cache'/key
+        queue.mkdir(exist_ok=True,parents=True); durable_json(queue/'attempt.json',state)
+        return state
+    def stage(a, run, label, rows, previous, preflight):
+        nonlocal waiting
+        keys=[r['source']['pdb_id'] for r in rows]; done=runs/f'{run.name}-{label}'; done.mkdir(exist_ok=True)
+        if label=='b0003' and child_mode is None:
+            waiting=True
+            with subprocess.Popen([sys.executable,'-c','import time; time.sleep(2.6)']) as child:
+                assert rolling.wait_stage(child,a.pump_retry)==0
+            waiting=False
+        pending=keys if child_mode is None and label in ('b0001','b0002') else []
+        if child_mode=='download' and label=='b0001':
+            frozen=pin(PDB) | {'expected_bytes':len(BODY)}
+            proof=done/'source_proofs'/f'{PDB}.json'; marker=root/'killed_download.json'
+            archive=Archive(run/'archive_slots',4,2,local_test=True,lease_fds=a.owner_fds)
+            if not marker.is_file():
+                assert fetch(done,frozen,archive,'primary',1)[1]=='downloaded'
+                # Leave a real archive transfer alive while killing its owner. Its
+                # inherited lease blocks the new writer until the request exits.
+                curl=subprocess.Popen(['curl','-q','-sS','--max-time','2','--output',str(done/'abandoned.bin'),url+'/body'],
+                                      pass_fds=a.owner_fds)
+                durable_json(marker,{'proof_sha':sha(proof),'http_pid':curl.pid})
+                os.kill(os.getpid(),signal.SIGKILL)
+            else:
+                assert fetch(done,frozen,archive,'primary',1)[1]=='reused_verified'
+                assert sha(proof)==read(marker)['proof_sha'] and len(read(proof)['attempts'])==1
+        with closing(sqlite3.connect(done/'catalog.db')) as db, db:
+            db.execute('CREATE TABLE IF NOT EXISTS obs(key TEXT PRIMARY KEY)')
+            db.executemany('INSERT OR IGNORE INTO obs VALUES(?)',[(p,) for p in keys if p not in pending])
+        durable_json(done/'phase_receipt.json',{'seed':previous.name})
+        return {'catalog_run':done.name,'total':len(rows),'pending':pending,'settled':len(rows)-len(pending),'network_bytes':0}
+    base_once=rolling.once
+    def once(path,val):
+        base_once(path,val)
+        marker=root/'killed_receipt.json'
+        if child_mode=='kill' and path==run/'receipts'/'b0001.json' and not marker.exists():
+            # An actual child inherits the lease and outlives the killed controller.
+            t=time.monotonic(); subprocess.Popen([sys.executable,'-c','import time; time.sleep(1.4)'],pass_fds=a.owner_fds)
+            durable_json(marker,{'sha':sha(path),'head':read(run/'catalog_head.json')['catalog_run'],'killed_monotonic':t})
+            os.kill(os.getpid(),signal.SIGKILL)
+    if child_mode=='kill' and (root/'killed_receipt.json').is_file():
+        durable_json(root/'replay_start.json',{'time':time.monotonic()})
+    with patch.multiple(rolling,stage_batch=stage,retry_download=retry,once=once,
+                        Archive=lambda *a,**kw: Archive(*a,**kw,local_test=True)):
+        rolling.rolling(a)
+    if child_mode is not None:
+        return
+    inside={p for p,in_stage,_ in wave if in_stage}
+    assert inside&set(inputs[0]) and inside&set(inputs[1]) and len(inside)>=2, wave
+    assert len(wave)==len({p for p,_,_ in wave})==4,wave
+    receipts={p.stem:read(p) for p in (run/'receipts').glob('*.json')}
+    assert sum(x.get('settled',0) for x in receipts.values())==5
+    waves=[row['retry_selected'] for label,row in receipts.items() if '-r' in label]
+    assert sorted(map(len,waves))==[2,2] and {p for row in waves for p in row}==set(inputs[0]+inputs[1])
+    assert read(run/'retry_progress.json')['queued']==0
+    return {'dispatched_while_one_main_stage_waited':len(inside),'cross_partition':True,'unique_retry_keys':len(wave),'ready_files_coalesced':True}
+
+
+def real_supervised(root,url):
+    def run_site(mode):
+        where=root/mode; run=where/'runs'/'holo-m3-test-scheduler'; run.mkdir(parents=True)
+        # The fixture owns its setup; the supervisor stores its state alongside it.
+        args=[sys.executable,'-B',__file__,'--journal-child',str(where),url,mode]
+        assert supervise(run,args,limit=2,backoff=.05,lease_wait=4)==0
+        status=read(run/'supervisor_status.json'); assert status['state']=='NORMAL_EXIT'
+        assert read(run/'rolling_progress.json')['status']=='PAUSED_OBSERVATION_LIMIT'
+        return where,run,status
+    where,run,status=run_site('kill'); evidence=read(where/'killed_receipt.json')
+    assert status['restarts']==1 and evidence['head']=='holo-m3-test-seed'
+    assert read(where/'replay_start.json')['time']-evidence['killed_monotonic']>=1.3
+    assert sha(run/'receipts'/'b0001.json')==evidence['sha']
+    with closing(sqlite3.connect(run.parent/(run.name+'-b0001')/'catalog.db')) as db:
+        assert db.execute('SELECT COUNT(*) FROM obs').fetchone()[0]==2
+    assert read(run/'catalog_head.json')['catalog_run']==run.name+'-b0003'
+    _,stop,state=run_site('stop'); assert state['restarts']==0 and len(list((stop/'receipts').glob('b*.json')))==1
+    download,trial,state=run_site('download')
+    assert state['restarts']==1 and read(trial/'rolling_progress.json')['new_settled_entries']==5
+    assert (download/'killed_download.json').is_file()
+    return {'verified_download_proof_reused_after_real_exit':True,'signal':'SIGKILL','automatic_restarts':1,'waited_for_descendant_lease':True,
+            'receipt_hash_preserved':True,'unique_records_after_restart':2,'intentional_stop_restarts':0}
+
+
 def verify(output):
     with tempfile.TemporaryDirectory(prefix='aphcp-recovery-') as tmp, ThreadingHTTPServer(('127.0.0.1',0),Server) as srv:
         Thread(target=srv.serve_forever,daemon=True).start()
         root=Path(tmp); url=f'http://127.0.0.1:{srv.server_port}'
-        evidence={'transport':transport(root,url),'journal':[journal(root,url,cut) for cut in ('sqlite-before-phase','phase-before-batch','batch-before-head')]}
+        evidence={'transport':transport(root,url),'journal':[journal(root,url,cut) for cut in ('sqlite-before-phase','phase-before-batch','batch-before-head')],
+                  'continuous_retry':scheduler(root/'schedule',url),'supervised':real_supervised(root/'supervised',url)}
         srv.shutdown()
     durable_json(output,evidence)
     print(evidence,flush=True)
 
 
 if __name__=='__main__':
+    if len(sys.argv)==5 and sys.argv[1]=='--journal-child':
+        scheduler(Path(sys.argv[2]),sys.argv[3],child_mode=sys.argv[4]); raise SystemExit(0)
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('--output',required=True,type=Path)
     verify(p.parse_args().output)

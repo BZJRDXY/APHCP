@@ -38,7 +38,7 @@ def durable_json(path, value):
 
 
 class Archive:
-    """A shared process-safe pool. HEAD/retry/range cannot occupy the main reserve."""
+    """One process-wide slot budget with protected main, HEAD, and retry lanes."""
     def __init__(self, folder, limit, ancillary, *, local_test=False, lease_fds=()):
         if not 1 <= ancillary < limit:
             raise ValueError('archive slots must leave a main GET reserve')
@@ -47,11 +47,19 @@ class Archive:
         self.lease_fds = tuple(lease_fds)
 
     @contextmanager
-    def slot(self, kind, deadline=None):
+    def slot(self, kind, deadline=None, *, trace=None):
         import fcntl
         if kind not in {'get', 'head', 'retry', 'range'}:
             raise ValueError('unknown archive request category')
-        slots = range(self.limit-1, -1, -1) if kind == 'get' else range(self.ancillary)
+        enqueued=time.monotonic()
+        reserved=min(2,self.ancillary)
+        if kind=='get':
+            slots=range(self.limit-1,reserved-1,-1)
+        else:
+            # Each auxiliary class keeps a slot even if the other class and GET
+            # saturate the shared slots. Range uses the retry lane and shared slots.
+            own=0 if kind=='head' or reserved==1 else 1
+            slots=(*range(reserved,self.ancillary),own)
         while deadline is None or time.monotonic() < deadline:
             for number in slots:
                 with (self.folder/f'{number:03d}.lock').open('ab') as f:
@@ -64,7 +72,10 @@ class Archive:
                     finally:
                         fcntl.flock(f, fcntl.LOCK_UN)
                     return
-            time.sleep(.012)
+            remaining=.012 if deadline is None else min(.012,max(0,deadline-time.monotonic()))
+            if remaining: time.sleep(remaining)
+        if trace is not None:
+            trace.update(kind=kind,queued_s=round(time.monotonic()-enqueued,4),phase='QUEUE',exit_code=28,body_bytes=0)
         raise TimeoutError('Archive slot wait exhausted file budget')
 
     def request(self, url, kind, output, seconds, trace, *, headers=(), deadline=None):
@@ -77,7 +88,7 @@ class Archive:
             raise ValueError('archive request outside the fixed RCSB archive')
         output = Path(output)
         queued = time.monotonic()
-        with self.slot(kind, deadline) as (number, slot_fd):
+        with self.slot(kind, deadline, trace=trace) as (number, slot_fd):
             started = time.monotonic()
             remaining = min(seconds, deadline-started) if deadline is not None else seconds
             if remaining < .005:
@@ -120,7 +131,7 @@ class Archive:
         from datetime import datetime, timezone
         trace = {}; out = pin | {'checked_utc':datetime.now(timezone.utc).isoformat()}
         try:
-            fields = self.request(pin['source_url'], 'head', '/dev/null', seconds, trace)
+            fields = self.request(pin['source_url'], 'head', '/dev/null', seconds, trace,deadline=time.monotonic()+seconds)
             n = int(fields.get('content-length', 0)); status = trace.get('http_status')
             if status==200 and n>0:
                 return out | {'status':status,'content_length':n,'final_url':pin['source_url'],
