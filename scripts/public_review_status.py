@@ -172,13 +172,23 @@ def after_ten_section(root, name):
             control['restart_verified'] is True and control['same_structural_evidence'] is True and
             count(control['releases'])==0 and paired['whole']['n']==paired['ranges']['n']==24,
             'Isolated after-ten evidence is incomplete or inconsistent')
+    registry=r.get('registry_speedup'); replay=r.get('rerun'); detail=''
+    if registry:
+        require(all(registry[k] is True for k in ('equivalent_review_sha256','equal_registry_counts',
+                                                   'quick_check_and_foreign_keys_passed')),
+                'Registry speed control did not retain the same checks and decisions')
+        detail+=f"- With the same {count(registry['candidates'])}-system staging input, registration took **{registry['before_full_s']:.1f} → {registry['after_full_s']:.1f} s**. The database integrity and foreign-key checks still ran, and the review result hash and registry counts matched.\n"
+    if replay:
+        require(replay['unchanged'] is True and replay['remaining']==retry['remaining'] and replay['formal_unchanged'] is True,
+                'Same-input isolate replay does not match the accepted state')
+        detail+=f"- Same-input replay preserved **{count(replay['evidence_files'])}** checked evidence files, including the catalog, receipts, and source proofs.\n"
     return f'''## M3 · Engineering verification after ten main batches (isolated)
 
 - Evidence snapshot **{utc(r['verified_utc'])}**: **{retry['recovered']:,}** of **{retry['input']:,}** existing technical gaps recovered; **{retry['remaining']:,}** remained at the snapshot. The main catalog pointer was unchanged and no new main batch started.
 - Verified that retries continue during a main-stage wait. In an isolated process interruption, recovery waited for the inherited writer lease and reused the committed receipt and source proof. Intentional exit did not restart.
 - Under the same 30-second transfer budget, whole GET verified **{count(paired['whole']['verified'])} of 24** and Range verified **{count(paired['ranges']['verified'])} of 24**, with **{count(paired['whole']['requests'])}** and **{count(paired['ranges']['requests'])}** requests respectively. The small-file Range threshold was retained.
 - On the same existing heavy entry, structure build took **{timing['build_before_s']:.1f} → {timing['build_after_s']:.1f} s**; the separate independent review control took **{timing['review_before_s']:.1f} → {timing['review_after_s']:.1f} s**, with equivalent candidate decisions and structure evidence. These are isolated timings, not whole-pipeline throughput.
-
+{detail}
 '''
 
 

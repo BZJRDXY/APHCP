@@ -481,6 +481,9 @@ def clone_sealed_registry(source, target):
         require(not any(Path(f'{source}{suffix}').exists() for suffix in ('-wal','-shm','-journal')),
                 'sealed_catalog_became_writable_during_clone')
         with connect(staged,readonly=True) as saved:
+            # Reflinks have a fresh page cache. mmap enables read-ahead during
+            # the same full quick_check instead of reading one SQLite page at a time.
+            saved.execute('PRAGMA mmap_size=536870912')
             require(saved.execute('PRAGMA quick_check').fetchone()[0]=='ok','cloned_catalog_integrity_failed')
         # Atomic, no replacement of an already staged destination.
         target.hardlink_to(staged)

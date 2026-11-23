@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `5226d78b91f99606ce35a6bf507392a20a1990067dde3d991196b355d77265ac`
+Public runtime fingerprint (SHA-256): `790d6af2f4dc1a26969f054c0bdadfea7feccecbf6f9a6a94b1573e577c81ce6`
 
 ## M1 · Metadata inventory
 
@@ -51,10 +51,12 @@ Public runtime fingerprint (SHA-256): `5226d78b91f99606ce35a6bf507392a20a1990067
 
 ## M3 · Engineering verification after ten main batches (isolated)
 
-- Evidence snapshot **2026-11-23T13:13:10+00:00**: **107** of **160** existing technical gaps recovered; **53** remained at the snapshot. The main catalog pointer was unchanged and no new main batch started.
+- Evidence snapshot **2026-11-23T13:29:10+00:00**: **160** of **160** existing technical gaps recovered; **0** remained at the snapshot. The main catalog pointer was unchanged and no new main batch started.
 - Verified that retries continue during a main-stage wait. In an isolated process interruption, recovery waited for the inherited writer lease and reused the committed receipt and source proof. Intentional exit did not restart.
 - Under the same 30-second transfer budget, whole GET verified **3 of 24** and Range verified **3 of 24**, with **24** and **66** requests respectively. The small-file Range threshold was retained.
 - On the same existing heavy entry, structure build took **183.4 → 74.9 s**; the separate independent review control took **149.4 → 49.9 s**, with equivalent candidate decisions and structure evidence. These are isolated timings, not whole-pipeline throughput.
+- With the same 34-system staging input, registration took **23.1 → 5.8 s**. The database integrity and foreign-key checks still ran, and the review result hash and registry counts matched.
+- Same-input replay preserved **174** checked evidence files, including the catalog, receipts, and source proofs.
 
 ## Open review
 
