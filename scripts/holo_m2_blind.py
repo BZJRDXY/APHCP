@@ -5,10 +5,12 @@ from collections import Counter
 import csv
 import fcntl
 import gzip
+from http.client import HTTPException
 import json
 from pathlib import Path
 import re
 import sys
+from threading import BoundedSemaphore
 import time
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -61,6 +63,72 @@ def raw_path(run, r):
     return run/'raw'/f"{r['pdb_id'].lower()}-v{r['revision']}.cif.gz"
 
 
+RANGE_SIZE = 512 << 10
+RANGE_MINIMUM = 8 << 20
+RANGE_SLOTS = BoundedSemaphore(24)
+
+
+def fetch_ranges(pin, temp, attempt):
+    """Resume large fixed archive bodies by validated byte ranges, when supported."""
+    url = pin['source_url']; total = pin['expected_bytes']
+    headers = {'Accept-Encoding':'identity','User-Agent':'APHCP-M2-fixed-source/1'}
+    with build_opener(NoRedirect()).open(Request(url,headers=headers | {'Range':'bytes=0-0'}),timeout=15) as sample:
+        etag = sample.headers.get('ETag','')
+        if (sample.status != 206 or sample.geturl()!=url or sample.headers.get('Content-Range')!=f'bytes 0-0/{total}'
+                or not re.fullmatch(r'"[^"\r\n]+"',etag)):
+            return None
+    folder=temp.with_suffix('.ranges'); folder.mkdir(exist_ok=True)
+    identity=folder/'identity.json'; seal={'source_url':url,'bytes':total,'etag':etag,'range_size':RANGE_SIZE}
+    if identity.exists() and read(identity)!=seal:
+        raise ValueError('Archive ETag or range plan changed for the same fixed revision')
+    if not identity.exists():
+        atomic_json(identity,seal)
+    attempt.update(http_status=206, etag=etag, transfer='ranges')
+
+    def receive(start):
+        end=min(start+RANGE_SIZE,total)-1; n=end-start+1
+        out=folder/f'{start:012d}.range'; partial=out.with_suffix('.tmp')
+        if out.is_file() and out.stat().st_size==n:
+            return (out,0,None)
+        with RANGE_SLOTS:
+            req=Request(url,headers=headers | {'Range':f'bytes={start}-{end}','If-Match':etag})
+            received=0; deadline=time.monotonic()+65
+            try:
+                with build_opener(NoRedirect()).open(req,timeout=12) as resp, partial.open('wb') as f:
+                    if (resp.status!=206 or resp.geturl()!=url or resp.headers.get('ETag')!=etag or
+                            resp.headers.get('Content-Range')!=f'bytes {start}-{end}/{total}' or
+                            resp.headers.get('Content-Length')!=str(n)):
+                        raise ValueError('Archive range identity, ETag or length differs from the pin')
+                    while received<n:
+                        if time.monotonic()>deadline:
+                            raise TimeoutError('Archive range exceeded its time budget')
+                        chunk=resp.read1(min(64<<10,n-received))
+                        if not chunk:
+                            break
+                        f.write(chunk); received+=len(chunk)
+                if received!=n:
+                    raise ValueError('Incomplete archive range')
+                partial.replace(out)
+                return (out,received,None)
+            except (OSError,ValueError,HTTPException) as exc:
+                partial.unlink(missing_ok=True)
+                return (out,received,f'{start}-{end}: {type(exc).__name__}: {exc}')
+    offsets=range(0,total,RANGE_SIZE)
+    with ThreadPoolExecutor(max_workers=min(12,len(offsets))) as workers:
+        results=list(workers.map(receive,offsets))
+    attempt['body_bytes']+=sum(n for _,n,_ in results)
+    attempt['reused_ranges']=sum(n==0 and err is None for _,n,err in results)
+    errors=[err for _,_,err in results if err]
+    if errors:
+        attempt['range_errors']=errors
+        raise ValueError(f'{len(errors)} of {len(results)} archive ranges need retry')
+    with temp.open('wb') as f:
+        for path,_,_ in results:
+            f.write(path.read_bytes())
+    return folder
+
+
+
 def fetch(run, r):
     p = r['pdb_id']; raw = raw_path(run, r); proof = run/'source_proofs'/f'{p}.json'
     raw.parent.mkdir(parents=True, exist_ok=True)
@@ -73,20 +141,27 @@ def fetch(run, r):
     for i in range(3):
         attempt = {'started_utc':now(),'body_bytes':0}; attempts.append(attempt)
         try:
-            if i==0 and raw.is_file() and raw.stat().st_size==r['expected_bytes']:
+            range_storage=None
+            if i == 0 and raw.is_file() and raw.stat().st_size==r['expected_bytes']:
                 held = raw
             else:
                 held = temp
-                request = Request(r['source_url'],headers={'Accept-Encoding':'identity','User-Agent':'APHCP-M2-fixed-source/1'})
-                with build_opener(NoRedirect()).open(request,timeout=30) as resp, temp.open('wb') as f:
-                    attempt['http_status'] = resp.status
-                    if resp.status!=200 or resp.geturl()!=r['source_url'] or int(resp.headers.get('Content-Length',r['expected_bytes']))!=r['expected_bytes']:
-                        raise ValueError('Exact archive response or length differs from HEAD proof')
-                    while attempt['body_bytes'] < r['expected_bytes']:
-                        chunk = resp.read(min(1<<20,r['expected_bytes']-attempt['body_bytes']))
-                        if not chunk:
-                            break
-                        attempt['body_bytes'] += len(chunk); f.write(chunk)
+                if r['expected_bytes']>=RANGE_MINIMUM:
+                    range_storage=fetch_ranges(r,temp,attempt)
+                if range_storage is None:
+                    request = Request(r['source_url'],headers={'Accept-Encoding':'identity','User-Agent':'APHCP-M2-fixed-source/1'})
+                    deadline=time.monotonic()+90
+                    with build_opener(NoRedirect()).open(request,timeout=15) as resp, temp.open('wb') as f:
+                        attempt['http_status'] = resp.status
+                        if resp.status!=200 or resp.geturl()!=r['source_url'] or int(resp.headers.get('Content-Length',r['expected_bytes']))!=r['expected_bytes']:
+                            raise ValueError('Exact archive response or length differs from HEAD proof')
+                        while attempt['body_bytes'] < r['expected_bytes']:
+                            if time.monotonic()>deadline:
+                                raise TimeoutError('Archive response exceeded its time budget')
+                            chunk=resp.read1(min(1<<20,r['expected_bytes']-attempt['body_bytes']))
+                            if not chunk:
+                                break
+                            attempt['body_bytes']+=len(chunk); f.write(chunk)
             if held.stat().st_size!=r['expected_bytes']:
                 raise ValueError('Incomplete source')
             with gzip.open(held,'rb') as gz:
@@ -101,6 +176,11 @@ def fetch(run, r):
             attempt.update(finished_utc=now(),status='PASS')
             atomic_json(proof,{'status':'PASS','identity':r,'sha256':digest,'gzip_crc':'PASS','bytes':raw.stat().st_size,
                                'relative_path':str(raw.relative_to(run)),'attempts':attempts,'observed_revision':rev})
+            if range_storage:
+                for part in range_storage.glob('*.range'):
+                    part.unlink()
+                (range_storage/'identity.json').unlink()
+                range_storage.rmdir()
             return p, 'downloaded' if attempt['body_bytes'] else 'recovered_verified'
         except Exception as exc:
             temp.unlink(missing_ok=True)

@@ -220,12 +220,13 @@ def build(args):
 def append_increment(root, run, seed, evidence_path, chemistry_path, git_head):
     """Append one increment to its isolated copy of the previous catalog."""
     from types import SimpleNamespace
+    from holo_m3_register import clone_sealed_registry
 
     started = time.monotonic()
     dbpath = database(frozen_registry_root(root, run, create=True))
     seed_path, seed_hash = seed_registry(root, run, SimpleNamespace(seed_run=seed))
     if not dbpath.exists():
-        backup(seed_path, dbpath)
+        clone_sealed_registry(seed_path, dbpath)
     label = run.name + '-observations'
     data = read(evidence_path)
     reviews_path = run/'review_results.json'

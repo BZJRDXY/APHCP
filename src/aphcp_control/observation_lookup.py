@@ -29,6 +29,13 @@ def catalog_view(root, controller, bundle, pdb):
     else:
         label = json.loads(pointer.read_text(encoding='utf-8'))['catalog_run']
         pattern = re.escape(controller)+r'-phase-\d{3}'
+        rolling = pointer.with_name('rolling_config.json')
+        if rolling.is_file() and rolling.resolve() == rolling:
+            spec = json.loads(rolling.read_text(encoding='utf-8'))
+            seed = Path(spec['seed_run'])
+            if seed.parent != runs or not re.fullmatch(r'holo-m3-[a-z0-9-]+-phase-\d{3}', seed.name):
+                raise ValueError('Invalid rolling catalog seed')
+            pattern = rf'(?:{re.escape(seed.name)}|{re.escape(controller)}-b\d{{4}}(?:-r\d{{2}})?-phase-\d{{3}})'
     if (not re.fullmatch(pattern, label) or (runs/label).resolve()!=runs/label or
             not (runs/label/'phase_receipt.json').is_file()):
         raise ValueError('Invalid catalog head')

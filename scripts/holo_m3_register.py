@@ -11,7 +11,9 @@ import json
 from pathlib import Path
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
@@ -23,7 +25,7 @@ from holo_candidate_batch import revision_from_cif
 from holo_m3_decisions import resolve as resolve_decisions
 from holo_m2_blind_structure import ContactContext, explicit_role_names, instances_for, normalize, role
 from holo_role_evidence import assess, build_role_context, role_source
-from holo_v1_export import describe_instances, export, output_label, rows, text
+from holo_v1_export import ATOM, describe_instances, expanded_atoms, expanded_conn_context, export, output_label, rows, text
 
 RULE='holo-m3-v1-staging-2'
 STATE='M3_STAGING_UNPUBLISHED'
@@ -237,7 +239,21 @@ def assess_candidate(key,n,b,c,roots,m2,cache,shared):
     for k,v in selected.items():
         a=ins[k]; require(all(v.get(i)==a.get(i) for i in ('entity','label_asym','operator','auth_asym','matrix','vector','output_label_asym')), 'assembly_copy_lineage_differs')
     labels={output_label(v) for v in selected.values()}
-    qc,atoms=verifier(Path(cif['path']),bsrc,p,aid,[model_num],labels,expanded=ins if expanded else None,verify=True)
+    readback_kwargs={'expanded':ins if expanded else None,'verify':True}
+    # Only the current verifier consumes this preparation; pinned historical exporters
+    # keep their original preparation and readback behavior.
+    if verifier is export:
+        def prepare_readback():
+            original=memo(shared,('atom_rows',raw['path'],raw['sha256']),lambda:rows(bsrc,ATOM))
+            if not expanded:
+                return original,None
+            # Keep all deposited rows here: generated atom IDs depend on source row order,
+            # including other models. Connection projection is scoped to this model.
+            atoms=expanded_atoms(bsrc,ins,source_atoms=original)
+            return atoms,expanded_conn_context(bsrc,ins,atoms,{str(model_num)})
+        prepared, connections=memo(shared,('readback',RULE,raw['path'],raw['sha256'],model_num,aid),prepare_readback)
+        readback_kwargs.update(prepared=prepared,prepared_connections=connections)
+    qc,atoms=verifier(Path(cif['path']),bsrc,p,aid,[model_num],labels,**readback_kwargs)
     require(qc['sha256']==cif['sha256'] and raw_json(qc['model_members'])==raw_json(art['model_members']) and qc['atom_count']==art['atom_count'],'derived_real_readback_differs')
     names={k:output_label(v) for k,v in selected.items()}
     protein=ms['binding_protein_instances']; members=obs['members']; req_instances=set(protein)|{m['instance'] for m in members}
@@ -277,11 +293,12 @@ def assess_candidate(key,n,b,c,roots,m2,cache,shared):
     def check_assembly():
         if not assembly_path.is_file():return None
         q=get_ref(assembly_path); d,aa=verifier(assembly_path,bsrc,p,aid,[model_num],{output_label(v) for v in ins.values()},
-                                                  complete=True,expanded=ins if expanded else None,verify=True)
+                                                  complete=True,**readback_kwargs)
         require(q['sha256']==d['sha256'],'complete_assembly_hash_differs')
         return q | {'model_scope':d['model_ids'],'observed_chains':len(d['model_members'][model_num]),'atoms':d['atom_count'],
                   'readback':'PASS','verifier_sha256':b.get('historical_verifier',{}).get('sha256')}
-    whole=memo(shared,('complete',str(assembly_path),raw['path']),check_assembly)
+    whole=memo(shared,('complete',str(assembly_path),raw['path'],raw['sha256'],model_num,aid,
+                       b.get('historical_verifier',{}).get('sha256',RULE)),check_assembly)
     files=refs|({'complete_assembly':whole} if whole else {})
     member_id=ms['partner_member_identities']
     identity={'pdb_id':p,'revision':rev,'source_sha256':raw['sha256'],'assembly':aid,'model_scope':[model_num],
@@ -448,6 +465,29 @@ def seed_registry(root,current,args):
     return db.resolve(),sha(db)
 
 
+def clone_sealed_registry(source, target):
+    """Seed an isolated M3 DB from an immutable Run; never hard-link a writable DB."""
+    source, target = Path(source), Path(target)
+    if sys.platform != 'linux' or any(Path(f'{source}{suffix}').exists() for suffix in ('-wal', '-shm', '-journal')):
+        return backup(source, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.registry-seed-', dir=target.parent) as temp:
+        staged=Path(temp)/target.name
+        # Exclusive reflink is an optimization. SQLite's consistent backup remains the
+        # portable fallback, including filesystems that do not support copy-on-write.
+        copied=subprocess.run(['cp', '--reflink=always', '--', str(source), str(staged)],
+                              capture_output=True, check=False)
+        if copied.returncode:
+            return backup(source, target)
+        require(not any(Path(f'{source}{suffix}').exists() for suffix in ('-wal','-shm','-journal')),
+                'sealed_catalog_became_writable_during_clone')
+        with connect(staged,readonly=True) as saved:
+            require(saved.execute('PRAGMA quick_check').fetchone()[0]=='ok','cloned_catalog_integrity_failed')
+        # Atomic, no replacement of an already staged destination.
+        target.hardlink_to(staged)
+    return target
+
+
 def incremental_inputs(root, inp, keys):
     spec=read(inp); require(spec.get('schema')=='aphcp-m3-increment-v1','unsupported_increment_manifest')
     evidence_ref=spec['candidate_evidence']; chem_ref=spec['chemistry']
@@ -516,7 +556,7 @@ def execute(args):
     if current and results!=current:raise ValueError('Immutable staging review differs; keep prior result and use a new run')
     if not current:write(data,results)
     if not seal_path.exists():write(seal_path,seal)
-    if seed and not database(ig).exists():backup(seed[0],database(ig))
+    if seed and not database(ig).exists():clone_sealed_registry(seed[0],database(ig))
     counts_db,db_reuse=index_review_results(ig,seal_path,results,seal,data,begin,round(time.monotonic()-start,3))
     states={'input_candidate_count':len(manifest),'input_entry_count':len({x[1] for x in manifest}),'dispositions':counts,
             'retained_review_systems':sum(x['disposition']=='REVIEW' and 'system_id' in x for x in results),
