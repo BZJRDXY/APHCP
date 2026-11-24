@@ -351,7 +351,7 @@ def ccd_basic(d):
 
 def bird_matches(d,bird):
     found=[]
-    for pid in d['prd']:
+    for pid in d.get('prd', ()):
         b=bird.get(pid)
         if not b:continue
         if d.get('ccd'):
@@ -674,7 +674,7 @@ def classifier(ccd,bird,ontology):
     @lru_cache(maxsize=32768)
     def basic_signature(sig):
         q=json.loads(sig); a=base_class(q,ccd,{})
-        return a, base_class(q,ccd,bird) if any(d['prd'] for d in q['members']) else a
+        return a, base_class(q,ccd,bird) if any(d.get('prd') for d in q['members']) else a
     def classify(p):
         sig={k:p[k] for k in ('members','covalent_edges','grouping','grouping_source_rows','issue')}
         sig['grouping_source_rows']=bool(sig['grouping_source_rows'])

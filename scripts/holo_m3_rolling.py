@@ -189,7 +189,7 @@ def wait_stage(child, pump):
             pump()
 
 
-def stage_batch(a, run, label, rows, seed, preflight):
+def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
     t=time.monotonic()
     runs=a.root/'runs'; m3=runs/f'{run.name}-{label}'; m2=runs/f'holo-m2-{run.name.removeprefix("holo-m3-")}-{label}'
     checks=preflight['checks']; linked={identity(r['source']):r['source'] for r in rows}
@@ -201,13 +201,23 @@ def stage_batch(a, run, label, rows, seed, preflight):
         return {'status':'ADMISSION_PENDING' if len(local_deferred)==len(deferred) else 'ARCHIVE_PENDING',
                 'catalog_run':seed.name,'total':len(rows),'pending':deferred,'archive_deferred':deferred,
                 'head_admission_deferred':local_deferred,'settled':0,'network_bytes':0}
-    m2.mkdir(exist_ok=True); m3.mkdir(exist_ok=True)
-    inputs=m2/'inputs'; inputs.mkdir(exist_ok=True)
-    once(inputs/'blind.json', [linked[identity(c)] for c in allowed])
-    once(inputs/'archive_head.json', allowed)
+    m3.mkdir(exist_ok=True)
+    blind=[linked[identity(c)] for c in allowed]
+    if recovered_m2 is not None:
+        m2=recovered_m2
+        frozen=read(m2/'frozen.json')
+        require(read(m2/'inputs'/'blind.json')==blind and read(m2/'inputs'/'archive_head.json')==allowed and
+                frozen['files']==[row | {'expected_bytes':check['content_length']} for row,check in zip(blind,allowed)],
+                'unsealed_m2_inputs_differ')
+    else:
+        m2.mkdir(exist_ok=True)
+        inputs=m2/'inputs'; inputs.mkdir(exist_ok=True)
+        once(inputs/'blind.json',blind)
+        once(inputs/'archive_head.json',allowed)
     current = m3/'increment_receipt.json'
     if not current.is_file():
-        for c in allowed:
+        cache_inputs=allowed if recovered_m2 is None else ()
+        for c in cache_inputs:
             if proof:=c.get('verified_cached_file'):
                 dst=raw_path(m2,c); dst.parent.mkdir(exist_ok=True)
                 if not dst.exists():
@@ -221,6 +231,8 @@ def stage_batch(a, run, label, rows, seed, preflight):
                         '--archive-limit',str(a.archive.limit),'--archive-ancillary',str(a.archive.ancillary),
                         '--primary-budget',str(a.primary_budget),
                          *(v for fd in a.owner_fds for v in ('--controller-lease-fd',str(fd))) ]
+        if recovered_m2 is not None:
+            command.append('--adopt-m2')
         with subprocess.Popen(command,pass_fds=a.owner_fds) as child:
             status=wait_stage(child,a.pump_retry)
             if status in (-9,TEMPORARY_INTERRUPTION):
@@ -228,8 +240,12 @@ def stage_batch(a, run, label, rows, seed, preflight):
             if status:
                 raise subprocess.CalledProcessError(status,command)
     summary=read(current)
-    require(read(m3/'increment_plan.json')['seed_run']==str(seed), 'rolling_seed_branch_disagrees')
-    return batch_outcome(runs,rows,m2,m3,summary,deferred,preflight,t) | {'head_admission_deferred':local_deferred}
+    increment=read(m3/'increment_plan.json')
+    require(increment['seed_run']==str(seed) and increment['m2_run']==str(m2), 'rolling_seed_or_source_disagrees')
+    result=batch_outcome(runs,rows,m2,m3,summary,deferred,preflight,t) | {'head_admission_deferred':local_deferred}
+    if recovered_m2 is not None:
+        result['reused_unsealed_m2']={'run':m2.name,'frozen_sha256':sha(m2/'frozen.json')}
+    return result
 
 
 def batch_outcome(runs, rows, m2, m3, summary, deferred, preflight, started):
@@ -366,6 +382,9 @@ def rolling(a):
         balance = {'high':high,'low':high//2,'budget_s':a.balance_budget,
                    'stop_after':a.stop_after_partition,'retry_only':a.retry_only}
         config['retry_balance'] = balance
+    recover_m2=getattr(a,'reuse_unsealed_m2',False)
+    if recover_m2:
+        config['reuse_unsealed_m2']=True
     a.pump_retry=lambda:None
     with ExitStack() as stack:
         lock=stack.enter_context((run/'rolling.lock').open('a'))
@@ -465,7 +484,7 @@ def rolling(a):
         if getattr(a,'resume_paused',False) and request.is_file():
             request.unlink(); sync_path(request.parent)
 
-        def process(label, rows, prep=None, adopt=False):
+        def process(label, rows, prep=None, adopt=False, *, recovered_m2=None):
             f=receipts/f'{label}.json'
             require(not f.is_file(), 'rolling_already_committed')
             if shutil.disk_usage(root).free < a.reserve_gib*GIB:
@@ -494,7 +513,8 @@ def rolling(a):
                         preflight=prep.result()
                     else:
                         preflight=prep
-                    saved=stage_batch(a,run,label,rows,seed,preflight)
+                    resume_args={"recovered_m2":recovered_m2} if recovered_m2 is not None else {}
+                    saved=stage_batch(a,run,label,rows,seed,preflight,**resume_args)
                 saved |= {'previous_catalog':seed.name,'sequence':sequence+1,'committed_utc':utc_now(),
                           'filesystem_used_delta_bytes':free_before-shutil.disk_usage(root).free}
                 if '-r' in label:
@@ -514,6 +534,32 @@ def rolling(a):
         if request.is_file():
             progress('PAUSED_AT_BOUNDARY'); return
         progress('RESUMING' if journal else 'ROLLING')
+        recovered_m2=None
+        if recover_m2:
+            require(legacy is not None,'unsealed_m2_requires_predecessor')
+            checkpoint=read(legacy/'active_dispatch.json')
+            label=checkpoint['label']
+            require(label in by_id and not checkpoint['adopt'],'unsealed_m2_requires_primary_partition')
+            if not (receipts/f'{label}.json').is_file():
+                require(checkpoint['previous_catalog']==seed.name,'unsealed_m2_predecessor_catalog_differs')
+                old_increment=runs/f'{legacy.name}-{label}'
+                old_phase=old_increment.with_name(old_increment.name+'-phase-001')
+                require(not (old_phase/'phase_receipt.json').exists(),'unsealed_m2_phase_already_sealed')
+                original=read(old_increment/'increment_plan.json')
+                recovered_m2=runs/f'holo-m2-{legacy.name.removeprefix("holo-m3-")}-{label}'
+                evidence=read(old_phase/'candidate_evidence.json')
+                manifest_sha=sha(recovered_m2/'frozen.json')
+                require(original['m2_run']==evidence['source_run']==str(recovered_m2) and
+                        original['m2_manifest_sha256']==evidence['source_manifest_sha256']==manifest_sha and
+                        original['seed_run']==str(seed),'unsealed_m2_source_proof_differs')
+                prep=read(legacy/'preflight'/f'{label}.json')
+                require(prep['input_digest']==digest(rows_for(by_id[label])),'unsealed_m2_preflight_differs')
+                (run/'preflight').mkdir(exist_ok=True)
+                once(run/'preflight'/f'{label}.json',prep)
+                if dispatch.is_file() and (current:=read(dispatch)):
+                    require(current==checkpoint,'unsealed_m2_dispatch_differs')
+                else:
+                    write(dispatch,checkpoint)
         if dispatch.is_file() and (active:=read(dispatch)):
             label=active['label']; bid=label.split('-r')[0]
             if (receipts/f'{label}.json').is_file():
@@ -530,7 +576,7 @@ def rolling(a):
                 if not active['adopt'] and saved_prep is None:
                     require('-r' not in label,'retry_dispatch_missing_preflight')
                     saved_prep=prepare(run,label,subset,cache,a.archive.ancillary,a.archive)
-                process(label,subset,saved_prep,adopt=active['adopt'])
+                process(label,subset,saved_prep,adopt=active['adopt'],recovered_m2=recovered_m2)
 
         (run/'preflight').mkdir(exist_ok=True)
         active_jobs={}; partition_cache={}; known_checks={}; partial_cache={}; cursor=0
@@ -782,6 +828,7 @@ def main():
     p.add_argument('--fetch-jobs',type=int,default=24)
     p.add_argument('--reserve-gib',type=int,default=1024)
     p.add_argument('--continue-from',type=Path,help='Adopt a stopped controller history from a distinct Run')
+    p.add_argument('--reuse-unsealed-m2',action='store_true',help='Recover the predecessor’s unsealed partition from its completed M2 evidence')
     p.add_argument('--primary-budget',type=float,default=30)
     p.add_argument('--archive-ancillary',type=int,default=6)
     p.add_argument('--retry-jobs',type=int,default=3)
@@ -798,6 +845,7 @@ def main():
     a=p.parse_args()
     if (min(a.jobs,a.fetch_jobs,a.batch_size,a.reserve_gib,a.primary_budget,a.max_pending,a.max_retries)<1 or
         a.max_retries>6 or a.balance_budget<1 or not 1<=a.retry_jobs<=a.archive_ancillary<a.fetch_jobs or
+        (a.reuse_unsealed_m2 and (not a.continue_from or a.retry_only)) or
         (a.max_main_batches is not None and a.max_main_batches<1) or
         (a.stop_after_partition is not None and a.stop_after_partition<1)):
         p.error('invalid scheduling limits')
