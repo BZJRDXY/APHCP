@@ -1,7 +1,8 @@
 """Feed verified fixed archive files to the rolling M3 source cache over SSH."""
 import argparse
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import Counter
 import gzip
 import hashlib
 import json
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from threading import Timer
 import time
 
 NAME=re.compile(r'holo-m2-prefetch-[a-z0-9-]{1,60}')
@@ -36,30 +38,64 @@ def sha(path):
         return hashlib.file_digest(f,'sha256').hexdigest()
 
 
-def collect(args, rows=None):
-    from aphcp_control.transport import load_settings,ssh_command
-    project=Path(__file__).resolve().parents[1]; settings=load_settings(project)
-    if rows is None: rows=json.loads(args.input.read_bytes())
+class FeedConnectionError(RuntimeError):
+    pass
+
+
+def remote_command(args, *command):
+    from aphcp_control.transport import load_settings, ssh_command
+    settings=load_settings(Path(__file__).resolve().parents[1])
+    if any(not p.is_absolute() or '..' in p.parts for p in (args.python,args.receiver)):
+        raise ValueError('Use absolute server runtime paths')
+    ssh=ssh_command(settings)
+    return [ssh[0],'-o','ServerAliveInterval=5','-o','ServerAliveCountMax=2',*ssh[1:],
+            shlex.join([str(args.python),'-B',str(args.receiver),command[0],settings['server']['data_root'],*command[1:]])]
+
+
+def ssh_json(command, stdin=b'', timeout=30):
+    try:
+        inputs={'input':stdin} if isinstance(stdin,bytes) else {'stdin':stdin}
+        child=subprocess.run(command,**inputs,capture_output=True,timeout=timeout)
+    except (OSError,subprocess.TimeoutExpired) as exc:
+        raise FeedConnectionError('alternate SSH timed out or was unavailable') from exc
+    if child.returncode:
+        raise FeedConnectionError(f'alternate SSH command failed ({child.returncode})')
+    return json.loads(child.stdout)
+
+
+def deliver(command, directory, files):
+    packet=directory/'feed.tar'
+    with tarfile.open(packet,'w') as archive:
+        for path in sorted(files):
+            entry=archive.gettarinfo(str(path),arcname=path.name)
+            entry.pax_headers={'APHCP.sha256':sha(path)}
+            with path.open('rb') as stream:
+                archive.addfile(entry,stream)
+    with packet.open('rb') as stream:
+        return ssh_json(command,stream,timeout=120)
+
+
+def collect(args, rows=None, *, available=None, partition=None):
+    if rows is None:
+        rows=json.loads(args.input.read_bytes())
     seen={}
     for item in rows:
         src=item.get('source',item); expected=pin(src['pdb_id'],src['revision'])
         if any(src[k]!=expected[k] for k in KEYS) or expected['pdb_id'] in seen:
             raise ValueError('Manifest must contain distinct fixed archive pins')
         seen[expected['pdb_id']]=expected
-    if not seen or len(seen)>2000: raise ValueError('Source feed accepts 1–2000 Entries per invocation')
-    for path in (args.python,args.receiver):
-        if not path.is_absolute() or '..' in path.parts: raise ValueError('Use absolute server runtime paths')
-    ssh=ssh_command(settings)+[shlex.join([str(args.python),'-B',str(args.receiver),'receive',
-                                           settings['server']['data_root'],args.cache])]
-    check=subprocess.run(ssh,input=b'',capture_output=True,timeout=30)
-    if check.returncode: raise RuntimeError(check.stderr.decode(errors='replace')[:500])
-    cached=json.loads(check.stdout)['available']; curl=shutil.which('curl.exe') or shutil.which('curl')
-    if not curl: raise RuntimeError('curl is required on the alternate download machine')
-    t=time.monotonic(); errors={}; loaded={}; send={}
+    if not seen or len(seen)>2000:
+        raise ValueError('Source feed accepts 1–2000 Entries per invocation')
+    ssh=remote_command(args,'receive',args.cache)
+    cached=ssh_json(ssh)['available'] if available is None else available
+    curl=shutil.which('curl.exe') or shutil.which('curl')
+    if not curl:
+        raise RuntimeError('curl is required on the alternate download machine')
+    start=time.monotonic(); errors={}; loaded={}; send={}; replayed=0; transfer_s=0; first_delivery_s=None
     targets={p:r for p,r in seen.items() if cached.get(p)!=r['revision']}
     with tempfile.TemporaryDirectory(prefix='aphcp-source-feed-') as temp:
         def get(row):
-            p=row['pdb_id']; name=p+'-v'+row['revision']+'.cif.gz'; target=Path(temp)/name
+            p=row['pdb_id']; target=Path(temp)/(p+'-v'+row['revision']+'.cif.gz')
             try:
                 result=subprocess.run([curl,'-q','--proto','=https','--fail','--silent','--show-error',
                           '--max-time',str(args.budget),'--connect-timeout','12','--max-filesize',str(MAX_FILE),
@@ -68,28 +104,61 @@ def collect(args, rows=None):
                 if result.returncode or result.stdout!=b'200' or not 0<target.stat().st_size<=MAX_FILE:
                     return p,None,'archive_transfer_failed'
                 return p,target,None
-            except (OSError,subprocess.TimeoutExpired): return p,None,'archive_transport_error'
+            except (OSError,subprocess.TimeoutExpired):
+                return p,None,'archive_transport_error'
+
         if targets:
             with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                for work in as_completed([pool.submit(get,r) for r in targets.values()]):
-                    p,f,error=work.result()
-                    if error: errors[p]=error
-                    else: send[p]=f
-        fetch_s=round(time.monotonic()-t,3); xfer=time.monotonic()
-        if send:
-            packet=Path(temp)/'feed.tar'
-            with tarfile.open(packet,'w') as tf:
-                for f in sorted(send.values()):
-                    entry=tf.gettarinfo(str(f),arcname=f.name); entry.pax_headers={'APHCP.sha256':sha(f)}
-                    with f.open('rb') as s: tf.addfile(entry,s)
-            with packet.open('rb') as stream:
-                child=subprocess.run(ssh,stdin=stream,capture_output=True,timeout=1800)
-            if child.returncode: raise RuntimeError(child.stderr.decode(errors='replace')[:700])
-            received=json.loads(child.stdout); loaded=received['loaded']; errors.update(received['errors'])
-    result={'cache':args.cache,'input':len(seen),'reused':len(seen)-len(targets),'received':len(loaded),
-            'received_bytes':sum(loaded.values()),'errors':errors,'fetch_s':fetch_s,
-            'transfer_verify_s':round(time.monotonic()-xfer,3),'elapsed_s':round(time.monotonic()-t,3)}
+                pending={pool.submit(get,row) for row in targets.values()}
+                flush_by=None
+                while pending or send:
+                    timeout=max(0,flush_by-time.monotonic()) if flush_by is not None else None
+                    finished,pending=wait(pending,timeout=timeout,return_when=FIRST_COMPLETED)
+                    for work in finished:
+                        p,path,error=work.result()
+                        if error: errors[p]=error
+                        else: send[p]=path
+                    if send and flush_by is None:
+                        flush_by=time.monotonic()+4
+                    if not send or (len(send)<4 and pending and time.monotonic()<flush_by):
+                        continue
+                    begin=time.monotonic()
+                    try:
+                        received=deliver(ssh,Path(temp),send.values())
+                    except FeedConnectionError:
+                        print(json.dumps({'cache':args.cache,'partition':partition,'delivery':'ACK_LOST',
+                                          'sent_files':len(send),'sent_bytes':sum(f.stat().st_size for f in send.values())}),flush=True)
+                        for work in pending: work.cancel()
+                        raise
+                    transfer_s+=time.monotonic()-begin
+                    if first_delivery_s is None: first_delivery_s=time.monotonic()-start
+                    if not set(received['loaded'])<=send.keys() or not set(received['errors'])<=send.keys():
+                        raise ValueError('Receiver acknowledgement did not match sent pins')
+                    loaded.update(received['loaded']); errors.update(received['errors']); cached.update(received['available'])
+                    replayed+=received.get('replayed',0)
+                    for p,path in send.items():
+                        if cached.get(p)!=targets[p]['revision']:
+                            errors.setdefault(p,'archive_delivery_unverified')
+                        path.unlink()
+                    send.clear(); flush_by=None
+    result={'cache':args.cache,'partition':partition,'input':len(seen),'reused':len(seen)-len(targets),'received':len(loaded),
+            'received_bytes':sum(loaded.values()),'replayed_delivery':replayed,'errors':errors,
+            'first_delivery_s':round(first_delivery_s,3) if first_delivery_s is not None else None,
+            'transfer_verify_s':round(transfer_s,3),'elapsed_s':round(time.monotonic()-start,3)}
     print(json.dumps(result,sort_keys=True),flush=True)
+    return result
+
+
+def cached_revision(cache, pdb):
+    proof=cache/'source_proofs'/f'{pdb}.json'
+    if proof.is_file():
+        saved=json.loads(proof.read_bytes()); pin_data=saved['identity']
+        body=cache/saved['relative_path']
+        if (pin_data['pdb_id']==pdb and saved['status']==saved.get('gzip_crc')=='PASS'
+                and pin_data['revision']==saved.get('observed_revision') and body.is_file()
+                and body.stat().st_size==saved['bytes']):
+            return pin_data['revision']
+    return None
 
 
 def bounded_queue(root, controller, cache, last):
@@ -119,22 +188,31 @@ def bounded_queue(root, controller, cache, last):
             owner=Path(read(owner/'rolling_config.json')['continued_from']).resolve(strict=True)
         if sha(path)!=part['sha256']: raise ValueError('Frozen production partition changed')
         output[part['id']]=[r['source'] for r in read(path)]
-    return {'active':True,'sealed':sealed,'partitions':output,'feed_reserve':cfg['feed_reserve']}
+    verified={row['pdb_id']:row['revision'] for items in output.values() for row in items
+              if cached_revision(runs/cache,row['pdb_id'])==row['revision']}
+    return {'active':True,'sealed':sealed,'partitions':output,'available':verified,'feed_reserve':cfg['feed_reserve']}
 
 
 @contextmanager
 def client_lease(args):
-    from aphcp_control.transport import load_settings,ssh_command
-    settings=load_settings(Path(__file__).resolve().parents[1])
-    if any(not p.is_absolute() or '..' in p.parts for p in (args.python,args.receiver)):
-        raise ValueError('Use absolute server runtime paths')
-    cmd=[*ssh_command(settings),shlex.join([str(args.python),'-B',str(args.receiver),'hold',
-                 settings['server']['data_root'],args.cache])]
-    with subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE) as child:
-        if child.stdout.readline()!=b'locked\n': raise RuntimeError('Could not acquire the alternate source feed lease')
-        try: yield
-        finally:
-            child.stdin.close(); child.wait(timeout=20)
+    cmd=remote_command(args,'hold',args.cache)
+    try:
+        with subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE) as child:
+            guard=Timer(30,child.kill); guard.start()
+            try:
+                if child.stdout.readline()!=b'locked\n':
+                    raise FeedConnectionError('Could not acquire the alternate source feed lease')
+            finally:
+                guard.cancel()
+            try:
+                yield
+            finally:
+                child.stdin.close()
+                try: child.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    child.kill(); child.wait()
+    except OSError as exc:
+        raise FeedConnectionError('alternate source feed lease connection lost') from exc
 
 
 def hold(args):
@@ -149,22 +227,38 @@ def hold(args):
 
 
 def follow(args):
-    from aphcp_control.transport import load_settings,ssh_command
-    settings=load_settings(Path(__file__).resolve().parents[1]); done=set()
-    if any(not p.is_absolute() or '..' in p.parts for p in (args.python,args.receiver)):
-        raise ValueError('Use absolute server runtime paths')
-    probe=[*ssh_command(settings),shlex.join([str(args.python),'-B',str(args.receiver),'queue',
-               settings['server']['data_root'],args.controller,args.cache,str(args.stop_after)])]
+    probe=remote_command(args,'queue',args.controller,args.cache,str(args.stop_after))
+    failures=Counter(); consecutive=0
     while True:
-        state=json.loads(subprocess.check_output(probe,timeout=30))
-        if not state['active']: return
-        if args.jobs>state['feed_reserve']: raise ValueError('Alternate download jobs exceed the reserved archive slots')
-        for label, items in state['partitions'].items():
-            if label not in done:
-                collect(args,items); done.add(label)
-                # Refresh the approved window after each feed to respect pause/stop.
-                break
-        else: time.sleep(5)
+        try:
+            with client_lease(args):
+                while True:
+                    state=ssh_json(probe)
+                    if not state['active']: return
+                    available=state['available']
+                    if args.jobs>state['feed_reserve']:
+                        raise ValueError('Alternate download jobs exceed the reserved archive slots')
+                    pins={(r['pdb_id'],r['revision']) for group in state['partitions'].values() for r in group}
+                    failures=Counter({key:count for key,count in failures.items() if key in pins})
+                    for label,items in state['partitions'].items():
+                        outstanding=[r for r in items if available.get(r['pdb_id'])!=r['revision']
+                                     and failures[r['pdb_id'],r['revision']]<2]
+                        if not outstanding: continue
+                        group=outstanding[:3*args.jobs]
+                        result=collect(args,group,available=available,partition=label)
+                        for row in group:
+                            key=row['pdb_id'],row['revision']
+                            if key[0] in result['errors']: failures[key]+=1
+                        consecutive=0
+                        break
+                    else:
+                        consecutive=0; time.sleep(5)
+        except FeedConnectionError:
+            consecutive+=1
+            if consecutive>5: raise
+            delay=min(2**consecutive,20)
+            print(json.dumps({'cache':args.cache,'state':'RECONNECTING','attempt':consecutive,'delay_s':delay}),flush=True)
+            time.sleep(delay)
 
 
 def receive(args):
@@ -177,15 +271,12 @@ def receive(args):
     for path in (raw,proofs):
         if path.resolve()!=path: raise ValueError('Invalid source feed directory')
         path.mkdir(exist_ok=True)
-    loaded={}; errors={}; available={}
+    loaded={}; errors={}; available={}; replayed=0
     with (run/'receive.lock').open('ab') as lease:
         fcntl.flock(lease,fcntl.LOCK_EX)
-        for f in proofs.glob('*.json'):
-            saved=json.loads(f.read_bytes()); p=saved['identity']
-            body=run/saved['relative_path']
-            if saved['status']=='PASS' and body.is_file() and body.stat().st_size==saved['bytes']:
-                available[p['pdb_id']]=p['revision']
-        if sys.stdin.buffer.peek(1):
+        if not sys.stdin.buffer.peek(1):
+            available={f.stem: rev for f in proofs.glob('*.json') if (rev:=cached_revision(run,f.stem))}
+        else:
             with tarfile.open(fileobj=sys.stdin.buffer,mode='r|') as packet:
                 for member in packet:
                     match=re.fullmatch(r'([0-9][A-Z0-9]{3})-v(\d+\.\d+)\.cif\.gz',member.name)
@@ -194,7 +285,7 @@ def receive(args):
                         raise ValueError('Unexpected source feed member')
                     pdb,rev=match.groups(); source=pin(pdb,rev)|{'expected_bytes':member.size}
                     body=raw/(member.name.lower()); proof=proofs/(pdb+'.json')
-                    if proof.exists() and available.get(pdb)!=rev:
+                    if proof.exists() and cached_revision(run,pdb)!=rev:
                         errors[pdb]='revision_conflicts_with_cache'; continue
                     temp=None
                     try:
@@ -211,16 +302,18 @@ def receive(args):
                             previous=json.loads(proof.read_bytes())
                             if previous['sha256']!=checksum or not body.is_file() or sha(body)!=checksum:
                                 raise ValueError('fixed_archive_differs_from_existing_cache')
+                            replayed+=1
                         else:
                             sync_path(temp); temp.replace(body); sync_path(raw)
                             durable_json(proof,{'status':'PASS','gzip_crc':'PASS','identity':source,'bytes':member.size,
                                 'sha256':checksum,'relative_path':str(body.relative_to(run)),'observed_revision':observed,
                                 'attempts':[],'evidence':'alternate_route_ssh_feed'})
-                        available[pdb]=rev; loaded[pdb]=member.size
+                            loaded[pdb]=member.size
+                        available[pdb]=rev
                     except (OSError,ValueError,RuntimeError,EOFError) as exc: errors[pdb]=str(exc)
                     finally:
                         if temp: temp.unlink(missing_ok=True)
-    print(json.dumps({'available':available,'loaded':loaded,'errors':errors},sort_keys=True))
+    print(json.dumps({'available':available,'loaded':loaded,'errors':errors,'replayed':replayed},sort_keys=True))
 
 
 def main():
@@ -239,8 +332,9 @@ def main():
     if args.mode in ('queue','follow') and (not CONTROLLER.fullmatch(args.controller) or args.stop_after<1):
         p.error('Invalid rolling Run or absolute stop')
     if args.mode=='queue': print(json.dumps(bounded_queue(args.root,args.controller,args.cache,args.stop_after)))
-    elif args.mode in ('fetch','follow'):
-        with client_lease(args): (collect if args.mode=='fetch' else follow)(args)
+    elif args.mode=='follow': follow(args)
+    elif args.mode=='fetch':
+        with client_lease(args): collect(args)
     else: (receive if args.mode=='receive' else hold)(args)
 
 
