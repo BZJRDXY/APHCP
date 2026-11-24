@@ -25,7 +25,7 @@ from holo_candidate_batch import revision_from_cif
 from holo_m3_decisions import resolve as resolve_decisions
 from holo_m2_blind_structure import ContactContext, explicit_role_names, instances_for, normalize, role
 from holo_role_evidence import assess, build_role_context, role_source
-from holo_v1_export import ATOM, describe_instances, expanded_atoms, expanded_conn_context, export, output_label, rows, text
+from holo_v1_export import ATOM, LABEL, MODEL, describe_instances, expanded_atoms, expanded_conn_context, export, output_label, rows, text
 
 RULE='holo-m3-v1-staging-2'
 STATE='M3_STAGING_UNPUBLISHED'
@@ -242,15 +242,22 @@ def assess_candidate(key,n,b,c,roots,m2,cache,shared):
     # Only the current verifier consumes this preparation; pinned historical exporters
     # keep their original preparation and readback behavior.
     if verifier is export:
+        projected_count = art['atom_count'] + art['omitted_assembly_atom_rows'] if expanded else None
+
         def prepare_readback():
             original=memo(shared,('atom_rows',raw['path'],raw['sha256']),lambda:rows(bsrc,ATOM))
             if not expanded:
                 return original,None
-            # Keep all deposited rows here: generated atom IDs depend on source row order,
-            # including other models. Connection projection is scoped to this model.
-            atoms=expanded_atoms(bsrc,ins,source_atoms=original)
+            # Older exports numbered atoms across all models. The sealed mapping's
+            # projection size distinguishes that format from the model-scoped export.
+            copies = Counter(v['label_asym'] for v in ins.values())
+            selected_rows = [row for row in original if text(row[MODEL]) == str(model_num)]
+            selected_count = sum(copies[text(row[LABEL])] for row in selected_rows)
+            source_rows = selected_rows if projected_count == selected_count else original
+            atoms=expanded_atoms(bsrc,ins,source_atoms=source_rows)
+            require(len(atoms[0]) == projected_count, 'recorded_assembly_projection_size_differs')
             return atoms,expanded_conn_context(bsrc,ins,atoms,{str(model_num)})
-        prepared, connections=memo(shared,('readback',RULE,raw['path'],raw['sha256'],model_num,aid),prepare_readback)
+        prepared, connections=memo(shared,('readback',RULE,raw['path'],raw['sha256'],model_num,aid,projected_count),prepare_readback)
         readback_kwargs.update(prepared=prepared,prepared_connections=connections)
     qc,atoms=verifier(Path(cif['path']),bsrc,p,aid,[model_num],labels,**readback_kwargs)
     require(qc['sha256']==cif['sha256'] and raw_json(qc['model_members'])==raw_json(art['model_members']) and qc['atom_count']==art['atom_count'],'derived_real_readback_differs')
@@ -316,7 +323,7 @@ def assess_candidate(key,n,b,c,roots,m2,cache,shared):
                         'partner_scope':'REVIEW' if partial_scope or issues else 'PASS','atoms':qc['atom_count'],'source_model_scope':[model_num],
                         'model_representation_note':dep_model_description,'all_deposited_models':[z.num for z in st],
                         'named_altloc_atoms':qc['named_altloc_atoms'],'altloc_policy':qc['altloc_policy'],
-                        'omitted_models':qc['omitted_models'],'explicit_connections':len(qc['connections']),
+                        'omitted_models':sorted(m.num for m in st if m.num != model_num),'explicit_connections':len(qc['connections']),
                         'omitted_touching_connections':len(qc['omitted_touching_connections']),'base_pairs':len(qc['base_pairs']),
                         'complete_assembly_available':whole is not None,'historical_verifier_sha256':b.get('historical_verifier',{}).get('sha256'),'transform_readback':qc.get('coordinate_transform_readback')}}
     return result
