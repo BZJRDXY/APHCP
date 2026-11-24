@@ -304,6 +304,28 @@ def pipeline_speed_section(root, name):
 '''
 
 
+def through100_section(root, source):
+    data, _ = receipt(root, source)
+    total = count(data['rolling_entries']); settled = count(data['settled_before_supplement'])
+    exhausted = count(data['exhausted_before_supplement']); unseen = count(data['unattempted'])
+    structures = count(data['queryable_before_supplement']); confirmed = count(data['staged_confirmed'])
+    added_entries = count(data['supplement_settled_entries']); added_systems = count(data['supplement_queryable_systems'])
+    commit = data['continuation_execution_commit']
+    require(settled + exhausted + unseen == total and data['sealed_batches'] == 100 and 0 < added_entries <= exhausted
+            and 0 < confirmed <= structures and added_systems > 0 and data['supplement_whole_assembly_verified'] is True
+            and data['supplement_scientific_disposition'] == 'REVIEW' and data['supplement_new_downloads'] == 0
+            and data['published_releases'] == 0 and re.fullmatch(r'[0-9a-f]{40}', commit)
+            and (data['continuation_first_active_partition'], data['continuation_gate'], data['continuation_stop']) == (101, 105, 200)
+            and 0 < count(data['continuation_approved_entries']) <= unseen, 'Invalid batch-100 closure or bounded continuation')
+    return f'''## M3 · Batch 100 closure and subsequent bounded launch
+
+- At the batch-100 stop, **{settled:,}/{total:,}** rolling entries were settled, **{exhausted:,}** had exhausted retries, and **{unseen:,}** were not yet attempted. The unpublished catalog had **{structures:,}** retrievable systems, **{confirmed:,}** confirmed in staging.
+- A targeted recheck reused frozen files and resolved **{added_entries:,}** technical entry exception. **{added_systems:,}** additional systems are retrievable with structural evidence; their scientific disposition is still REVIEW. No new coordinates were downloaded for this recheck.
+- Batch **101** was observed in progress at **{utc(data['verified_utc'])}**, with an internal gate at **105** and an absolute stop at **200** for **{count(data['continuation_approved_entries']):,}** approved entries. Execution code: `{commit}`. Neither the gate nor completion is attested by this launch snapshot. No dataset release was created.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -374,6 +396,7 @@ def render(root: Path, current_runtime: str):
     admission = archive_admission_section(root, src['m3_archive_admission']) if src.get('m3_archive_admission') else ''
     balanced = balanced_scale_section(root, src['m3_balanced_scale']) if src.get('m3_balanced_scale') else ''
     speed = pipeline_speed_section(root, src['m3_pipeline_speed']) if src.get('m3_pipeline_speed') else ''
+    through100 = through100_section(root, src['m3_through100']) if src.get('m3_through100') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -396,7 +419,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}{through100}## Open review
 
 {pending}
 

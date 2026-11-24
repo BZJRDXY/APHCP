@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from holo_m3_decisions import resolve
+from holo_m3_decisions import decision_view, resolve
 
 
 def result(run, outcome, parents=()):
@@ -35,6 +35,23 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(resolved['decision_state'],'CONCORDANT')
         self.assertEqual(resolved['disposition'],'REGISTERED')
         self.assertIsNone(resolved['current_decision_id'])
+
+    def test_observation_query_uses_current_evidence_and_clears_conflicts(self):
+        old=result('old','REVIEW')
+        new=result('new','REGISTERED',['old/example-system'])
+        new[2].update(role={'status':'PASS','source_evidence':{'reason':'new evidence'}},
+                      qc={'topology':'PASS'})
+        frozen={'status':'REVIEW','role':'REVIEW','role_evidence':{'reason':'old evidence'},
+                'm3_readback_qc':{'topology':'REVIEW'},'qc':{'coordinate_identity':'PASS'}}
+        shown=decision_view(frozen,[old,new])
+        self.assertEqual((shown['status'],shown['role']),('REGISTERED','PASS'))
+        self.assertEqual(shown['role_evidence'],new[2]['role']['source_evidence'])
+        self.assertEqual(shown['m3_readback_qc'],new[2]['qc'])
+        self.assertEqual(shown['qc'],frozen['qc'])
+        unresolved=decision_view(frozen,[old,new,result('other','REVIEW')])
+        self.assertEqual((unresolved['status'],unresolved['role']),('CONFLICT','REVIEW'))
+        self.assertIsNone(unresolved['role_evidence'])
+        self.assertIsNone(unresolved['m3_readback_qc'])
 
     def test_orphan_and_circular_replacements_are_rejected(self):
         with self.assertRaisesRegex(ValueError,'missing_for_same_identity'):

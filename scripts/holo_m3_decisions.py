@@ -54,3 +54,16 @@ def resolve(items):
         effective, state = None, 'CONFLICT'
     return shown | {'current_decision_id': effective, 'decision_state': state, 'current_decision_candidates': heads,
                     'provenance': [by_id[k][0] for k in sorted(by_id)]}
+
+
+def decision_view(observation, assessments):
+    decision = resolve(assessments)
+    role = decision.get('role') or {}
+    # Status and M3 evidence describe the same resolved decision; M2 QC remains the original observation.
+    return observation | {
+        'status': decision['disposition'], 'm3_reasons': decision.get('reasons', []),
+        'current_decision_id': decision['current_decision_id'], 'decision_state': decision['decision_state'],
+        'current_decision_candidates': decision['current_decision_candidates'],
+        'role': role.get('status', 'REVIEW'), 'role_evidence': role.get('source_evidence'),
+        'm3_readback_qc': decision.get('qc'),
+    }

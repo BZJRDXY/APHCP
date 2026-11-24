@@ -14,7 +14,7 @@ from holo_m3_register import (
     sha, utc_now, write,
 )
 from aphcp_control.registry import backup
-from holo_m3_decisions import resolve as resolve_decisions
+from holo_m3_decisions import decision_view, resolve as resolve_decisions
 
 
 STAGE = 'STRUCTURE_OBSERVATION'
@@ -309,9 +309,7 @@ def lookup_records(run, *, pdb=None, system=None, verify_files=False, limit=None
                 break
             rid, row = records[-1]
             if row.get('system_id') in decisions:
-                decision = resolve_decisions(decisions[row['system_id']])
-                row = row | {'status': decision['disposition'], 'm3_reasons': decision.get('reasons', []),
-                             'current_decision_id': decision.get('current_decision_id'), 'decision_state': decision.get('decision_state')}
+                row = decision_view(row, decisions[row['system_id']])
             if len(records) > 1 or row.get('entry_evidence'):
                 row = row | {'observations': [{'run': run_id, 'status': r['status'], 'key': r.get('key'),
                                                'entry_evidence': r.get('entry_evidence')} for run_id, r in records]}

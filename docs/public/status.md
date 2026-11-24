@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `6d95bc8797d5e3bd96f9c71d2423d89cfaea3f0a8519335410230eeba9f0d2ee`
+Public runtime fingerprint (SHA-256): `7f2f5321ada5d78dde8f64f7e7b9a5c862da0f89029ac66cd874e5743b337c71`
 
 ## M1 · Metadata inventory
 
@@ -82,6 +82,12 @@ Public runtime fingerprint (SHA-256): `6d95bc8797d5e3bd96f9c71d2423d89cfaea3f0a8
 
 - At **2026-11-24T06:11:14+00:00**, two isolated runs from the same catalog and **170** fixed entries compared serial and overlapped scheduling. Time decreased from **51.5 s** to **42.8 s** with **1,079** identical reviewed system identities, QC outcomes and CIF hashes. This is a cached-input test, not a production throughput forecast.
 - On a separate **24**-file sample enriched for historical slow downloads, the alternate route verified **24** files and the server route verified **5** on the first attempt with the same 30-second budget. The alternate-source cache verified input identities and reused all transferred files on replay. No dataset release was made.
+
+## M3 · Batch 100 closure and subsequent bounded launch
+
+- At the batch-100 stop, **53,173/233,639** rolling entries were settled, **5** had exhausted retries, and **180,461** were not yet attempted. The unpublished catalog had **326,582** retrievable systems, **10,655** confirmed in staging.
+- A targeted recheck reused frozen files and resolved **1** technical entry exception. **2** additional systems are retrievable with structural evidence; their scientific disposition is still REVIEW. No new coordinates were downloaded for this recheck.
+- Batch **101** was observed in progress at **2026-11-24T11:53:30+00:00**, with an internal gate at **105** and an absolute stop at **200** for **51,003** approved entries. Execution code: `29691cdfadd5576639f52652692682fe77a38cdb`. Neither the gate nor completion is attested by this launch snapshot. No dataset release was created.
 
 ## Open review
 
