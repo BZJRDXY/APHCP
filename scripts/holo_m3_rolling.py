@@ -152,6 +152,38 @@ def cache_index(before):
     return result
 
 
+def cache_hit(cached, pin):
+    if cached:
+        origin,proof=cached
+        if all(proof['identity'][k]==pin[k] for k in SPEC):
+            try:
+                ref=file_ref(origin/proof['relative_path'],(origin,),proof['sha256'])
+                if ref['bytes']==proof['bytes']:
+                    return ref
+            except (OSError,ValueError):
+                pass
+    return None
+
+
+class SourceCache(dict):
+    def __init__(self, scanned, feed):
+        super().__init__(scanned)
+        self.feed=feed
+
+    def get(self, key, default=None):
+        found=super().get(key)
+        if found or not self.feed:
+            return found or default
+        pdb,revision=key
+        path=self.feed/'source_proofs'/f'{pdb}.json'
+        if not path.is_file(): return default
+        proof=read(path); pin=proof.get('identity',{})
+        if (proof.get('status')==proof.get('gzip_crc')=='PASS' and proof.get('observed_revision')==revision and
+            identity(pin)==key and all(k in pin for k in SPEC) and proof.get('bytes',0)>0 and proof.get('relative_path')):
+            return self.feed,proof
+        return default
+
+
 def prepare(run, label, rows, cache, jobs, archive):
     folder = run/'preflight'; folder.mkdir(exist_ok=True)
     path = folder/f'{label}.json'
@@ -161,17 +193,10 @@ def prepare(run, label, rows, cache, jobs, archive):
         return result
     start = time.monotonic()
     def probe(record):
-        pin=record['source']; cached=cache.get(identity(pin))
+        pin=record['source']; cached=cache_hit(cache.get(identity(pin)),pin)
         if cached:
-            origin,proof=cached
-            if all(proof['identity'][k]==pin[k] for k in SPEC):
-                try:
-                    cached_file=file_ref(origin/proof['relative_path'],(origin,),proof['sha256'])
-                    if cached_file['bytes']==proof['bytes']:
-                        return pin | {'status':200,'content_length':proof['bytes'],'availability':'VERIFIED',
-                                      'verified_cached_file':cached_file,'checked_utc':utc_now()}
-                except (OSError,ValueError):
-                    pass
+            return pin | {'status':200,'content_length':cached['bytes'],'availability':'VERIFIED',
+                          'verified_cached_file':cached,'checked_utc':utc_now()}
         return archive.head(pin)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         checks=list(pool.map(probe,rows))
@@ -189,20 +214,66 @@ def wait_stage(child, pump):
             pump()
 
 
-def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
-    t=time.monotonic()
-    runs=a.root/'runs'; m3=runs/f'{run.name}-{label}'; m2=runs/f'holo-m2-{run.name.removeprefix("holo-m3-")}-{label}'
-    checks=preflight['checks']; linked={identity(r['source']):r['source'] for r in rows}
+def m2_path(runs, run, label):
+    return runs/f'holo-m2-{run.name.removeprefix("holo-m3-")}-{label}'
+
+
+def preflight_sources(rows, checks):
+    linked={identity(r['source']):r['source'] for r in rows}
     require(len(linked)==len(checks) and set(linked)=={identity(c) for c in checks}, 'rolling_preflight_does_not_cover_batch')
     allowed=[c for c in checks if c['availability']=='VERIFIED']
+    return [linked[identity(c)] for c in allowed],allowed
+
+
+def prepare_m2(runs, m2, blind, allowed, cache=None):
+    m2.mkdir(exist_ok=True)
+    inputs=m2/'inputs'; inputs.mkdir(exist_ok=True)
+    once(inputs/'blind.json',blind)
+    once(inputs/'archive_head.json',allowed)
+    late_links=0
+    for c in allowed:
+        dst=raw_path(m2,c)
+        if dst.exists(): continue
+        proof=c.get('verified_cached_file')
+        if not proof and cache is not None and cache.feed:
+            newer=cache_hit(cache.get(identity(c)),c)
+            if newer and newer['bytes']==c['content_length']:
+                proof=newer; late_links+=1
+        if proof:
+            dst.parent.mkdir(exist_ok=True)
+            src=Path(proof['path']); require(src.is_relative_to(runs) and sha(src)==proof['sha256'], 'cached_raw_changed_after_preflight')
+            os.link(src,dst)
+    return late_links
+
+
+def prefetch_m2(a, run, label, rows, preflight):
+    # The prefetch worker can build one successor, but cannot update the catalog.
+    from types import SimpleNamespace
+    from holo_m3_increment import submit_m2
+    runs=a.root/'runs'; target=m2_path(runs,run,label)
+    blind,allowed=preflight_sources(rows,preflight['checks'])
+    if not allowed:
+        return False
+    late_links=prepare_m2(runs,target,blind,allowed,getattr(a,'source_cache',None))
+    t=time.monotonic()
+    submit_m2(SimpleNamespace(index=a.index,jobs=a.jobs,fetch_jobs=a.archive.limit-a.archive.ancillary,
+              archive_slots=a.archive.folder,archive_limit=a.archive.limit,archive_ancillary=a.archive.ancillary,
+              primary_budget=a.primary_budget,stream_build=True,controller_lease_fd=a.owner_fds),target)
+    return {'m2_run':target.name,'elapsed_s':round(time.monotonic()-t,3),'entries':len(allowed),
+            'stream_receipt_sha256':sha(target/'stream_receipt.json'),'late_cache_links':late_links}
+
+
+def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
+    t=time.monotonic()
+    runs=a.root/'runs'; m3=runs/f'{run.name}-{label}'; m2=m2_path(runs,run,label)
+    checks=preflight['checks']; blind,allowed=preflight_sources(rows,checks)
     deferred=sorted(c['pdb_id'] for c in checks if c['availability']!='VERIFIED')
     local_deferred=sorted(c['pdb_id'] for c in checks if c.get('failure_domain')=='LOCAL_ADMISSION')
     if not allowed:
         return {'status':'ADMISSION_PENDING' if len(local_deferred)==len(deferred) else 'ARCHIVE_PENDING',
                 'catalog_run':seed.name,'total':len(rows),'pending':deferred,'archive_deferred':deferred,
                 'head_admission_deferred':local_deferred,'settled':0,'network_bytes':0}
-    m3.mkdir(exist_ok=True)
-    blind=[linked[identity(c)] for c in allowed]
+    m3.mkdir(exist_ok=True); late_links=0
     if recovered_m2 is not None:
         m2=recovered_m2
         frozen=read(m2/'frozen.json')
@@ -210,31 +281,28 @@ def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
                 frozen['files']==[row | {'expected_bytes':check['content_length']} for row,check in zip(blind,allowed)],
                 'unsealed_m2_inputs_differ')
     else:
-        m2.mkdir(exist_ok=True)
-        inputs=m2/'inputs'; inputs.mkdir(exist_ok=True)
-        once(inputs/'blind.json',blind)
-        once(inputs/'archive_head.json',allowed)
+        late_links=prepare_m2(runs,m2,blind,allowed,getattr(a,'source_cache',None))
     current = m3/'increment_receipt.json'
     if not current.is_file():
-        cache_inputs=allowed if recovered_m2 is None else ()
-        for c in cache_inputs:
-            if proof:=c.get('verified_cached_file'):
-                dst=raw_path(m2,c); dst.parent.mkdir(exist_ok=True)
-                if not dst.exists():
-                    src=Path(proof['path']); require(src.is_relative_to(runs) and sha(src)==proof['sha256'], 'cached_raw_changed_after_preflight')
-                    os.link(src,dst)
         pipeline=Path(__file__).resolve().with_name('holo_m3_increment.py')
         command=[sys.executable,'-B',str(pipeline),'--root',str(a.root),'--m2-run',str(m2),'--m3-run',str(m3),
                         '--batch',m3.name,'--seed-run',str(seed),'--index',str(a.index),'--reference-run',str(a.reference_run),
-                        '--expected-entries',str(len(allowed)),'--jobs',str(a.jobs),'--fetch-jobs',str(a.fetch_jobs),
+                        '--expected-entries',str(len(allowed)),'--jobs',str(a.jobs),'--fetch-jobs',str(a.archive.limit),
                         '--git-head',a.git_head,'--defer-pending','--archive-slots',str(a.archive.folder),
                         '--archive-limit',str(a.archive.limit),'--archive-ancillary',str(a.archive.ancillary),
                         '--primary-budget',str(a.primary_budget),
                          *(v for fd in a.owner_fds for v in ('--controller-lease-fd',str(fd))) ]
         if recovered_m2 is not None:
             command.append('--adopt-m2')
+        if getattr(a,'pipeline',False):
+            command.append('--stream-build')
+        def pump():
+            a.pump_retry()
+            callback=getattr(a,'advance_prefetch',None)
+            if callback and '-r' not in label and (m2/'last_fetch_invocation.json').is_file():
+                callback()
         with subprocess.Popen(command,pass_fds=a.owner_fds) as child:
-            status=wait_stage(child,a.pump_retry)
+            status=wait_stage(child,pump)
             if status in (-9,TEMPORARY_INTERRUPTION):
                 raise InterruptedStage(f'Rolling increment interrupted: {status}')
             if status:
@@ -243,6 +311,8 @@ def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
     increment=read(m3/'increment_plan.json')
     require(increment['seed_run']==str(seed) and increment['m2_run']==str(m2), 'rolling_seed_or_source_disagrees')
     result=batch_outcome(runs,rows,m2,m3,summary,deferred,preflight,t) | {'head_admission_deferred':local_deferred}
+    if late_links:
+        result['late_cache_links']=late_links
     if recovered_m2 is not None:
         result['reused_unsealed_m2']={'run':m2.name,'frozen_sha256':sha(m2/'frozen.json')}
     return result
@@ -385,6 +455,16 @@ def rolling(a):
     recover_m2=getattr(a,'reuse_unsealed_m2',False)
     if recover_m2:
         config['reuse_unsealed_m2']=True
+    if getattr(a,'pipeline',False):
+        config['pipeline']=True
+    feed_name=getattr(a,'source_feed',None); feed=None
+    feed_reserve=(getattr(a,'feed_reserve',None) or 6) if feed_name else 0
+    require(a.archive_ancillary<a.fetch_jobs-feed_reserve,'source_feed_leaves_no_primary_archive_slots')
+    if feed_name:
+        require(re.fullmatch(r'holo-m2-prefetch-[a-z0-9-]{1,60}',feed_name),'invalid_source_feed')
+        feed=runs/feed_name
+        require(feed.resolve()==feed,'source_feed_outside_runs')
+        config.update(source_feed=feed_name,feed_reserve=feed_reserve,source_feed_stop=a.stop_after_partition)
     a.pump_retry=lambda:None
     with ExitStack() as stack:
         lock=stack.enter_context((run/'rolling.lock').open('a'))
@@ -415,7 +495,7 @@ def rolling(a):
         if legacy:
             config['legacy_plan_sha256']=sha(legacy/'rolling_plan.json')
         once(run/'rolling_config.json',config)
-        a.archive=Archive(run/'archive_slots',a.fetch_jobs,a.archive_ancillary,lease_fds=a.owner_fds)
+        a.archive=Archive(run/'archive_slots',a.fetch_jobs-feed_reserve,a.archive_ancillary,lease_fds=a.owner_fds)
         path=run/'rolling_plan.json'
         if not path.is_file():
             once(path,read(legacy/'rolling_plan.json') if legacy else build_plan(root,run,a.m1,a.prior,a.batch_size))
@@ -426,7 +506,8 @@ def rolling(a):
         proof=read(a.acceptance)
         require(proof['accepted'] and proof['catalog_run']==a.seed_run.name and proof['pending_technical']==[],
                 'production_acceptance_gate_failed')
-        cache=cache_index(tuple(r for r in runs.glob('holo-m2-*') if (r/'source_proofs').is_dir()))
+        cache=SourceCache(cache_index(tuple(r for r in runs.glob('holo-m2-*') if (r/'source_proofs').is_dir())),feed)
+        a.source_cache=cache
         receipts=run/'receipts'; receipts.mkdir(exist_ok=True)
         seed=a.seed_run; done=0; primary=set(); pending={}; retries=Counter(); bytes_network=0; started=time.monotonic(); sequence=0
         by_id={p['id']:p for p in plan['partitions']}; consumed_attempts={}; sealed_at={}
@@ -750,7 +831,7 @@ def rolling(a):
 
         with ThreadPoolExecutor(max_workers=1) as ahead, ThreadPoolExecutor(max_workers=a.retry_jobs) as pool:
             a.pump_retry=pump
-            future=None; consecutive_failures=0; completed_here=0; pause_reason=None
+            future=None; prefetched=None; consecutive_failures=0; completed_here=0; pause_reason=None
             if not unstarted and stop_after is not None and not retry_only:
                 drain_reason=balance_backlog(None,closing=True) if balance else None
                 pause_reason=drain_reason or 'PAUSED_OBSERVATION_LIMIT'
@@ -769,11 +850,33 @@ def rolling(a):
                 if future is None and not adopt:
                     # A cold-start HEAD wave gets the preflight executor first.
                     future=ahead.submit(prepare,run,label,rows,cache,a.archive.ancillary,a.archive)
+                if prefetched is not None:
+                    while not prefetched.done():
+                        wait((prefetched,),timeout=.5); pump()
+                    # Recover from a failed speculative stage via the foreground path.
+                    try:
+                        proof=prefetched.result()
+                        if proof: write(run/'preflight'/f'{label}.stream.json',proof)
+                    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as exc:
+                        print(f'{label} prefetch failed; foreground will resume: {exc}',flush=True)
+                    prefetched=None
+                    if request.is_file(): break
                 lookahead=None
                 if i+1<len(unstarted) and (a.max_main_batches is None or completed_here+1<a.max_main_batches):
-                    nxt=unstarted[i+1]
-                    lookahead=ahead.submit(prepare,run,nxt['id'],rows_for(nxt),cache,a.archive.ancillary,a.archive)
-                result=process(label,rows,future,adopt=adopt); future=lookahead
+                    nxt=unstarted[i+1]; next_rows=rows_for(nxt)
+                    lookahead=ahead.submit(prepare,run,nxt['id'],next_rows,cache,a.archive.ancillary,a.archive)
+                def advance_prefetch():
+                    nonlocal prefetched
+                    if (prefetched is None and lookahead is not None and lookahead.done() and
+                        not request.is_file() and lookahead.exception() is None and
+                        shutil.disk_usage(root).free>=a.reserve_gib*GIB):
+                        prefetched=ahead.submit(prefetch_m2,a,run,nxt['id'],next_rows,lookahead.result())
+                a.advance_prefetch=advance_prefetch if getattr(a,'pipeline',False) else None
+                try:
+                    result=process(label,rows,future,adopt=adopt)
+                finally:
+                    a.advance_prefetch=None
+                future=lookahead
                 completed_here+=1
                 if request.is_file(): break
                 collect(); schedule(pool)
@@ -830,6 +933,9 @@ def main():
     p.add_argument('--continue-from',type=Path,help='Adopt a stopped controller history from a distinct Run')
     p.add_argument('--reuse-unsealed-m2',action='store_true',help='Recover the predecessor’s unsealed partition from its completed M2 evidence')
     p.add_argument('--primary-budget',type=float,default=30)
+    p.add_argument('--pipeline',action='store_true',help='Overlap verified source and structure work, including one successor')
+    p.add_argument('--source-feed',help='Read an optional live cache with a holo-m2-prefetch Run name')
+    p.add_argument('--feed-reserve',type=int,help='Reserve slots for the external feed within --fetch-jobs (default: 6)')
     p.add_argument('--archive-ancillary',type=int,default=6)
     p.add_argument('--retry-jobs',type=int,default=3)
     p.add_argument('--max-retries',type=int,default=3)
@@ -846,6 +952,8 @@ def main():
     if (min(a.jobs,a.fetch_jobs,a.batch_size,a.reserve_gib,a.primary_budget,a.max_pending,a.max_retries)<1 or
         a.max_retries>6 or a.balance_budget<1 or not 1<=a.retry_jobs<=a.archive_ancillary<a.fetch_jobs or
         (a.reuse_unsealed_m2 and (not a.continue_from or a.retry_only)) or
+        (a.source_feed and not a.stop_after_partition) or
+        (a.feed_reserve is not None and (not a.source_feed or a.feed_reserve<1)) or
         (a.max_main_batches is not None and a.max_main_batches<1) or
         (a.stop_after_partition is not None and a.stop_after_partition<1)):
         p.error('invalid scheduling limits')

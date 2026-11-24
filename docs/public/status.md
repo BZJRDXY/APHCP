@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `5cc368baa81a1d36291fe41a98bb5f0e4086345ece2be5e97812a143fba6952d`
+Public runtime fingerprint (SHA-256): `da3d507cad4331b6507a4375acea21e0900beadb2394d0ad834796d691960bde`
 
 ## M1 · Metadata inventory
 
@@ -77,6 +77,11 @@ Public runtime fingerprint (SHA-256): `5cc368baa81a1d36291fe41a98bb5f0e4086345ec
 - **1,650** new entries were attempted; **110** retry entries were recovered. At the gate, **10,166 / 233,639** rolling entries were settled, **3** technical entries had exhausted retries, and no actionable retries remained.
 - The staging catalog then contained **88,623** retrievable systems, including **1,933** confirmed in staging. No dataset release was created.
 - The subsequent run was independently observed after launch at **2026-11-23T17:15:56+00:00** and is capped at absolute batch **100**. This is launch evidence, not a live status or completion claim.
+
+## M3 · Pipeline and source acquisition comparison
+
+- At **2026-11-24T06:11:14+00:00**, two isolated runs from the same catalog and **170** fixed entries compared serial and overlapped scheduling. Time decreased from **51.5 s** to **42.8 s** with **1,079** identical reviewed system identities, QC outcomes and CIF hashes. This is a cached-input test, not a production throughput forecast.
+- On a separate **24**-file sample enriched for historical slow downloads, the alternate route verified **24** files and the server route verified **5** on the first attempt with the same 30-second budget. The alternate-source cache verified input identities and reused all transferred files on replay. No dataset release was made.
 
 ## Open review
 

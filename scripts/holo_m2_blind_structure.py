@@ -324,11 +324,17 @@ def nucleic_evidence(native, source, contexts, paired):
     return out
 
 
+def index_paths(index):
+    return {n:index/f'{n}.parquet' for n in ('annotation_table','entry_sources','entry_biounit_chains')}
+
+
+def index_stamp(index):
+    return {n:{'bytes':f.stat().st_size,'mtime_ns':f.stat().st_mtime_ns} for n,f in index_paths(index).items()}
+
+
 def prepare_index(run, plan, index):
     import pyarrow.parquet as pq
-    names=('annotation_table','entry_sources','entry_biounit_chains')
-    files={n:index/f'{n}.parquet' for n in names}
-    stamp={n:{'bytes':f.stat().st_size,'mtime_ns':f.stat().st_mtime_ns} for n,f in files.items()}
+    files=index_paths(index); names=tuple(files); stamp=index_stamp(index)
     dst=run/'index_snapshot.json'
     if dst.exists():
         old=read(dst)
@@ -635,7 +641,7 @@ def summarize(run,plan,invocation):
         'raw_verified':sum(s['status']=='PASS' for s in raw),'network':counters,'sizes':sizes,'invocation':invocation})
 
 
-def build(run,plan,selected,index,jobs,fetch_counts,start):
+def build(run,plan,selected,index,jobs,fetch_counts,start,*,downloads=None,on_fetch=None):
     rows,cache=prepare_index(run,plan,index)
     bootstrap=Path(__file__).resolve().parent
     signatures={f.name:sha256(f) for f in bootstrap.glob('holo_*.py')}
@@ -648,12 +654,33 @@ def build(run,plan,selected,index,jobs,fetch_counts,start):
     split_above=256 if slots>=slices else None
     targets={r['pdb_id']:r for r in plan if r['pdb_id'] in selected}
     complete={}; started={}; total=len(targets)
-    with ProcessPoolExecutor(max_workers=slots) as pool:
-        pending={pool.submit(one,run,r,rows[p],fingerprint,split_above=split_above):(p,None)
-                 for p,r in targets.items()}
-        while pending:
-            finished,_=wait(pending,return_when=FIRST_COMPLETED)
+    streamed=downloads is not None
+    timing={}
+    # Start POSIX workers before the download threads so they inherit the Run lease.
+    if streamed:
+        from multiprocessing import get_context
+    options={'mp_context':get_context('fork')} if streamed else {}
+    with ProcessPoolExecutor(max_workers=slots,**options) as pool:
+        if streamed:
+            pool.submit(int,0).result()
+        fetching=set(downloads()) if streamed else set()
+        pending={}
+        def enqueue(p):
+            pending[pool.submit(one,run,targets[p],rows[p],fingerprint,split_above=split_above)]=(p,None)
+            timing.setdefault('first_structure_dispatch_s',round(time.monotonic()-start,3))
+        if not streamed:
+            for p in targets: enqueue(p)
+        while pending or fetching:
+            finished,_=wait(set(pending)|fetching,return_when=FIRST_COMPLETED)
             for task in finished:
+                if task in fetching:
+                    fetching.remove(task)
+                    pdb,status=task.result()
+                    on_fetch(pdb,status,not fetching)
+                    if not fetching:
+                        timing['last_fetch_s']=round(time.monotonic()-start,3)
+                    enqueue(pdb)
+                    continue
                 pdb,part=pending.pop(task)
                 try:
                     p,status=task.result()
@@ -682,8 +709,10 @@ def build(run,plan,selected,index,jobs,fetch_counts,start):
                             'status':'TECHNICAL_FAILURE','failure_stage':'candidate_slice_merge',
                             'error':str(exc) or type(exc).__name__})
                         status='slice_failure'
+                timing.setdefault('first_structure_finish_s',round(time.monotonic()-start,3))
                 counts[status]+=1; n=sum(counts.values())
                 if n%10==0 or n==total or status not in ('built','reused_verified'):
                     print('structure',n,'/',total,pdb,dict(counts),round(time.monotonic()-start,2),flush=True)
-    summarize(run,plan,{'finished_utc':now(),'fetch':fetch_counts,'index_snapshot':cache,'structure':counts,'elapsed_s':round(time.monotonic()-start,3)})
+    summarize(run,plan,{'finished_utc':now(),'fetch':dict(fetch_counts),'index_snapshot':cache,'structure':counts,
+                        'stream_build':streamed,**timing,'elapsed_s':round(time.monotonic()-start,3)})
 

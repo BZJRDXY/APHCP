@@ -75,6 +75,8 @@ def submit_m2(a, m2):
     if getattr(a,'archive_slots',None):
         cmd+=['--archive-slots',str(a.archive_slots),'--archive-limit',str(a.archive_limit),
               '--archive-ancillary',str(a.archive_ancillary),'--primary-budget',str(a.primary_budget)]
+    if getattr(a,'stream_build',False):
+        cmd.append('--stream-build')
     subprocess.run(cmd,check=True,pass_fds=owner_lease(a))
 
 
@@ -159,7 +161,8 @@ def run_pipeline(a):
         require(len(plan)==a.expected_entries,'M2 entries do not match the approved input count')
         once(m3/'increment_plan.json', {'m2_run':str(m2),'m2_manifest_sha256':sha(m2/'frozen.json'),
             'adopt_m2':a.adopt_m2,'entries':len(plan),'batch':a.batch,'seed_run':str(a.seed_run.resolve(strict=True)),
-            'reference_run':str(a.reference_run.resolve(strict=True)),'index':str(a.index.resolve()),'git_head':a.git_head})
+            'reference_run':str(a.reference_run.resolve(strict=True)),'index':str(a.index.resolve()),'git_head':a.git_head,
+            **({'stream_build':True} if getattr(a,'stream_build',False) else {})})
         seed=a.seed_run.resolve(strict=True); pending={x['pdb_id'] for x in plan}; cumulative=set(); receipts=[]
         before={}; m2_pending=pending.copy(); m3_pending=set(); executed=[]
         while pending:
@@ -213,11 +216,14 @@ if __name__=='__main__':
     parser.add_argument('--controller-lease-fd',type=int,action='append',default=[],help=argparse.SUPPRESS)
     parser.add_argument('--archive-slots',type=Path); parser.add_argument('--archive-limit',type=int,default=24)
     parser.add_argument('--archive-ancillary',type=int,default=6); parser.add_argument('--primary-budget',type=float,default=30)
+    parser.add_argument('--stream-build',action='store_true')
     parser.add_argument('--batch',required=True)
     parser.add_argument('--expected-entries',type=int,required=True)
     parser.add_argument('--git-head',required=True)
     parser.add_argument('--jobs',type=int,default=8)
     args=parser.parse_args()
+    if args.stream_build and not args.archive_slots:
+        parser.error('--stream-build requires --archive-slots')
     if min(args.jobs,args.fetch_jobs,args.passes,args.expected_entries)<1:
         parser.error('positive counts are required')
     run_pipeline(args)

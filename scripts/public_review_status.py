@@ -289,6 +289,21 @@ def balanced_scale_section(root, name):
 '''
 
 
+def pipeline_speed_section(root, name):
+    data,_=receipt(root,name)
+    a,b=data['baseline_s'],data['pipeline_s']; n=count(data['entries']); cases=count(data['reviewed_systems'])
+    sample=count(data['route_input']); src=count(data['pro5000_verified']); alt=count(data['alternate_verified'])
+    require(0<b<a and 0<cases and 0<n and 0<src<alt<=sample and data['same_scientific_results'] is True
+            and data['same_input_replay'] is True and data['new_structure_downloads'] == 0 and data['staging_only'] is True,
+            'Missing bounded pipeline and source-route comparison')
+    return f'''## M3 · Pipeline and source acquisition comparison
+
+- At **{utc(data['verified_utc'])}**, two isolated runs from the same catalog and **{n:,}** fixed entries compared serial and overlapped scheduling. Time decreased from **{a:.1f} s** to **{b:.1f} s** with **{cases:,}** identical reviewed system identities, QC outcomes and CIF hashes. This is a cached-input test, not a production throughput forecast.
+- On a separate **{sample}**-file sample enriched for historical slow downloads, the alternate route verified **{alt}** files and the server route verified **{src}** on the first attempt with the same 30-second budget. The alternate-source cache verified input identities and reused all transferred files on replay. No dataset release was made.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -358,6 +373,7 @@ def render(root: Path, current_runtime: str):
     three_main = three_main_section(root, src['m3_three_main'], current_runtime) if src.get('m3_three_main') else ''
     admission = archive_admission_section(root, src['m3_archive_admission']) if src.get('m3_archive_admission') else ''
     balanced = balanced_scale_section(root, src['m3_balanced_scale']) if src.get('m3_balanced_scale') else ''
+    speed = pipeline_speed_section(root, src['m3_pipeline_speed']) if src.get('m3_pipeline_speed') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -380,7 +396,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}## Open review
 
 {pending}
 

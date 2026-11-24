@@ -1,6 +1,6 @@
 """Isolated, resumable APHCP blind M2: fetch pinned sources, build and audit."""
 import argparse
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 import csv
 import fcntl
@@ -235,9 +235,13 @@ def main():
     ap.add_argument('--entries',nargs='+'); ap.add_argument('--mode',choices=('all','fetch','build','audit'),default='all')
     ap.add_argument('--archive-slots',type=Path); ap.add_argument('--archive-limit',type=int,default=24)
     ap.add_argument('--archive-ancillary',type=int,default=6); ap.add_argument('--primary-budget',type=float)
+    ap.add_argument('--stream-build',action='store_true',help='Build each Entry as soon as its fixed source has been checked')
     args=ap.parse_args(); run=args.run.resolve(); start=time.monotonic()
     archive=Archive(args.archive_slots,args.archive_limit,args.archive_ancillary) if args.archive_slots else None
     if args.primary_budget is not None and (not archive or args.primary_budget<=0): ap.error('positive budget requires archive slots')
+    if args.mode=='all' and not args.index: ap.error('--index is required')
+    if args.stream_build and (args.mode!='all' or not archive or args.entries is not None):
+        ap.error('stream build requires all fixed Entries and shared archive slots')
     with (run/'execute.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         plan=freeze(run); selected=set(args.entries or (x['pdb_id'] for x in plan))
@@ -249,20 +253,42 @@ def main():
         if args.mode=='build':
             from holo_m2_blind_structure import build
             build(run,plan,selected,args.index,args.jobs,{},start); return
-        fetch_counts=Counter()
+        checkpoint=run/'stream_receipt.json'
+        summary=run/'summary.json'
+        if args.stream_build and checkpoint.is_file():
+            from holo_m2_blind_structure import index_stamp
+            previous=read(checkpoint)
+            if (previous['frozen_sha256']!=sha256(run/'frozen.json') or previous['summary_sha256']!=sha256(summary) or
+                previous['index']!=str(args.index.resolve()) or
+                read(run/'index_snapshot.json')['source_tables']!=index_stamp(args.index) or
+                any(sha256(Path(__file__).parent/f)!=h for f,h in read(run/'build_inputs.json')['code_files'].items())):
+                raise ValueError('Completed M2 stream changed; use a new Run')
+            print('M2 stream checkpoint reused',run.name,flush=True)
+            return
+        fetch_counts=Counter(); total=len(selected)
+        def record(p,result,last):
+            fetch_counts[result]+=1; n=sum(fetch_counts.values())
+            if last or n%20==0 or result=='failed':
+                print('fetch',n,'/',total,p,dict(fetch_counts),round(time.monotonic()-start,1),flush=True)
+            if last:
+                durable_json(run/'last_fetch_invocation.json',{'finished_utc':now(),'counts':dict(fetch_counts),
+                                                                'elapsed_s':round(time.monotonic()-start,2)})
         with ThreadPoolExecutor(max_workers=args.fetch_jobs) as pool:
-            tasks=[pool.submit(fetch,run,r,archive,"primary",
-                               args.primary_budget if r["expected_bytes"]<RANGE_MINIMUM else None) for r in plan if r['pdb_id'] in selected]
-            for n,f in enumerate(as_completed(tasks),1):
-                p,result=f.result(); fetch_counts[result]+=1
-                if n==len(tasks) or n%20==0 or result=='failed':
-                    print('fetch',n,'/',len(tasks),p,dict(fetch_counts),round(time.monotonic()-start,1),flush=True)
-        atomic_json(run/'last_fetch_invocation.json',{'finished_utc':now(),'counts':dict(fetch_counts),'elapsed_s':round(time.monotonic()-start,2)})
+            def downloads():
+                return [pool.submit(fetch,run,r,archive,"primary",
+                                    args.primary_budget if r["expected_bytes"]<RANGE_MINIMUM else None)
+                        for r in plan if r['pdb_id'] in selected]
+            if args.stream_build:
+                from holo_m2_blind_structure import build
+                build(run,plan,selected,args.index,args.jobs,fetch_counts,start,downloads=downloads,on_fetch=record)
+                durable_json(checkpoint,{'frozen_sha256':sha256(run/'frozen.json'),'summary_sha256':sha256(summary),
+                                          'index':str(args.index.resolve())})
+                return
+            for n,f in enumerate(as_completed(downloads()),1):
+                p,result=f.result(); record(p,result,n==total)
         if args.mode=='all':
-            if not args.index:
-                ap.error('--index is required')
             from holo_m2_blind_structure import build
-            build(run,plan,selected,args.index,args.jobs,dict(fetch_counts),start)
+            build(run,plan,selected,args.index,args.jobs,fetch_counts,start)
 
 
 if __name__=='__main__':
