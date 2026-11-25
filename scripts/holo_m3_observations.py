@@ -13,7 +13,7 @@ from holo_m3_register import (
     frozen_registry_root, jsonl, read, read_only_path, recorded_assessments, require, seed_registry,
     sha, utc_now, write,
 )
-from aphcp_control.registry import backup
+from aphcp_control.registry import backup, recover_empty_registry
 from holo_m3_decisions import decision_view, resolve as resolve_decisions
 
 
@@ -169,6 +169,7 @@ def build(args):
         require(read(frozen) == seal, 'catalog_inputs_changed_use_new_run')
     else:
         write(frozen, seal)
+    recover_empty_registry(dbpath,(run/'catalog_receipt.json',run/'phase_receipt.json'))
     if not dbpath.exists():
         backup(seed_path, dbpath)
     entries = {row['pdb_id']: row for row in jsonl(entries_file)}
@@ -225,6 +226,7 @@ def append_increment(root, run, seed, evidence_path, chemistry_path, git_head):
     started = time.monotonic()
     dbpath = database(frozen_registry_root(root, run, create=True))
     seed_path, seed_hash = seed_registry(root, run, SimpleNamespace(seed_run=seed))
+    recover_empty_registry(dbpath,(run/'phase_receipt.json',run/'catalog_receipt.json',run/'registration_receipt.json'))
     if not dbpath.exists():
         clone_sealed_registry(seed_path, dbpath)
     label = run.name + '-observations'

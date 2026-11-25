@@ -19,7 +19,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
 
 import gemmi
-from aphcp_control.registry import backup, connect, database, migrate, utc_now
+from aphcp_control.registry import (RegistryDiskReserve, backup, connect, database, migrate,
+                                    publish_registry, recover_empty_registry, require_backup_space, utc_now)
 from aphcp_control.queries import pdb as pdb_query
 from holo_candidate_batch import revision_from_cif
 from holo_m3_decisions import resolve as resolve_decisions
@@ -477,6 +478,7 @@ def clone_sealed_registry(source, target):
     if sys.platform != 'linux' or any(Path(f'{source}{suffix}').exists() for suffix in ('-wal', '-shm', '-journal')):
         return backup(source, target)
     target.parent.mkdir(parents=True, exist_ok=True)
+    require_backup_space(source,target)
     with tempfile.TemporaryDirectory(prefix='.registry-seed-', dir=target.parent) as temp:
         staged=Path(temp)/target.name
         # Exclusive reflink is an optimization. SQLite's consistent backup remains the
@@ -493,7 +495,7 @@ def clone_sealed_registry(source, target):
             saved.execute('PRAGMA mmap_size=536870912')
             require(saved.execute('PRAGMA quick_check').fetchone()[0]=='ok','cloned_catalog_integrity_failed')
         # Atomic, no replacement of an already staged destination.
-        target.hardlink_to(staged)
+        publish_registry(staged,target)
     return target
 
 
@@ -588,7 +590,9 @@ def execute(args):
     if not current:write(data,results)
     if not seal_path.exists():write(seal_path,seal)
     clock=time.monotonic()
-    if seed and not database(ig).exists():clone_sealed_registry(seed[0],database(ig))
+    if seed:
+        recover_empty_registry(database(ig),(r/'registration_receipt.json', r/'phase_receipt.json',r/'catalog_receipt.json'))
+        if not database(ig).exists(): clone_sealed_registry(seed[0],database(ig))
     counts_db,db_reuse=index_review_results(ig,seal_path,results,seal,data,begin,round(time.monotonic()-start,3))
     timing['registry_wall_s']=round(time.monotonic()-clock,3)
     write(r/('rerun_review_timing.json' if db_reuse else 'per_pdb_m3_timing.json'),timing)
@@ -652,7 +656,11 @@ def main():
     get.add_argument('--run',type=Path,required=True);group=get.add_mutually_exclusive_group(required=True)
     group.add_argument('--pdb');group.add_argument('--system');get.add_argument('--verify-files',action='store_true')
     get.add_argument('--asset',choices=['system_cif','source_mmcif','source_mapping','complete_assembly'])
-    args=p.parse_args(); execute(args) if args.command=='register' else lookup(args)
+    args=p.parse_args()
+    try:
+        execute(args) if args.command=='register' else lookup(args)
+    except RegistryDiskReserve as exc:
+        raise SystemExit(73) from exc
 
 
 if __name__=='__main__':main()

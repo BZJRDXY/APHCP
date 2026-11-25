@@ -1,4 +1,7 @@
+import os
+import shutil
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,20 +34,75 @@ def connect(path, *, readonly=False):
         connection.close()
 
 
+def sqlite_identity(db):
+    return (db.execute("PRAGMA application_id").fetchone()[0],
+            db.execute("PRAGMA user_version").fetchone()[0],
+            db.execute("PRAGMA page_count").fetchone()[0],
+            [tuple(r) for r in db.execute("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")])
+
+
+def publish_registry(staged, target):
+    """Durably publish a complete SQLite file without replacing another writer's file."""
+    if not staged.stat().st_size:
+        raise ValueError("Empty SQLite backup")
+    with staged.open("r+b" if os.name == "nt" else "rb") as stream:
+        os.fsync(stream.fileno())
+    target.hardlink_to(staged)
+    if os.name == "posix":
+        fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+class RegistryDiskReserve(RuntimeError):
+    pass
+
+
+def require_backup_space(source, target):
+    reserve = int(os.environ.get('APHCP_ROLLING_RESERVE_BYTES','0'))
+    if reserve:
+        needed = Path(source).stat().st_size
+        wal = Path(f'{source}-wal')
+        if wal.exists():
+            needed += wal.stat().st_size
+        if shutil.disk_usage(target.parent).free < reserve + needed:
+            raise RegistryDiskReserve('registry_copy_would_reach_disk_reserve')
+
+
 def backup(source, target):
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("xb"):
-        pass
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(target)
+    require_backup_space(source,target)
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.backup-")
+    os.close(fd)
+    staged = Path(name)
     try:
-        with connect(source, readonly=True) as live, connect(target) as saved:
+        with connect(source, readonly=True) as live, connect(staged) as saved:
+            live.execute("BEGIN")  # Pin the source snapshot across inspection and backup.
+            original = sqlite_identity(live)
+            if not original[2]:
+                raise ValueError("Empty SQLite backup source")
             live.backup(saved)
-            if saved.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise ValueError("SQLite 备份完整性检查失败")
-    except Exception:
-        target.unlink()
-        raise
+            if sqlite_identity(saved) != original or saved.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("SQLite backup source or integrity differs")
+            if saved.execute("PRAGMA journal_mode=DELETE").fetchone()[0].lower() != "delete":
+                raise ValueError("SQLite backup must be a self-contained file")
+        publish_registry(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
     return target
+
+
+def recover_empty_registry(target, sealed):
+    """Called only under the writer lease for a distinct staging destination."""
+    if target.is_file() and not target.stat().st_size:
+        if any(p.exists() for p in sealed) or any(Path(f"{target}{s}").exists() for s in ("-wal", "-shm", "-journal")):
+            raise ValueError("Empty registry has a commit receipt or active journal")
+        target.unlink()
 
 
 def migrate(path, directory=MIGRATIONS):

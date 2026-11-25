@@ -226,4 +226,12 @@ if __name__=='__main__':
         parser.error('--stream-build requires --archive-slots')
     if min(args.jobs,args.fetch_jobs,args.passes,args.expected_entries)<1:
         parser.error('positive counts are required')
-    run_pipeline(args)
+    from aphcp_control.registry import RegistryDiskReserve
+    try:
+        run_pipeline(args)
+    except RegistryDiskReserve as exc:
+        raise SystemExit(73) from exc
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode==73:
+            raise SystemExit(73) from exc
+        raise

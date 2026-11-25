@@ -207,16 +207,19 @@ def scheduler(root, url, *, child_mode=None):
                       acceptance=acc,batch_size=2,jobs=1,fetch_jobs=4,reserve_gib=0,primary_budget=1,
                       archive_ancillary=2,retry_jobs=1,max_retries=1,max_pending=6,max_main_batches=None,
                       stop_after_partition=(1 if child_mode=='stop' else 3),plan_only=False)
-    if child_mode in ('balance-kill','balance-timeout'):
-        a.balance_retries=True; a.balance_budget=1 if child_mode=='balance-timeout' else 12
+    if child_mode in ('balance-kill','balance-timeout','balance-clears'):
+        a.balance_retries=True; a.balance_budget=1 if child_mode in ('balance-timeout','balance-clears') else 12
         a.max_pending=2; a.retry_only=False
     wave=[]
     waiting=False
     def retry(run,row,archive,previous,known,n,consumed=0,prefer_ranges=False):
         t=time.monotonic(); identity=row['source']; p=identity['pdb_id']; wave.append((p,waiting,t))
         time.sleep(.14)
-        state=({'attempts':0,'next_epoch':time.time()+60,'state':'FAILED'} if child_mode=='balance-timeout' else
+        state=({'attempts':0,'next_epoch':time.time()+(1.5 if child_mode=='balance-clears' else 60),'state':'FAILED'} if
+               child_mode=='balance-timeout' or (child_mode=='balance-clears' and not (root/f'retry_deferred_{p}').exists()) else
                {'attempts':1,'next_epoch':0,'state':'READY','check':identity | {'retry_network_bytes':0,'availability':'VERIFIED'}})
+        if child_mode=='balance-clears' and state['state']=='FAILED':
+            (root/f'retry_deferred_{p}').touch()
         key=digest(tuple(identity[k] for k in rolling.SPEC)); queue=run/'retry_cache'/key
         queue.mkdir(exist_ok=True,parents=True); durable_json(queue/'attempt.json',state)
         return state
@@ -234,7 +237,7 @@ def scheduler(root, url, *, child_mode=None):
             assert saved['started_epoch']==marker['started_epoch']
             durable_json(root/'balance_resumed.json',saved)
         pending=keys if (child_mode is None and label in ('b0001','b0002') or
-                         child_mode in ('balance-kill','balance-timeout') and label=='b0001') else []
+                         child_mode in ('balance-kill','balance-timeout','balance-clears') and label=='b0001') else []
         if child_mode=='download' and label=='b0001':
             frozen=pin(PDB) | {'expected_bytes':len(BODY)}
             proof=done/'source_proofs'/f'{PDB}.json'; marker=root/'killed_download.json'
@@ -275,7 +278,9 @@ def scheduler(root, url, *, child_mode=None):
             os.kill(os.getpid(),signal.SIGKILL)
     with patch.multiple(rolling,stage_batch=stage,retry_download=retry,once=once,write=save,
                         Archive=lambda *a,**kw: Archive(*a,**kw,local_test=True)):
-        rolling.rolling(a)
+        state=rolling.rolling(a)
+        if child_mode and state=='PAUSED_RETRY_DRAIN_TIMEOUT':
+            raise SystemExit(rolling.TEMPORARY_INTERRUPTION)
     if child_mode is not None:
         return
     inside={p for p,in_stage,_ in wave if in_stage}
@@ -294,8 +299,9 @@ def real_supervised(root,url):
         where=root/mode; run=where/'runs'/'holo-m3-test-scheduler'; run.mkdir(parents=True)
         # The fixture owns its setup; the supervisor stores its state alongside it.
         args=[sys.executable,'-B',__file__,'--journal-child',str(where),url,mode]
-        assert supervise(run,args,limit=2,backoff=.05,lease_wait=4)==0
-        status=read(run/'supervisor_status.json'); assert status['state']=='NORMAL_EXIT'
+        rc=rolling.TEMPORARY_INTERRUPTION if mode=='balance-timeout' else 0
+        assert supervise(run,args,limit=2,backoff=.1,lease_wait=4)==rc
+        status=read(run/'supervisor_status.json'); assert status['state']==('RESTART_LIMIT' if rc else 'PLANNED_STOP')
         expected='PAUSED_RETRY_DRAIN_TIMEOUT' if mode=='balance-timeout' else 'PAUSED_OBSERVATION_LIMIT'
         assert read(run/'rolling_progress.json')['status']==expected
         return where,run,status
@@ -315,10 +321,14 @@ def real_supervised(root,url):
     assert read(balance_run/'rolling_progress.json')['new_settled_entries']==5
     assert read(balance_run/'retry_progress.json')['queued']==0
     _,held,state=run_site('balance-timeout')
-    assert state['restarts']==0 and read(held/'rolling_progress.json')['partitions_completed']==1
+    assert state['restarts']==2 and read(held/'rolling_progress.json')['partitions_completed']==1
     assert read(held/'retry_balance'/'b0002.json')['state']=='DRAIN_TIMEOUT'
     assert not (held/'receipts'/'b0002.json').is_file()
-    return {'durable_balance_resumed_after_SIGKILL':True,'balance_timeout_stops_primary':True,
+    _,cleared,state=run_site('balance-clears')
+    assert state['restarts']>=1 and read(cleared/'rolling_progress.json')['partitions_completed']==3
+    assert read(cleared/'retry_progress.json')['queued']==0
+    assert read(cleared/'retry_balance'/'b0002.json')['previous_holds'][0]['state']=='DRAIN_TIMEOUT'
+    return {'persisted_timeout_rechecked_and_drained':True,'recovery_budget_exhaustion':True,'durable_balance_resumed_after_SIGKILL':True,'balance_timeout_stops_primary':True,
             'verified_download_proof_reused_after_real_exit':True,'signal':'SIGKILL','automatic_restarts':1,'waited_for_descendant_lease':True,
             'receipt_hash_preserved':True,'unique_records_after_restart':2,'intentional_stop_restarts':0}
 

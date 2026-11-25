@@ -26,10 +26,55 @@ from holo_m3_register import (digest, file_ref, frozen_registry_root, jsonl,
 
 GIB = 1 << 30
 TEMPORARY_INTERRUPTION = 75
+DISK_RESERVE_EXIT = 73
 
 
 class InterruptedStage(RuntimeError):
     pass
+
+
+class DiskReserve(RuntimeError):
+    pass
+
+
+def disk_guard(a, extra=0):
+    if shutil.disk_usage(a.root).free < a.reserve_gib*GIB + extra:
+        raise DiskReserve('rolling_disk_reserve_reached')
+
+
+def actionable_count(stats):
+    return stats['queued'] - stats['exhausted']
+
+
+def drain_checkpoint(path, next_label, closing, stats, *, high, low, cap, now=None):
+    """Reopen a timed-out hold against the live queue; one fresh window per supervised attempt."""
+    now=time.time() if now is None else now
+    prior=read(path) if path.is_file() else {}
+    state=prior.get('state')
+    if prior:
+        require(prior['next_partition']==next_label and prior['closing']==closing,
+                'retry_balance_checkpoint_boundary_changed')
+    actionable=actionable_count(stats)
+    target=0 if closing else min(low,cap-1)
+    history=prior.get('previous_holds',[])
+    if state=='DRAIN_TIMEOUT':
+        history=[*history,{k:v for k,v in prior.items() if k!='previous_holds'}]
+    if prior and actionable<=target:
+        if state!='DRAINED' or prior.get('final')!=stats:
+            write(path,prior | {'state':'DRAINED','finished_utc':utc_now(),'final':stats,'previous_holds':history})
+        return None
+    if state=='DRAINING':
+        return prior | {'target_actionable':target}
+    if not actionable or (not closing and actionable<min(high,cap)):
+        if state=='DRAIN_TIMEOUT':
+            write(path,prior | {'state':'DRAINED','finished_utc':utc_now(),'final':stats,'previous_holds':history})
+        return None
+    if prior and state!='DRAIN_TIMEOUT':
+        history=[*history,{k:v for k,v in prior.items() if k!='previous_holds'}]
+    fresh={'state':'DRAINING','next_partition':next_label,'closing':closing,'target_actionable':target,
+           'started_utc':utc_now(),'started_epoch':now,'initial':stats,'previous_holds':history}
+    write(path,fresh)
+    return fresh
 SPEC = ('pdb_id', 'revision', 'source_url', 'file_type')
 PDB = re.compile(r'[0-9][A-Z0-9]{3}')
 REV = re.compile(r'\d+\.\d+')
@@ -254,6 +299,7 @@ def prefetch_m2(a, run, label, rows, preflight):
     blind,allowed=preflight_sources(rows,preflight['checks'])
     if not allowed:
         return False
+    disk_guard(a,sum(x['content_length'] for x in allowed if not x.get('verified_cached_file')))
     late_links=prepare_m2(runs,target,blind,allowed,getattr(a,'source_cache',None))
     t=time.monotonic()
     submit_m2(SimpleNamespace(index=a.index,jobs=a.jobs,fetch_jobs=a.archive.limit-a.archive.ancillary,
@@ -273,6 +319,7 @@ def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
         return {'status':'ADMISSION_PENDING' if len(local_deferred)==len(deferred) else 'ARCHIVE_PENDING',
                 'catalog_run':seed.name,'total':len(rows),'pending':deferred,'archive_deferred':deferred,
                 'head_admission_deferred':local_deferred,'settled':0,'network_bytes':0}
+    disk_guard(a,sum(x['content_length'] for x in allowed if not x.get('verified_cached_file')))
     m3.mkdir(exist_ok=True); late_links=0
     if recovered_m2 is not None:
         m2=recovered_m2
@@ -301,8 +348,11 @@ def stage_batch(a, run, label, rows, seed, preflight, *, recovered_m2=None):
             callback=getattr(a,'advance_prefetch',None)
             if callback and '-r' not in label and (m2/'last_fetch_invocation.json').is_file():
                 callback()
-        with subprocess.Popen(command,pass_fds=a.owner_fds) as child:
+        with subprocess.Popen(command,pass_fds=a.owner_fds,
+                              env=dict(os.environ,APHCP_ROLLING_RESERVE_BYTES=str(int(a.reserve_gib*GIB)))) as child:
             status=wait_stage(child,pump)
+            if status==DISK_RESERVE_EXIT:
+                raise DiskReserve('rolling_stage_disk_reserve_reached')
             if status in (-9,TEMPORARY_INTERRUPTION):
                 raise InterruptedStage(f'Rolling increment interrupted: {status}')
             if status:
@@ -452,6 +502,9 @@ def rolling(a):
         balance = {'high':high,'low':high//2,'budget_s':a.balance_budget,
                    'stop_after':a.stop_after_partition,'retry_only':a.retry_only}
         config['retry_balance'] = balance
+    terminal=getattr(a,'terminal_plan_sha256',None)
+    if terminal:
+        config['terminal_plan_sha256']=terminal
     recover_m2=getattr(a,'reuse_unsealed_m2',False)
     if recover_m2:
         config['reuse_unsealed_m2']=True
@@ -469,6 +522,8 @@ def rolling(a):
     with ExitStack() as stack:
         lock=stack.enter_context((run/'rolling.lock').open('a'))
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if (run/'protective_stop.json').is_file():
+            raise DiskReserve('rolling_disk_protection_requires_review')
         # An orphaned writer or downloader keeps the corresponding lease until it exits.
         a.owner_fds=(lock.fileno(),)
         legacy=Path(a.continue_from).resolve(strict=True) if getattr(a,'continue_from',None) else None
@@ -500,7 +555,12 @@ def rolling(a):
         if not path.is_file():
             once(path,read(legacy/'rolling_plan.json') if legacy else build_plan(root,run,a.m1,a.prior,a.batch_size))
         plan=read(path)
+        if not a.plan_only and plan.get('schema')==1 and a.stop_after_partition==len(plan['partitions']):
+            require(terminal,'rolling_full_stop_requires_terminal_plan_sha256')
         print({k:v for k,v in plan.items() if k not in ('partitions',)} | {'batches':len(plan['partitions'])},flush=True)
+        if terminal:
+            require(sha(path)==terminal and a.stop_after_partition==len(plan['partitions']) and
+                    getattr(a,'balance_retries',False),'rolling_terminal_scope_differs')
         if a.plan_only:
             return
         proof=read(a.acceptance)
@@ -568,9 +628,7 @@ def rolling(a):
         def process(label, rows, prep=None, adopt=False, *, recovered_m2=None):
             f=receipts/f'{label}.json'
             require(not f.is_file(), 'rolling_already_committed')
-            if shutil.disk_usage(root).free < a.reserve_gib*GIB:
-                progress('PAUSED_DISK_RESERVE')
-                raise RuntimeError('rolling_disk_reserve_reached')
+            disk_guard(a)
             current={'label':label,'pdb_ids':sorted(row['source']['pdb_id'] for row in rows),
                      'previous_catalog':seed.name,'adopt':adopt}
             (run/'preflight').mkdir(exist_ok=True)
@@ -602,6 +660,8 @@ def rolling(a):
                     saved['retry_selected']=current['pdb_ids']
                     saved['retry_attempts']={x['pdb_id']:x['retry_attempt'] for x in preflight['checks']}
                     saved['network_bytes']+=sum(x.get('retry_network_bytes',0) for x in preflight['checks'])
+            except DiskReserve:
+                raise
             except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
                 progress('PAUSED_UNSEALED_PARTITION',label)
                 raise
@@ -613,7 +673,7 @@ def rolling(a):
             return saved
 
         if request.is_file():
-            progress('PAUSED_AT_BOUNDARY'); return
+            progress('PAUSED_AT_BOUNDARY'); return 'PAUSED_AT_BOUNDARY'
         progress('RESUMING' if journal else 'ROLLING')
         recovered_m2=None
         if recover_m2:
@@ -724,6 +784,8 @@ def rolling(a):
                             partial_cache[key]=any(
                                 (x.get('exit_code')==28 or 'Timeout' in x.get('error','')) and x.get('http_status')==200 and x.get('body_bytes',0)>0
                                 for attempt in attempts for x in [attempt,*attempt.get('requests',[])])
+                        check=head_for(bid,pdb) or {}
+                        disk_guard(a,check.get('content_length') or 0)
                         active_jobs[key]=pool.submit(retry_download,run,row,a.archive,cache.get(identity(pin)),
                                                       head_for(bid,pdb),a.max_retries,consumed_attempts.get(key,0),partial_cache[key])
                         cursor=(ix+1)%len(batches); dispatched=True; break
@@ -791,27 +853,13 @@ def rolling(a):
             if now-last_retry_report>=15:
                 write(run/'retry_progress.json',retry_status()); last_retry_report=now
         def balance_backlog(next_label, closing=False):
-            # One durable hold per boundary; a supervisor restart keeps the same deadline.
             evidence=run/'retry_balance'
             evidence.mkdir(exist_ok=True)
             balance_path=evidence/(f'{next_label}.json' if not closing else 'closing.json')
-            state=read(balance_path) if balance_path.is_file() else {}
-            if state.get('state')=='DRAINING':
-                require(state['next_partition']==next_label and state['closing']==closing,
-                        'retry_balance_checkpoint_boundary_changed')
-            elif state.get('state')=='DRAIN_TIMEOUT':
-                return 'PAUSED_RETRY_DRAIN_TIMEOUT'
-            elif state.get('state')=='DRAINED':
+            state=drain_checkpoint(balance_path,next_label,closing,retry_status(),high=balance['high'],
+                                   low=balance['low'],cap=a.max_pending)
+            if state is None:
                 return None
-            else:
-                stats=retry_status()
-                total=stats['queued']; actionable=total-stats['exhausted']
-                if not actionable or (not closing and actionable<balance['high'] and total<a.max_pending):
-                    return None
-                target=0 if closing else min(balance['low'],max(0,a.max_pending-stats['exhausted']-1))
-                state={'state':'DRAINING','next_partition':next_label,'closing':closing,'target_actionable':target,
-                       'started_utc':utc_now(),'started_epoch':time.time(),'initial':stats}
-                write(balance_path,state)
             progress('RETRY_BALANCING')
             while not request.is_file():
                 pump()
@@ -842,8 +890,9 @@ def rolling(a):
                 if balance:
                     pause_reason=balance_backlog(part['id'])
                     if pause_reason or request.is_file(): break
-                if sum(map(len,pending.values()))>=a.max_pending:
+                if actionable_count(retry_status())>=a.max_pending:
                     pause_reason='PAUSED_RETRY_BACKLOG'; break
+                disk_guard(a)
                 schedule(pool)
                 label=part['id']; rows=rows_for(part); adopt=bool(legacy and i==0 and
                     (runs/f'{legacy.name}-{label}-phase-001'/'phase_receipt.json').is_file())
@@ -857,6 +906,8 @@ def rolling(a):
                     try:
                         proof=prefetched.result()
                         if proof: write(run/'preflight'/f'{label}.stream.json',proof)
+                    except DiskReserve:
+                        raise
                     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as exc:
                         print(f'{label} prefetch failed; foreground will resume: {exc}',flush=True)
                     prefetched=None
@@ -908,7 +959,14 @@ def rolling(a):
         if pause_reason:
             if not request.is_file(): collect(force=True)
             write(run/'retry_progress.json',retry_status())
-            progress(pause_reason); return
+            if terminal and pause_reason=='PAUSED_OBSERVATION_LIMIT':
+                from verify_m3_terminal import accept_terminal
+                disk_guard(a)
+                progress('VERIFYING_TERMINAL')
+                accept_terminal(root,run,terminal,a.stop_after_partition,a.max_retries)
+                progress('STAGED_COMPLETE')
+                return 'STAGED_COMPLETE'
+            progress(pause_reason); return pause_reason
         write(run/'retry_progress.json',retry_status())
         exclusions=sum(plan['exclusions'].values())
         require(done+sum(map(len,pending.values()))+exclusions==plan['denominator'],'rolling_final_denominator_differs')
@@ -946,6 +1004,7 @@ def main():
     limit.add_argument('--max-main-batches',type=int)
     limit.add_argument('--stop-after-partition',type=int,help='Absolute plan ordinal; safe across automatic restarts')
     limit.add_argument('--retry-only',action='store_true',help='Drain existing technical keys without opening a main partition')
+    p.add_argument('--terminal-plan-sha256',help='Require independent all-partition terminal acceptance')
     p.add_argument('--resume-paused',action='store_true')
     p.add_argument('--plan-only',action='store_true')
     a=p.parse_args()
@@ -955,9 +1014,17 @@ def main():
         (a.source_feed and not a.stop_after_partition) or
         (a.feed_reserve is not None and (not a.source_feed or a.feed_reserve<1)) or
         (a.max_main_batches is not None and a.max_main_batches<1) or
-        (a.stop_after_partition is not None and a.stop_after_partition<1)):
+        (a.stop_after_partition is not None and a.stop_after_partition<1) or
+        (a.terminal_plan_sha256 and not re.fullmatch(r'[a-f0-9]{64}',a.terminal_plan_sha256))):
         p.error('invalid scheduling limits')
-    try: rolling(a)
+    try:
+        state=rolling(a)
+        if state in {'PAUSED_RETRY_DRAIN_TIMEOUT','PAUSED_SOURCE_FAILURE','PAUSED_RETRY_BACKLOG'}:
+            raise SystemExit(TEMPORARY_INTERRUPTION)
+    except DiskReserve as exc:
+        # No speculative writer remains after the controller's pools unwind.
+        write(a.run/'protective_stop.json',{'status':'PAUSED_DISK_RESERVE','updated_utc':utc_now()})
+        print(str(exc),file=sys.stderr,flush=True); raise SystemExit(DISK_RESERVE_EXIT) from exc
     except InterruptedStage as exc:
         print(str(exc),file=sys.stderr,flush=True); raise SystemExit(TEMPORARY_INTERRUPTION) from exc
 
