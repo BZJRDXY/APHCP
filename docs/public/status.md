@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `af387eb79ec9573ede8d3b766ced0c07d25d29820da3a859e313c0635d50b411`
+Public runtime fingerprint (SHA-256): `0b4c2ac073626ac8905bad3fa3196d7c462e0266832ef9f4083d3573b8984f3d`
 
 ## M1 · Metadata inventory
 
