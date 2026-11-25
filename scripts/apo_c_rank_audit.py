@@ -78,8 +78,8 @@ def freeze(run):
                       'union_entries': sum(len(x['top10_union']) for x in cases)}), flush=True)
 
 
-def replay(run, reference):
-    output = run / 'rank_comparison' / 'known_reference_replay.json'
+def replay(run, reference, output_name):
+    output = run / 'rank_comparison' / output_name
     if output.exists():
         raise FileExistsError('reference ranking replay already exists')
     frozen_path = run / 'rank_comparison' / 'frozen_candidates.json'
@@ -89,7 +89,13 @@ def replay(run, reference):
         ranks[case['holo']] = {source: {v['pdb']: v['entry_rank'] for v in values}
                                for source, values in case['top10_rankings'].items()}
     groups = ['experimental_unbound_supported_pair_scope_pending', 'unbound_evidence_pending',
-              'other_ligand_occupied', 'wrong_domain', 'different_species_homolog']
+              'other_ligand_occupied', 'wrong_domain', 'different_species_homolog',
+              'target_ligand_occupied_observed_scope', 'component_role_or_scope_pending',
+              'identity_or_experiment_conflict_pending', 'site_observation_pending']
+    unknown_statuses = {r['status'] for r in refs['references']} - set(groups)
+    keys = [(r['holo'], r['candidate']) for r in refs['references']]
+    if unknown_statuses or len(keys) != len(set(keys)) or any(h not in ranks for h, _ in keys):
+        raise ValueError(f'invalid or duplicate reference labels: {sorted(unknown_statuses)}')
     summaries = []
     for k in [1, 3, 10]:
         by_source = {}
@@ -104,19 +110,32 @@ def replay(run, reference):
         r = set(by_source['RCSB']['known_reference_hits'][groups[0]])
         pl = set(by_source['PLINDER']['known_reference_hits'][groups[0]])
         ah = set(by_source['AHoJ']['known_reference_hits'][groups[0]])
+        pending_groups = ['unbound_evidence_pending', 'component_role_or_scope_pending',
+                          'identity_or_experiment_conflict_pending', 'site_observation_pending']
+        pending = {source: {item for group in pending_groups
+                            for item in by_source[source]['known_reference_hits'][group]}
+                   for source in by_source}
         summaries.append({'top_k': k, 'sources': by_source,
                           'PLINDER_unbound_refs_beyond_RCSB': sorted(pl - r),
-                          'AHoJ_unbound_refs_beyond_RCSB_and_PLINDER': sorted(ah - r - pl)})
+                          'AHoJ_unbound_refs_beyond_RCSB_and_PLINDER': sorted(ah - r - pl),
+                          'PLINDER_pending_beyond_RCSB': sorted(pending['PLINDER'] - pending['RCSB']),
+                          'AHoJ_pending_beyond_RCSB_and_PLINDER': sorted(
+                              pending['AHoJ'] - pending['RCSB'] - pending['PLINDER'])})
     out = {'created_utc': now(), 'frozen_candidates': str(frozen_path), 'frozen_sha256': sha(frozen_path),
            'reference_file': str(reference), 'reference_sha256': sha(reference),
+           'code_sha256': sha(Path(__file__)),
            'reference_count': len(refs['references']), 'reference_method': refs['method'],
            'denominator_unbound_supported': sum(r['status'] == groups[0] for r in refs['references']),
            'summaries': summaries,
            'limits': ['Reference cases were known before the comparison and were not independently blinded.',
                       'Entry-level ranking is a screening proxy; specific chain/Assembly observations require separate checks.',
-                      'Most candidate Entries remain unadjudicated; no population accuracy or complete recall is estimated.',
+                      'Unadjudicated-entry counts mean no provisional label, not completed independent or formal adjudication.',
+                      'Only the frozen Top-10 union has provisional labels; Entries outside it remain unadjudicated, so no population accuracy or complete recall is estimated.',
                       'Experimental unbound support does not by itself establish a formally accepted APHCP Pair.']}
     write_json(output, out)
+    code = run / 'code' / f'{Path(__file__).stem}-{sha(Path(__file__))[:12]}.py'
+    if not code.exists():
+        shutil.copy2(Path(__file__), code)
     print(json.dumps({'path': str(output), 'references': len(refs['references']),
                       'unbound_denominator': out['denominator_unbound_supported']}), flush=True)
 
@@ -126,6 +145,7 @@ def main():
     p.add_argument('stage', choices=['freeze', 'replay'])
     p.add_argument('--run', required=True)
     p.add_argument('--reference-file')
+    p.add_argument('--output-name', default='known_reference_replay.json')
     args = p.parse_args()
     run = Path(args.run)
     if args.stage == 'freeze':
@@ -136,7 +156,9 @@ def main():
         ref = Path(args.reference_file)
         if not ref.resolve().is_relative_to(run.resolve()):
             raise ValueError('reference file must be in the research Run')
-        replay(run, ref)
+        if Path(args.output_name).name != args.output_name:
+            raise ValueError('output name must be a simple filename')
+        replay(run, ref, args.output_name)
 
 
 if __name__ == '__main__':

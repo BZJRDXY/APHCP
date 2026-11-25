@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import json
 from unittest.mock import patch
 
 import gemmi
@@ -11,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from apo_c_triplet_regression import (atom_alt_compatibility, ccd_heavy_atoms,
                                       connections_for_target, unobserved_records)
 from apo_c_chain_equivalence import validate_assignment
-from apo_c_rank_audit import unique_entry_ranking
+from apo_c_rank_audit import replay, unique_entry_ranking
 from apo_c_holdout_prepare import source_metadata
 
 
@@ -108,6 +109,18 @@ primary 12345 10.1234/example
             result = source_metadata(path, {'A'})
         self.assertEqual(result['accessions'], ['P23919'])
         self.assertEqual(len(result['sequence_sha256']), 1)
+
+    def test_ranking_replay_rejects_unknown_reference_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            comparison = run / 'rank_comparison'
+            comparison.mkdir()
+            frozen = {'cases': [{'holo': '1AKE', 'top10_rankings': {'RCSB': [], 'PLINDER': [], 'AHoJ': []}}]}
+            (comparison / 'frozen_candidates.json').write_text(json.dumps(frozen), encoding='utf8')
+            ref = comparison / 'refs.json'
+            ref.write_text(json.dumps({'references': [{'holo': '1AKE', 'candidate': '4AKE', 'status': 'typo'}]}), encoding='utf8')
+            with self.assertRaises(ValueError):
+                replay(run, ref, 'output.json')
 
 
 if __name__ == '__main__':
