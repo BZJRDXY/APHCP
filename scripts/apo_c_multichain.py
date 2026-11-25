@@ -179,6 +179,8 @@ def inspect(case, candidate, candidate_assembly, anchor_auth, simulate_missing, 
     hread = gemmi.read_structure(str(out / 'holo_system.cif'))
     if not hread or not hread[0].count_atom_sites():
         raise ValueError('Holo output did not read back')
+    site_complete = bool(site) and all(r.get('candidate_has_CA') and r.get('candidate_ccd') == r['holo_ccd']
+                                       and not r.get('candidate_missing_holo_heavy_atom_names') for r in site)
     return structure_evidence | {
         'outcome': 'MULTICHAIN_MAPPED_PROVISIONAL',
         'best_assignment': [{'holo_instance': h, 'candidate_instance': c,
@@ -188,6 +190,8 @@ def inspect(case, candidate, candidate_assembly, anchor_auth, simulate_missing, 
         'symmetry_or_copy_ambiguity': len(equivalent) > 1, 'global_ca_count': best['matched_ca'],
         'global_ca_rmsd_A': round(best['rmsd'], 4), 'pocket_ca_count': len(px),
         'local_pocket_ca_rmsd_A': round(local_rmsd, 4), 'site_residues': site,
+        'site_observation_status': ('COMPLETE_RELATIVE_TO_HOLO_OBSERVED_HEAVY_ATOMS' if site_complete
+                                    else 'INSUFFICIENT_OR_UNMAPPED'),
         'nonselected_components_near_global_or_local_template': nearby,
         'candidate_assembly_qc': assembly_qc, 'holo_system_sha256': sha(out / 'holo_system.cif'),
         'limitations': ['The chosen homologous chain copies are a structural mapping hypothesis, not formal Pair acceptance.',

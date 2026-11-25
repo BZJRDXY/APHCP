@@ -321,6 +321,7 @@ def inspect_pair(case, cand_pdb, cand_auth, assembly_id, run, result_dir, candid
                 'target_residue_instances': targets, 'target_heavy_atoms': len(lig_atoms),
                 'site_definition': 'Holo receptor residues with a positive-occupancy heavy atom within 4.0 A of observed target',
                 'site_residues': residues, 'geometric_screen': 'SITE_OBSERVATION_OR_MAPPING_INSUFFICIENT',
+                'site_observation_status': 'INSUFFICIENT_OR_UNMAPPED',
                 'reason': 'Fewer than three mapped pocket CA atoms; local alignment and occupancy are not determined.',
                 'alignment_ca_count': len(x), 'global_ca_rmsd_A': round(global_rmsd, 4),
                 'pocket_ca_count': len(pocket_holo), 'candidate_assembly_qc': assembly_qc, 'holo_system_qc': holo_qc,
@@ -395,6 +396,8 @@ def inspect_pair(case, cand_pdb, cand_auth, assembly_id, run, result_dir, candid
             'candidate_receptor_atoms_within_2A_of_transformed_holo_target': receptor_template_clashes,
             'candidate_receptor_atoms_within_2A_of_local_probe': local_receptor_clashes,
             'geometric_screen': state, 'pocket_all_holo_observed_heavy_atoms_present': complete,
+            'site_observation_status': ('COMPLETE_RELATIVE_TO_HOLO_OBSERVED_HEAVY_ATOMS' if complete
+                                        else 'INSUFFICIENT_OR_UNMAPPED'),
             'alignment_ca_count': len(x), 'global_ca_rmsd_A': round(global_rmsd, 4),
             'pocket_ca_rmsd_after_global_alignment_A': round(rmsd(np.array(pocket_x), np.array(pocket_y)), 4)
                 if pocket_x else None,
