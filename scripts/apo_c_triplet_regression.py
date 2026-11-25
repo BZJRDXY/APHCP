@@ -138,6 +138,8 @@ def unobserved_records(block, category, label, model):
             seq = int(row['label_seq_id'])
         except (KeyError, TypeError, ValueError):
             continue
+        flag = str(row.get('occupancy_flag'))
+        row['deposited_observation_status'] = {'0': 'ZERO_OCCUPANCY', '1': 'UNOBSERVED'}.get(flag, 'UNSPECIFIED')
         out.setdefault(seq, []).append(row)
     return out
 

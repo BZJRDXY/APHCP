@@ -49,11 +49,16 @@ loop_
 _pdbx_unobs_or_zero_occ_residues.PDB_model_num
 _pdbx_unobs_or_zero_occ_residues.label_asym_id
 _pdbx_unobs_or_zero_occ_residues.label_seq_id
-1 A 190
-2 A 191
-1 B 192
+_pdbx_unobs_or_zero_occ_residues.occupancy_flag
+1 A 190 1
+2 A 191 1
+1 B 192 0
+1 A 193 0
 ''').sole_block()
-        self.assertEqual(set(unobserved_records(block, '_pdbx_unobs_or_zero_occ_residues.', 'A', 1)), {190})
+        result = unobserved_records(block, '_pdbx_unobs_or_zero_occ_residues.', 'A', 1)
+        self.assertEqual(set(result), {190, 193})
+        self.assertEqual(result[190][0]['deposited_observation_status'], 'UNOBSERVED')
+        self.assertEqual(result[193][0]['deposited_observation_status'], 'ZERO_OCCUPANCY')
 
     def test_equal_nonblank_altlocs_are_not_assumed_correlated(self):
         self.assertEqual(atom_alt_compatibility({'altloc': 'A'}, {'altloc': 'A'}),

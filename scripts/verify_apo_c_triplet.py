@@ -170,6 +170,10 @@ def main():
     absent = {str(unobs['auth_seq_id'][i]) for i in range(len(unobs.get('id', [])))
               if unobs['auth_asym_id'][i] == 'A' and str(unobs['PDB_model_num'][i]) == '1'}
     checks['1I44_unobserved_1167_to_1170'] = {'1167', '1168', '1169', '1170'} <= absent
+    missing_loop = [row for row in partial['mapped_site'] if row['holo_author_seq'] in {'1167', '1168', '1169', '1170'}]
+    checks['1I44_missing_loop_flag_is_unobserved'] = len(missing_loop) == 4 and all(
+        any(x.get('occupancy_flag') == '1' and x.get('deposited_observation_status') == 'UNOBSERVED'
+            for x in row.get('candidate_deposited_unobserved_residue_records', [])) for row in missing_loop)
     acp = [x for x in atom_rows(c) if x['label_comp_id'] == 'ACP' and x['auth_asym_id'] == 'A']
     checks['1I44_ACP_contacts_composite_site'] = near(min_dist(acp, candidate_site(c, whole)), 2.6607)
     full_holo = gemmi.cif.read(whole['derivatives']['holo_system.cif']['path']).sole_block()
@@ -243,6 +247,11 @@ def main():
         proof['nearby_component_identity_and_distance_equivalent'] and
         all(a['pocket_ca_count'] == 16 and len(a['site_residues']) == 20 for a in multi['assignments']))
     checks['1RAV_symmetry_is_involution'] = np.allclose(mat @ mat, np.eye(3), atol=1e-7) and np.allclose(mat @ vec + vec, 0, atol=1e-7)
+    missing = [row for row in multi['assignments'][0]['site_residues']
+               if row['holo_author_seq'] in {'37', '38', '39', '40'} and not row.get('candidate_has_CA')]
+    checks['1RAV_four_site_residues_are_zero_occupancy'] = len(missing) == 4 and all(
+        any(x.get('occupancy_flag') == '0' and x.get('deposited_observation_status') == 'ZERO_OCCUPANCY'
+            for x in row.get('candidate_deposited_unobserved_residue_records', [])) for row in missing)
     for key in checks:
         checks[key] = bool(checks[key])
     result['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())

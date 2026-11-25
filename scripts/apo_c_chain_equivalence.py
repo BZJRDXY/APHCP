@@ -18,7 +18,8 @@ import apo_c_triplet_regression
 import holo_source_mapping
 from apo_c_pair import align_coordinates, ca, get_sequence, revision, sequence_map
 from apo_c_pilot import now, read_json, sha, write_json
-from apo_c_triplet_regression import component_contacts, positive_heavy, residue_index, target_members
+from apo_c_triplet_regression import (component_contacts, positive_heavy, residue_index, target_members,
+                                      unobserved_records)
 from holo_source_mapping import assembly_instances
 
 
@@ -47,7 +48,7 @@ def atom_map(rows, operator):
     return result
 
 
-def assignment_evidence(assignment, hs, cs, hi, ci, ligand):
+def assignment_evidence(assignment, hs, cs, candidate_block, hi, ci, ligand):
     holo_points, candidate_points, pocket_holo, pocket_candidate = [], [], [], []
     site_rows, site_atoms, keyed_site = [], [], {}
     ligand_tree = cKDTree(ligand)
@@ -55,6 +56,7 @@ def assignment_evidence(assignment, hs, cs, hi, ci, ligand):
         hop, hlabel, hrows = hi[hkey]
         cop, clabel, crows = ci[ckey]
         hres, cres = residue_index(hrows), residue_index(crows)
+        unobserved = unobserved_records(candidate_block, '_pdbx_unobs_or_zero_occ_residues.', clabel, cs[0].num)
         mapping, seq = sequence_map(get_sequence(hs, hrows), get_sequence(cs, crows))
         for hn, cn in mapping.items():
             if hn not in hres or cn not in cres:
@@ -69,7 +71,8 @@ def assignment_evidence(assignment, hs, cs, hi, ci, ligand):
                 continue
             cn = mapping.get(hn)
             row = {'holo_instance': hkey, 'holo_label_seq': hn, 'holo_author_seq': str(hr.seqid),
-                   'holo_component': hr.name, 'candidate_instance': ckey, 'candidate_label_seq': cn}
+                   'holo_component': hr.name, 'candidate_instance': ckey, 'candidate_label_seq': cn,
+                   'candidate_deposited_unobserved_residue_records': unobserved.get(cn, [])}
             if cn in cres:
                 cauth, cr = cres[cn]
                 catoms = positive_heavy(cr, cop)
@@ -206,13 +209,15 @@ def main():
         hi = assembly_instances(hs, str(entry['sample']['identity']['assembly']), hs[0], include_water=True)
         ci = assembly_instances(cs, old['request']['assembly'], cs[0], include_water=True)
         members, ligand = target_members(hb, hi, entry['sample']['identity'])
-        a = assignment_evidence(assignments[0], hs, cs, hi, ci, ligand)
-        b = assignment_evidence(assignments[1], hs, cs, hi, ci, ligand)
+        a = assignment_evidence(assignments[0], hs, cs, cb, hi, ci, ligand)
+        b = assignment_evidence(assignments[1], hs, cs, cb, hi, ci, ligand)
         proof = symmetry_proof(ci, assignments[0], assignments[1], a, b)
         site_a = [(x['holo_instance'], x['holo_label_seq'], x['candidate_label_seq'], x.get('candidate_has_CA'),
-                   x.get('missing_relative_holo_heavy_atoms')) for x in a['site_residues']]
+                   x.get('missing_relative_holo_heavy_atoms'), x.get('candidate_deposited_unobserved_residue_records'))
+                  for x in a['site_residues']]
         site_b = [(x['holo_instance'], x['holo_label_seq'], x['candidate_label_seq'], x.get('candidate_has_CA'),
-                   x.get('missing_relative_holo_heavy_atoms')) for x in b['site_residues']]
+                   x.get('missing_relative_holo_heavy_atoms'), x.get('candidate_deposited_unobserved_residue_records'))
+                  for x in b['site_residues']]
         proof['residue_mapping_and_missing_atom_evidence_equal'] = site_a == site_b
         passed = (proof['symmetry_squared_rotation_error'] < 1e-6 and
                   proof['symmetry_squared_translation_error_A'] < 1e-6 and
