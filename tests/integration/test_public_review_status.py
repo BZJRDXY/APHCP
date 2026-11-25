@@ -170,5 +170,37 @@ class PublicReviewStatusTest(unittest.TestCase):
             render(self.root, self.runtime)
 
 
+    def test_batch_200_requires_verified_stop_and_separates_the_two_denominators(self):
+        checks = dict(accepted=True, same_input_replay=True, provenance_and_foreign_keys_ok=True)
+        gate = dict(checks, window_start=101, sealed=105, plan_entries_this_window=9,
+                    retry={'exhausted': 1}, entries_per_hour=90, next_source_feed=None,
+                    observed_recent_primary_interval_baseline_entries_per_hour=95)
+        progress = dict(active_partition=None, partitions_completed=200, new_settled_entries=70,
+                        unattempted_entries=24, attempted_pending_count=6, m1_entries=120,
+                        exclusions={'HISTORICAL_SAME_REVISION': 5, 'OUT_OF_SCOPE': 15})
+        retry = dict(queued=6, exhausted=6, running=0, retryable_not_ready=0,
+                     verified_waiting_for_catalog=0)
+        final = dict(checks, window_start=106, sealed=200, plan_entries_this_window=31,
+                     verified_utc='2026-01-04T01:00:00Z', progress=progress, retry=retry,
+                     queryable=130, confirmed=14, published=0, entries_per_hour=105,
+                     head='PRIVATE_BATCH_200_CATALOG')
+        data = dict(stage_final=final, gate=gate, execution_commit='a' * 40,
+                    frozen_101_200=40, rolling_entries=100, no_batch_201=True,
+                    writer_locks_free=True, watcher={'state': 'FINISHED'},
+                    supervisor={'state': 'NORMAL_EXIT'})
+        self.write(self.root / SOURCES, self.sources | {'m3_through200': 'through200.json'})
+        self.put('through200.json', {'data': data})
+        page = render(self.root, self.runtime)
+        self.assertIn('**35/40** frozen PDB entries settled', page)
+        self.assertIn('**70/100** settled, **6** exhausted, **24** not yet attempted', page)
+        self.assertNotIn('PRIVATE_BATCH_200_CATALOG', page)
+        for change in ({'no_batch_201': False},
+                       {'stage_final': final | {'same_input_replay': False}},
+                       {'stage_final': final | {'retry': retry | {'verified_waiting_for_catalog': 1}}}):
+            self.put('through200.json', {'data': data | change})
+            with self.assertRaisesRegex(ValueError, 'Invalid batch-200 closure'):
+                render(self.root, self.runtime)
+
+
 if __name__ == '__main__':
     unittest.main()

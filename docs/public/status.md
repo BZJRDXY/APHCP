@@ -89,6 +89,13 @@ Public runtime fingerprint (SHA-256): `7f2f5321ada5d78dde8f64f7e7b9a5c862da0f890
 - A targeted recheck reused frozen files and resolved **1** technical entry exception. **2** additional systems are retrievable with structural evidence; their scientific disposition is still REVIEW. No new coordinates were downloaded for this recheck.
 - Batch **101** was observed in progress at **2026-11-24T11:53:30+00:00**, with an internal gate at **105** and an absolute stop at **200** for **51,003** approved entries. Execution code: `29691cdfadd5576639f52652692682fe77a38cdb`. Neither the gate nor completion is attested by this launch snapshot. No dataset release was created.
 
+## M3 · Batches 101–200 accepted and stopped
+
+- Final acceptance: **2026-11-25T03:22:55+00:00**. Batch **200** sealed and production stopped as planned. No batch 201 dispatch or actionable retry backlog. File retrieval, provenance, foreign keys and same-input replay were verified.
+- Batches 101–200: **50,995/51,003** frozen PDB entries settled; **8** exhausted technical retries. Rolling total: **104,169/233,639** settled, **12** exhausted, **129,458** not yet attempted. The larger M1 inventory also includes excluded and already processed same-revision entries.
+- The unpublished catalog has **681,283** retrievable systems, including **22,143** confirmed in staging. PDB entries and systems use different denominators. Formal releases: **0**.
+- Net throughput including retries and catalog merges: **2,588.29 entries/hour** in batches 101–105 with the backup feed; **3,340.21 entries/hour** in batches 106–200 after switching to the server-only feed. Execution code: `29691cdfadd5576639f52652692682fe77a38cdb`.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.

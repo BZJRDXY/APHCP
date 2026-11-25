@@ -326,6 +326,48 @@ def through100_section(root, source):
 '''
 
 
+def through200_section(root, source):
+    receipt_data, _ = receipt(root, source)
+    data = receipt_data['data']
+    final, gate = data['stage_final'], data['gate']
+    progress, retry = final['progress'], final['retry']
+    commit = data['execution_commit']
+    frozen = count(data['frozen_101_200'])
+    rolling = count(data['rolling_entries'])
+    settled = count(progress['new_settled_entries'])
+    unattempted = count(progress['unattempted_entries'])
+    exhausted = count(retry['exhausted'])
+    window_exhausted = exhausted - count(gate['retry']['exhausted'])
+    queryable, confirmed = count(final['queryable']), count(final['confirmed'])
+    require(
+        all(stage[k] is True for stage in (gate, final)
+            for k in ('accepted', 'same_input_replay', 'provenance_and_foreign_keys_ok'))
+        and (gate['window_start'], gate['sealed'], final['window_start'], final['sealed']) == (101, 105, 106, 200)
+        and progress['partitions_completed'] == 200 and progress['active_partition'] is None
+        and data['no_batch_201'] is True and data['writer_locks_free'] is True
+        and data['watcher']['state'] == 'FINISHED' and data['supervisor']['state'] == 'NORMAL_EXIT'
+        and all(count(retry[key]) == 0 for key in ('running', 'retryable_not_ready', 'verified_waiting_for_catalog'))
+        and exhausted == count(retry['queued']) == count(progress['attempted_pending_count'])
+        and rolling == settled + unattempted + exhausted
+        and count(progress['m1_entries']) == rolling + sum(count(v) for v in progress['exclusions'].values())
+        and frozen == sum(count(stage['plan_entries_this_window']) for stage in (gate, final))
+        and 0 <= window_exhausted < frozen and 0 < confirmed <= queryable
+        and count(final['published']) == 0 and re.fullmatch(r'[0-9a-f]{40}', commit),
+        'Invalid batch-200 closure, replay, or accounting evidence',
+    )
+    gate_rate, final_rate = (stage['entries_per_hour'] for stage in (gate, final))
+    require(0 < gate_rate < gate['observed_recent_primary_interval_baseline_entries_per_hour']
+            and final_rate > 0 and gate['next_source_feed'] is None, 'Invalid batch-200 throughput evidence')
+    return f'''## M3 · Batches 101–200 accepted and stopped
+
+- Final acceptance: **{utc(final['verified_utc'])}**. Batch **200** sealed and production stopped as planned. No batch 201 dispatch or actionable retry backlog. File retrieval, provenance, foreign keys and same-input replay were verified.
+- Batches 101–200: **{frozen - window_exhausted:,}/{frozen:,}** frozen PDB entries settled; **{window_exhausted:,}** exhausted technical retries. Rolling total: **{settled:,}/{rolling:,}** settled, **{exhausted:,}** exhausted, **{unattempted:,}** not yet attempted. The larger M1 inventory also includes excluded and already processed same-revision entries.
+- The unpublished catalog has **{queryable:,}** retrievable systems, including **{confirmed:,}** confirmed in staging. PDB entries and systems use different denominators. Formal releases: **0**.
+- Net throughput including retries and catalog merges: **{gate_rate:,.2f} entries/hour** in batches 101–105 with the backup feed; **{final_rate:,.2f} entries/hour** in batches 106–200 after switching to the server-only feed. Execution code: `{commit}`.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -397,6 +439,7 @@ def render(root: Path, current_runtime: str):
     balanced = balanced_scale_section(root, src['m3_balanced_scale']) if src.get('m3_balanced_scale') else ''
     speed = pipeline_speed_section(root, src['m3_pipeline_speed']) if src.get('m3_pipeline_speed') else ''
     through100 = through100_section(root, src['m3_through100']) if src.get('m3_through100') else ''
+    through200 = through200_section(root, src['m3_through200']) if src.get('m3_through200') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -419,7 +462,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}{through100}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}{through100}{through200}## Open review
 
 {pending}
 
