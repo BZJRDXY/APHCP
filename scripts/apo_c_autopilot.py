@@ -30,7 +30,8 @@ from apo_c_pilot import now, read_json, sha, write_json
 def rankings(search, holo):
     pl = [{'pdb': x['source_entry_id'], 'author_chain': x['source_chain_auth_id'],
            'assembly': x['source_biounit_id'], 'source_rank': x['rank'],
-           'chain_instance': x['source_chain_instance']}
+           'chain_instance': x['source_chain_instance'],
+           'target_match_granularity': x.get('target_match_granularity', 'LEGACY_UNVERIFIED')}
           for x in sorted(search['plinder'].get('links', []), key=lambda z: (z['rank'], z['linked_structure_id']))]
     ah = [{'pdb': x['pdb'], 'author_chain': x['auth_chain'], 'source_rank': x['source_order'],
            'source_target': match['entry']['entry_key'], 'assembly': None}
@@ -173,25 +174,30 @@ def download_bounded(url, max_bytes, deadline_seconds):
     return b''.join(chunks), evidence
 
 
-def fetch_candidate(run, pdb, origins, config):
-    receipt = run / 'fetch' / f'{pdb}.json'
-    if receipt.exists():
-        result = read_json(receipt)
+def fetch_candidate(run, pdb, origins, config, revision=None):
+    key = pdb if revision is None else f"{pdb}.v{revision.replace('.', '-')}"
+    base = run / 'fetch' / f'{key}.json'
+    previous = apo_c_pilot.attempts(base)
+    if previous:
+        result = read_json(previous[-1])
         if result['status'] != 'FETCHED':
-            return None
-        if sha(Path(result['path'])) != result['sha256']:
-            raise ValueError('previously fetched original has changed')
-        return result
-    if len(list((run / 'fetch').glob('*.json'))) >= config['max_candidate_download_attempts']:
+            if not config.get('retry_failed') or result.get('permanent'):
+                return None
+        elif revision is not None and result['revision'] != revision:
+            raise ValueError('previously fetched revision differs from pinned revision')
+        else:
+            if sha(Path(result['path'])) != result['sha256']:
+                raise ValueError('previously fetched original has changed')
+            return result
+    budget = config.setdefault('download_session', set())
+    if key in budget or len(budget) >= config['max_candidate_download_attempts']:
         return None
+    budget.add(key)
+    receipt = apo_c_pilot.next_attempt(base)
     try:
-        index = Path(read_json(run / 'run.json')['index'])
-        source_rows = pq.read_table(index / 'entry_sources.parquet',
-                                    filters=[('entry_pdb_id', '=', pdb.lower())]).to_pylist() if 'PLINDER' in origins else []
-        if source_rows:
-            row = source_rows[0]
-            major, minor = int(row['source_mmcif_major_revision']), int(row['source_mmcif_minor_revision'])
-            basis = 'PLINDER 2026-09 entry_sources'
+        if revision:
+            major, minor = map(int, revision.split('.'))
+            basis = 'PLINDER 2026-09 entry_sources' if 'PLINDER' in origins else 'pinned comparison revision'
         else:
             metadata, info = apo_c_pilot.cache_get(run, f'rcsb_entry/{pdb.lower()}',
                                                    f'https://data.rcsb.org/rest/v1/core/entry/{pdb}')
@@ -202,7 +208,10 @@ def fetch_candidate(run, pdb, origins, config):
         url = (f'https://files-versioned.rcsb.org/pdb_versioned/data/entries/{ident[1:3]}/'
                f'pdb_0000{ident}/pdb_0000{ident}_xyz_v{major}-{minor}.cif.gz')
         body, request = download_bounded(url, config['max_compressed_bytes'], config['download_deadline_seconds'])
-        gzip.decompress(body)
+        block = gemmi.cif.read_string(gzip.decompress(body).decode('utf8')).sole_block()
+        observed, first_date = apo_c_pair.revision(block, pdb)
+        if observed != rev:
+            raise ValueError('fixed candidate revision differs from selected revision')
         path = run / 'raw' / f'{ident}-v{rev}.cif.gz'
         path.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(body).hexdigest()
@@ -210,80 +219,70 @@ def fetch_candidate(run, pdb, origins, config):
             raise ValueError('cached candidate original differs from download')
         if not path.exists():
             path.write_bytes(body)
-        observed, first_date = apo_c_pair.revision(gemmi.cif.read(str(path)).sole_block(), pdb)
-        if observed != rev:
-            raise ValueError('fixed candidate revision differs from selected revision')
         result = {'status': 'FETCHED', 'path': str(path), 'sha256': sha(path), 'bytes': path.stat().st_size,
                   'revision': rev, 'first_public_model_date': first_date, 'request': request, 'version_basis': basis}
-        if not source_rows:
+        if not revision:
             result['metadata_request'] = info
-        manifest = run / 'rank_comparison' / 'supplemental_raw' / f'{pdb}.json'
-        write_json(manifest, result)
         write_json(receipt, result)
         return result
     except DownloadBudgetExceeded as exc:
-        write_json(receipt, {'status': 'FETCH_BUDGET_EXCEEDED', 'pdb': pdb, 'reason': str(exc), 'request': exc.evidence})
+        write_json(receipt, {'status': 'FETCH_BUDGET_EXCEEDED', 'pdb': pdb, 'reason': str(exc), 'request': exc.evidence,
+                             'permanent': 'size' in str(exc)})
         return None
     except Exception as exc:
         write_json(receipt, {'status': 'FETCH_FAILED', 'pdb': pdb, 'error': f'{type(exc).__name__}: {exc}'})
         return None
 
 
+def required_revision(pdb, origins, config):
+    pinned = config.get('pinned_candidate_revisions', {}).get(pdb)
+    versions = pq.read_table(Path(config['index']) / 'entry_sources.parquet',
+                             filters=[('entry_pdb_id', '=', pdb.lower())]).to_pylist() if 'PLINDER' in origins else []
+    values = {f"{v['source_mmcif_major_revision']}.{v['source_mmcif_minor_revision']}" for v in versions}
+    if len(values) > 1 or (pinned and values and values != {pinned}):
+        raise ValueError(f'conflicting required revisions for {pdb}: {values} vs {pinned}')
+    return pinned or next(iter(values), None)
+
+
+def saved_original(run, pdb, wanted):
+    manifest = run / 'rank_comparison' / 'supplemental_raw' / f'{pdb}.json'
+    receipt = run / 'fetch' / f'{pdb}.json'
+    version_receipts = sorted(receipt.parent.glob(f'{pdb}.v*.json'))
+    for path in [manifest, *reversed(apo_c_pilot.attempts(receipt)), *reversed(version_receipts)]:
+        if not path.is_file():
+            continue
+        row = read_json(path)
+        if (row.get('status') in (None, 'FETCHED') and row.get('path')
+                and (wanted is None or row['revision'] == wanted)):
+            source = Path(row['path'])
+            if not source.is_file() or sha(source) != row['sha256']:
+                raise ValueError(f'fixed original unavailable or changed: {path}')
+            return (str(source), row['sha256'], source.stat().st_size, row['revision']), str(path)
+    return None, None
+
+
 def inspect_candidate(run, case, prepared, pdb, origins, config):
     block, structure, sequence, site, accessions = prepared
+    wanted = required_revision(pdb, origins, config)
     with apo_c_pilot.open_catalog(Path(read_json(run / 'run.json')['catalog'])) as db:
-        source = apo_c_union_triage.existing_original(db, pdb)
-        manifest = run / 'rank_comparison' / 'supplemental_raw' / f'{pdb}.json'
-        if source is None and manifest.exists():
-            saved = read_json(manifest)
-            if sha(Path(saved['path'])) != saved['sha256']:
-                raise ValueError('cached candidate source hash changed')
-            source = (saved['path'], saved['sha256'], saved['bytes'], saved['revision'])
+        source = apo_c_union_triage.existing_original(db, pdb, wanted)
+        source_origin, source_receipt = 'sealed_catalog_asset_file', None
         if source is None:
-            for previous in config['reuse_runs']:
-                candidates = [Path(previous) / 'rank_comparison' / 'supplemental_raw' / f'{pdb}.json',
-                              Path(previous) / 'fetch' / f'{pdb}.json']
-                for prior in candidates:
-                    if not prior.is_file():
-                        continue
-                    saved = read_json(prior)
-                    if saved.get('status') not in (None, 'FETCHED') or not saved.get('path'):
-                        continue
-                    original = Path(saved['path'])
-                    if not original.is_file() or sha(original) != saved['sha256']:
-                        raise ValueError(f'prior fixed candidate source is unavailable or changed: {prior}')
-                    observed, _ = apo_c_pair.revision(gemmi.cif.read(str(original)).sole_block(), pdb)
-                    if observed != saved['revision']:
-                        raise ValueError('prior candidate source revision differs')
-                    if 'PLINDER' in origins:
-                        versions = pq.read_table(Path(config['index']) / 'entry_sources.parquet',
-                                                 filters=[('entry_pdb_id', '=', pdb.lower())]).to_pylist()
-                        if versions:
-                            wanted = f"{versions[0]['source_mmcif_major_revision']}.{versions[0]['source_mmcif_minor_revision']}"
-                            if wanted != observed:
-                                continue
-                    reused = {'path': str(original), 'sha256': saved['sha256'], 'bytes': original.stat().st_size,
-                              'revision': observed, 'reused_from': str(prior)}
-                    write_json(manifest, reused)
-                    source = (reused['path'], reused['sha256'], reused['bytes'], reused['revision'])
-                    break
+            for previous in [run, *(Path(x) for x in config['reuse_runs'])]:
+                source, source_receipt = saved_original(previous, pdb, wanted)
                 if source is not None:
+                    source_origin = 'wwpdb_fixed_version_download' if previous == run else 'verified_prior_run'
                     break
         if source is None:
-            fetched = fetch_candidate(run, pdb, origins, config)
+            fetched = fetch_candidate(run, pdb, origins, config, wanted)
+            key = pdb if wanted is None else f"{pdb}.v{wanted.replace('.', '-')}"
+            history = apo_c_pilot.attempts(run / 'fetch' / f'{key}.json')
             if fetched is None:
-                receipt = run / 'fetch' / f'{pdb}.json'
                 return {'status': 'SOURCE_UNAVAILABLE_OR_BUDGET_EXHAUSTED', 'pdb': pdb,
-                        'fetch_receipt': str(receipt) if receipt.exists() else None}
+                        'fetch_receipt': str(history[-1]) if history else None,
+                        'required_revision': wanted}
             source = (fetched['path'], fetched['sha256'], fetched['bytes'], fetched['revision'])
-        if 'PLINDER' in origins:
-            versions = pq.read_table(Path(config['index']) / 'entry_sources.parquet',
-                                     filters=[('entry_pdb_id', '=', pdb.lower())]).to_pylist()
-            if versions:
-                wanted = f"{versions[0]['source_mmcif_major_revision']}.{versions[0]['source_mmcif_minor_revision']}"
-                if source[3] != wanted:
-                    return {'status': 'SOURCE_REVISION_CONFLICT_REQUIRES_REVIEW', 'pdb': pdb,
-                            'stored_revision': source[3], 'plinder_revision': wanted, 'source_path': source[0]}
+            source_origin, source_receipt = 'wwpdb_fixed_version_download', str(history[-1])
         path, _, size, _ = source
         if size > config['max_compressed_bytes']:
             return {'status': 'RESOURCE_LIMIT_REQUIRES_REVIEW', 'pdb': pdb,
@@ -308,7 +307,9 @@ def inspect_candidate(run, case, prepared, pdb, origins, config):
                         rows.append({'entity': pdb + '_' + str(residue.entity_id)})
         result = apo_c_union_triage.candidate_evidence(
             run, case['pdb'], pdb, rows, {'sifts_common_uniprot': accessions},
-            block, structure, sequence, site, db)
+            block, structure, sequence, site, db, fixed_source=source, fixed_origin=source_origin)
+        if 'candidate_source' in result:
+            result['candidate_source'].update(required_revision=wanted, receipt=source_receipt)
     if any(not e.get('common_uniprot') for e in result.get('entities', [])):
         try:
             mappings, info = apo_c_pilot.uniprot_mappings(run, pdb)
@@ -383,6 +384,18 @@ def read_holo_role(catalog, case):
     return {'role': record.get('role'), 'role_evidence': record.get('role_evidence')}
 
 
+def has_technical_gap(evidence):
+    return (evidence['scientific_decision']['status'] == 'TECHNICAL_GAP'
+            or any(o.get('status') == 'TECHNICAL_FAILURE' for e in evidence.get('entities', [])
+                   for o in e.get('assembly_observations', []))
+            or bool(evidence.get('candidate_sifts_error')))
+
+
+def source_hints(origins):
+    return {(name, tuple(row.get(k) for k in ('entity', 'author_chain', 'assembly', 'chain_instance')))
+            for name, route in origins.items() for row in route['source_rows']}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', required=True)
@@ -394,6 +407,8 @@ def main():
     p.add_argument('--reuse-search-run', help='prior Run with the identical Holo search implementation and inputs')
     p.add_argument('--per-source-rank', type=int, default=3)
     p.add_argument('--max-unique-per-holo', type=int, default=6)
+    p.add_argument('--retry-failed', action='store_true',
+                   help='Retry missing search pages, fixed inputs, and technical observations in an existing run')
     args = p.parse_args()
     if not 1 <= args.per_source_rank <= 10 or not 1 <= args.max_unique_per_holo <= 30:
         p.error('invalid candidate inspection budget')
@@ -424,17 +439,22 @@ def main():
         raise ValueError('existing Run does not match the frozen configuration and code')
     if args.reuse_search_run:
         reuse_searches(run, args.reuse_search_run)
-    apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=False))
+    config['retry_failed'] = args.retry_failed
+    apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
     results = []
     for case in read_json(run / 'samples.json'):
         key = case['id'].replace(':', '_')
         outcome = run / 'automated' / key / 'result.json'
-        if outcome.exists():
-            old = read_json(outcome)
-            results.append(old)
-            print('RESULT_REUSE', case['id'], flush=True)
-            continue
-        search_path = apo_c_pilot.case_file(run, case)
+        search_path = apo_c_pilot.attempts(apo_c_pilot.case_file(run, case))[-1]
+        old_results = apo_c_pilot.attempts(outcome)
+        if old_results:
+            old = read_json(old_results[-1])
+            if (old['search_sha256'] == sha(search_path) and
+                    (not args.retry_failed or (old['holo_evidence']['status'] != 'TECHNICAL_FAILURE'
+                      and not any(has_technical_gap(read_json(Path(row['evidence_path']))) for row in old['candidates'])))):
+                results.append(old)
+                print('RESULT_REUSE', case['id'], flush=True)
+                continue
         search = read_json(search_path)
         rank = rankings(search, case['pdb'])
         chosen = select_budget(rank, args.per_source_rank, args.max_unique_per_holo)
@@ -442,7 +462,8 @@ def main():
                   'search_sha256': sha(search_path), 'source_status': {x: search[x]['status']
                          for x in ('plinder', 'sifts_rcsb', 'ahoj')},
                   'rankings_top10': {k: v[:10] for k, v in rank.items()}, 'selected_candidates': chosen,
-                  'candidates': [], 'formal_pair_acceptance': False}
+                  'candidates': [], 'deliveries': [], 'formal_pair_acceptance': False}
+        output_file = apo_c_pilot.next_attempt(outcome)
         try:
             case.update(read_holo_role(args.catalog, case))
             holo, prepared = prepare_holo(case)
@@ -461,17 +482,20 @@ def main():
                 result['holo_system'] = {'path': str(holo_output), 'sha256': sha(holo_output)}
                 for item in chosen:
                     candidate_path = outcome.parent / 'candidates' / f"{item['pdb']}.json"
-                    if candidate_path.exists():
-                        evidence = read_json(candidate_path)
-                        result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
-                                                     'evidence_path': str(candidate_path)})
-                        print('CANDIDATE_REUSE', case['id'], item['pdb'], flush=True)
-                        continue
+                    history = apo_c_pilot.attempts(candidate_path)
+                    if history:
+                        evidence = read_json(history[-1])
+                        if (source_hints(evidence.get('search_origins', {})) == source_hints(item['sources']) and
+                                (not args.retry_failed or not has_technical_gap(evidence))):
+                            result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
+                                                         'evidence_path': str(history[-1])})
+                            print('CANDIDATE_REUSE', case['id'], item['pdb'], flush=True)
+                            continue
+                    candidate_path = apo_c_pilot.next_attempt(candidate_path)
                     print('CANDIDATE_START', case['id'], item['pdb'], flush=True)
                     try:
                         evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config)
                         evidence['scientific_decision'] = apo_c_science.decide_candidate(holo, prepared, evidence)
-                        evidence['search_origins'] = item['sources']
                         selected_assemblies = sorted({o['assembly'] for e in evidence.get('entities', [])
                                 for o in e.get('assembly_observations', [])
                                 if o.get('status') == 'ACTUAL_CONTACTS_MEASURED'})[:config['max_derivative_assemblies_per_candidate']]
@@ -491,15 +515,47 @@ def main():
                                     'error': f'{type(exc).__name__}: {exc}',
                                     'scientific_decision': {'status': 'TECHNICAL_GAP', 'rule': apo_c_science.RULE,
                                                             'reasons': ['CANDIDATE_INSPECTION_FAILED']}}
+                    evidence['search_origins'] = item['sources']
                     write_json(candidate_path, evidence)
                     result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
                                                  'evidence_path': str(candidate_path)})
                     print('CANDIDATE_DONE', case['id'], item['pdb'], evidence['status'], flush=True)
+                for row in result['candidates']:
+                    e = read_json(Path(row['evidence_path']))
+                    if e['scientific_decision']['status'] != 'SUPPORTED_RESEARCH_PAIR':
+                        continue
+                    obs, = [o for ent in e['entities'] for o in ent['assembly_observations']
+                            if o['decision']['status'] == 'SUPPORTED_RESEARCH_PAIR']
+                    assembly, = [i for i in e['materialized_assemblies'] if i['assembly'] == obs['assembly']]
+                    full_holo = derived / 'holo_full_assembly.cif'
+                    if full_holo.exists() and not full_holo.with_suffix('.json').exists():
+                        n = 2
+                        while (derived / f'holo_full_assembly_attempt{n:03d}.cif').exists() and not (
+                               derived / f'holo_full_assembly_attempt{n:03d}.json').exists():
+                            n += 1
+                        full_holo = derived / f'holo_full_assembly_attempt{n:03d}.cif'
+                    if not full_holo.exists():
+                        holo_qc = apo_c_pair.write_assembly(
+                            prepared[1], str(case['identity']['assembly']), full_holo,
+                            required_connections={edge['id'] for edge in holo['target_connections']})
+                        write_json(full_holo.with_suffix('.json'), holo_qc)
+                    holo_qc = read_json(full_holo.with_suffix('.json'))
+                    if sha(full_holo) != holo_qc['sha256'] or sha(Path(assembly['path'])) != assembly['qc']['sha256']:
+                        raise ValueError('delivered assembly differs from readback')
+                    result['deliveries'].append({
+                        'system_id': case['id'], 'candidate': row['pdb'], 'role_evidence': e['scientific_decision']['holo_target_role'],
+                        'holo_identity': holo['identity'], 'holo_original': holo['source'],
+                        'holo_assembly': {'path': str(full_holo), 'qc': holo_qc},
+                        'apo_original': e['candidate_source'], 'apo_assembly': assembly,
+                        'apo_observation': {k: obs[k] for k in ('model', 'instance', 'label_asym', 'author_chain', 'assembly')},
+                        'holo_target_members': holo['target_members'], 'mapped_site': obs['mapped_site'],
+                        'assessment': obs['decision'], 'candidate_evidence': row['evidence_path']})
             else:
                 result['candidate_review'] = 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'
         except Exception as exc:
             result['holo_evidence'] = {'status': 'TECHNICAL_FAILURE', 'error': f'{type(exc).__name__}: {exc}'}
-        write_json(outcome, result)
+            result['deliveries'] = []
+        write_json(output_file, result)
         results.append(result)
         print('RESULT', case['id'], result['holo_evidence']['status'],
               'selected', len(chosen), 'examined', len(result['candidates']), flush=True)
@@ -518,6 +574,8 @@ def main():
                'scientific_rule': apo_c_science.RULE,
                'research_pair_outcomes': dict(Counter(s for values in research.values() for s in values)),
                'holo_with_research_pair': sum('SUPPORTED_RESEARCH_PAIR' in values for values in research.values()),
+               'research_pairs_delivered': sum(len(r.get('deliveries', [])) for r in results),
+               'holo_with_delivered_research_pair': sum(bool(r.get('deliveries')) for r in results),
                'limits': ['Search routes can fail independently.', 'Multi-chain targets remain review.',
                           'An observed no-contact scope is not proof of an unbound experiment.',
                           'No population accuracy, blind assessment or formal acceptance is claimed.']}

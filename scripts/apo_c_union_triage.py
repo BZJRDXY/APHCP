@@ -30,11 +30,12 @@ def accessions(block, entity):
                    and str(cat['entity_id'][i]) == str(entity)})
 
 
-def existing_original(db, pdb):
+def existing_original(db, pdb, required_revision=None):
     rows = db.execute('SELECT a.uri,a.sha256,a.bytes,v.revision FROM asset_file a '
                       'JOIN entry_version v ON a.entry_version_id=v.id '
                       "WHERE v.pdb_id=? AND a.uri LIKE '%/raw/%.cif.gz'", (pdb,)).fetchall()
-    rows = [x for x in rows if x[1] and Path(x[0]).is_file()]
+    rows = [x for x in rows if x[1] and Path(x[0]).is_file() and
+            (required_revision is None or x[3] == required_revision)]
     if not rows:
         return None
     chosen = max(rows, key=lambda x: (tuple(map(int, x[3].split('.'))), x[0]))
@@ -43,9 +44,10 @@ def existing_original(db, pdb):
     return chosen
 
 
-def candidate_evidence(run, holo, pdb, source_rows, q, qblock, qstruct, qseq, qsite, db):
-    source = existing_original(db, pdb)
-    source_origin = 'sealed_catalog_asset_file'
+def candidate_evidence(run, holo, pdb, source_rows, q, qblock, qstruct, qseq, qsite, db,
+                       fixed_source=None, fixed_origin=None):
+    source = fixed_source or existing_original(db, pdb)
+    source_origin = fixed_origin or 'sealed_catalog_asset_file'
     supplemental = run / 'rank_comparison' / 'supplemental_raw' / f'{pdb}.json'
     if not source and supplemental.is_file():
         manifest = read_json(supplemental)

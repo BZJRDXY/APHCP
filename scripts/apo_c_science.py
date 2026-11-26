@@ -11,12 +11,62 @@ from apo_c_triplet_regression import positive_heavy, residue_index
 from holo_source_mapping import assembly_instances, connection_edges
 
 
-RULE = 'single-chain-observed-site-v1'
+RULE = 'single-chain-observed-site-v2'
 STANDARD = set('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL'.split())
 
 
 def text_value(block, tag):
     return gemmi.cif.as_string(block.find_value(tag) or '')
+
+
+def deposited_target_role(holo, block, structure):
+    historic = holo.get('role')
+    if historic == 'PASS':
+        return {'status': 'HISTORICAL_EVIDENCE', 'historic_role': historic,
+                'evidence': holo.get('role_evidence')}
+    members = holo['target_members']
+    if historic != 'REVIEW' or len(members) != 1 or holo['external_covalent_connections']:
+        return {'status': 'UNRESOLVED', 'historic_role': historic}
+    member = members[0]
+    ccd = member['component'].upper()
+    title = text_value(block, '_struct.title')
+    instances = assembly_instances(structure, str(holo['identity']['assembly']), structure[0])
+    actual = [(key, author, str(r.seqid)) for key, (_, _, rows) in instances.items()
+              for author, r in rows if r.name.upper() == ccd and r.entity_type == gemmi.EntityType.NonPolymer]
+    if actual != [(member['instance'], member['author_chain'], member['author_seq'])]:
+        return {'status': 'UNRESOLVED', 'historic_role': historic, 'candidate_target_instances': actual}
+    if (len(member['observed_heavy_atoms']) < 3 or len(holo['site_residues']) < 2
+            or not re.search(r'\b(?:bound|complex(?:ed)?|inhibited)\b', title, re.I)
+            or re.search(r'\b(?:unbound|unliganded|ligand.free|apo|without)\b', title, re.I)):
+        return {'status': 'UNRESOLVED', 'historic_role': historic}
+    # Treat a coordination complex as an explicit target token only if the
+    # fixed deposition connects that metal to this particular ligand instance.
+    linked = {}
+    for edge in holo['target_connections']:
+        flags = edge['target_endpoint_membership']
+        if edge['kind'] != 'metalc' or sum(flags) != 1:
+            continue
+        ligand, metal = (edge['ends'][i] for i in (flags.index(True), flags.index(False)))
+        if ligand['atom'] not in member['observed_heavy_atom_names']:
+            continue
+        metal_id = metal['ccd'].upper()
+        if any(r.subchain == metal['label_asym'] and r.name == metal_id
+               and author == metal['auth_asym']
+               and str(r.seqid.num) == str(metal['auth_seq'])
+               and any(a.element.is_metal and a.occ > 0 and a.name == metal['atom'] for a in r)
+               for _, _, rows in instances.values() for author, r in rows):
+            linked[metal_id + ccd] = edge['id']
+    terms = [ccd, *linked]
+    for row in block.find('_chem_comp.', ['id', 'name']):
+        if gemmi.cif.as_string(row[0]).upper() == ccd:
+            terms.append(gemmi.cif.as_string(row[1]).strip())
+    term = next((t for t in terms if t and re.search(r'(?<!\w)' + re.escape(t) + r'(?!\w)', title, re.I)), None)
+    if not term:
+        return {'status': 'UNRESOLVED', 'historic_role': historic}
+    return {'status': 'FIXED_DEPOSITION_INSTANCE', 'historic_role': historic,
+            'field': '_struct.title', 'text': title, 'matched_term': term,
+            'observed_instance': actual[0], 'coordination_record': linked.get(term),
+            'source_sha256': holo['source_sha256']}
 
 
 def experiment_record(block, holo_members, holo_block):
@@ -159,22 +209,63 @@ def inspect_observation(obs, holo_geometry, structure, block):
             if zero and min(site_tree.query(zero)[0]) <= 4:
                 ambiguous_ligands.append({'instance': instance, 'component': residue.name, 'author_chain': author,
                                           'author_seq': str(residue.seqid)})
-    assignments = []
+    assignments, unresolved, companions = [], [], []
+    # Collect neighboring protein residues by assembly copy for a footprint
+    # check against the real atoms of the complete partner.
+    protein_contacts = defaultdict(list)
     for contact in near:
-        if contact['kind'] != 'nonpolymer':
+        if contact['kind'] == 'polymer':
+            protein_contacts[contact['instance']].append(contact)
+    projected = [(member, cKDTree(tree.data @ fit[0] + fit[1]), footprint)
+                 for member, tree, footprint in members] if fit and fit[2] <= 2 else []
+    for instance, contacts_in_copy in protein_contacts.items():
+        c_op, _, c_rows = assembly[instance]
+        keys = {(x['author_chain'], x['author_seq']) for x in contacts_in_copy}
+        atoms = [a['xyz'] for author, r in c_rows if (author, str(r.seqid)) in keys
+                 for a in positive_heavy(r, c_op) if not a['altloc']]
+        if not atoms:
+            continue
+        real_tree = cKDTree(atoms)
+        touched = {q for q, aa in coordinates.items() if
+                   (blank := [a['xyz'] for a in aa if not a['altloc']]) and min(real_tree.query(blank)[0]) <= 4}
+        for member, probe, footprint in projected:
+            shared = sorted(touched & footprint)
+            overlap = int(np.count_nonzero(probe.query(atoms)[0] <= 2))
+            if len(shared) >= 2 and overlap >= 3:
+                assignments.append({'kind': 'POLYMER_PARTNER', 'component_instance': instance,
+                                    'component': 'protein_partner', 'holo_member': member['component'],
+                                    'residues': sorted(keys), 'shared_actual_contact_positions': shared,
+                                    'candidate_heavy_atoms_within_2A_of_probe': overlap})
+    for contact in near:
+        if contact['kind'] == 'polymer':
+            if not any(x['component_instance'] == contact['instance'] for x in assignments):
+                unresolved.append(contact)
             continue
         c_op, _, c_rows = assembly[contact['instance']]
         partners = [res for author, res in c_rows if author == contact['author_chain'] and
                     str(res.seqid) == contact['author_seq'] and res.name == contact['component']]
         if len(partners) != 1:
+            unresolved.append(contact)
             continue
         atoms = [a for a in positive_heavy(partners[0], c_op) if not a['altloc']]
+        from apo_c_triplet_regression import ccd_heavy_atoms
+        expected = ccd_heavy_atoms(block, contact['component'])
+        if (len(atoms) == 1 and expected == [atoms[0]['name']]
+                and fit and fit[2] <= 1 and projected
+                and all(m['missing_ccd_heavy_atom_names'] == [] for m, _, _ in projected)):
+            distance = min(float(probe.query(atoms[0]['xyz'])[0]) for _, probe, _ in projected)
+            if distance > 4:
+                companions.append(contact | {'basis': 'DEPOSITED_MONATOMIC_COMPONENT_OUTSIDE_OBSERVED_TARGET_FOOTPRINT',
+                                            'distance_to_locally_aligned_target_A': round(distance, 4)})
+                continue
         if len(atoms) < 3:
+            unresolved.append(contact)
             continue
         xyz = np.array([a['xyz'] for a in atoms])
         tree = cKDTree(xyz)
         touched = {q for q, aa in coordinates.items() if
                    (blank := [a['xyz'] for a in aa if not a['altloc']]) and min(tree.query(blank)[0]) <= 4}
+        before = len(assignments)
         for member, target_tree, footprint in members:
             shared = sorted(touched & footprint)
             if len(shared) < 2:
@@ -194,10 +285,13 @@ def inspect_observation(obs, holo_geometry, structure, block):
                                     'local_alignment_ca_count': len(alpha_h),
                                     'compatible_atom_scope': 'positive occupancy, blank altloc on measured atoms',
                                     'local_ca_rmsd_A': round(fit[2], 4) if fit else None})
+        if len(assignments) == before:
+            unresolved.append(contact)
     return {'operator': str(op.name), 'author_chain': next((row['author_chain'] for row in obs['mapped_site']
                                                                       if row.get('author_chain')), None),
             'local_alignment_ca_count': len(alpha_h), 'local_ca_rmsd_A': round(fit[2], 4) if fit else None,
             'near_nonwater_instances': near, 'occupied_subsites': assignments, 'covalent_site_links': linked_site,
+            'noncompetitive_companions': companions, 'unresolved_nonwater_contacts': unresolved,
             'zero_occupancy_nearby_components': ambiguous_ligands,
             'holo_site_altloc_positions': sorted(holo_altlocs),
             'candidate_site_altloc_positions': uncertain_altlocs}
@@ -212,6 +306,7 @@ def decide_candidate(holo, prepared, evidence):
     structure = gemmi.make_structure_from_block(block)
     experimental = experiment_record(block, holo['target_members'], hblock)
     hgeom = target_geometry(holo, hs)
+    binding_role = deposited_target_role(holo, hblock, hs)
     members = holo['target_members']
     ordinary_target = (len(members) == 1 and members[0]['entity_type'] == 'EntityType.NonPolymer'
                        and len(members[0]['observed_heavy_atoms']) >= 3
@@ -246,7 +341,7 @@ def decide_candidate(holo, prepared, evidence):
                 reasons.append('IDENTITY_NOT_RESOLVED_FOR_CHAIN')
             if not complete_target:
                 reasons.append('HOLO_TARGET_PARTIAL_OR_COMPLEX')
-            if holo.get('role') != 'PASS' or not all(holo.get('qc', {}).get(k) == 'PASS' for k in
+            if binding_role['status'] == 'UNRESOLVED' or not all(holo.get('qc', {}).get(k) == 'PASS' for k in
                     ('coordinate_identity', 'experimental_fidelity', 'topology', 'partner_scope_qc')):
                 reasons.append('HOLO_ROLE_OR_SCOPE_QC_PENDING')
             if missing:
@@ -261,7 +356,8 @@ def decide_candidate(holo, prepared, evidence):
                 reasons.append('ALTERNATE_CONFORMATIONS_REQUIRE_REVIEW')
             if facts['covalent_site_links'] or any(r.get('component') not in STANDARD for r in obs['mapped_site']):
                 reasons.append('SITE_MODIFICATION_OR_COVALENT_CONTEXT')
-            if facts['near_nonwater_instances']:
+            if facts['unresolved_nonwater_contacts'] or (facts['noncompetitive_companions'] and not
+                    experimental['native_or_unliganded_title_signal']):
                 reasons.append('NONWATER_CONTACT_IN_MAPPED_SITE')
             if facts['zero_occupancy_nearby_components']:
                 reasons.append('DEPOSITED_NEARBY_COMPONENT_HAS_ZERO_OCCUPANCY')
@@ -290,7 +386,7 @@ def decide_candidate(holo, prepared, evidence):
         status = 'TECHNICAL_GAP'
     else:
         status = 'REVIEW'
-    return {'rule': RULE, 'status': status, 'candidate_experiment': experimental,
+    return {'rule': RULE, 'status': status, 'candidate_experiment': experimental, 'holo_target_role': binding_role,
             'observation_states': states,
             'scope': 'Specified positive-occupancy mapped site and deposited experimental assembly/model. '
                      'Supported research pairs require complete ordinary Holo target and a unique candidate chain observation.'}

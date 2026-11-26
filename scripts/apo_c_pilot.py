@@ -47,13 +47,18 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf8'))
 
 
-def cache_get(run, name, url, params=None, timeout=25, accepted=(200, 204)):
+def cache_get(run, name, url, params=None, timeout=25, accepted=(200, 204), validate=None):
     """Cache successful responses and their request evidence; failures remain explicit."""
     base = run / 'http' / name
     body, meta = base.with_suffix('.gz'), base.with_suffix('.json')
     if body.exists() and meta.exists():
         with gzip.open(body, 'rb') as f:
-            return f.read(), read_json(meta)
+            payload, info = f.read(), read_json(meta)
+        if info['status'] not in accepted:
+            raise ValueError(f'unexpected cached HTTP status: {base}')
+        if validate:
+            validate(payload, info['status'])
+        return payload, info
     if body.exists() or meta.exists():
         raise RuntimeError(f'incomplete cache entry: {base}')
     started, clock = now(), time.monotonic()
@@ -61,6 +66,8 @@ def cache_get(run, name, url, params=None, timeout=25, accepted=(200, 204)):
     elapsed = time.monotonic() - clock
     if r.status_code not in accepted:
         raise RuntimeError(f'HTTP {r.status_code} for {r.url}: {r.text[:180]}')
+    if validate:
+        validate(r.content, r.status_code)
     base.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(body, 'xb') as f:
         f.write(r.content)
@@ -140,26 +147,78 @@ def plinder(case, index):
     pid = case['pdb'].lower()
     revisions = pq.read_table(index / 'entry_sources.parquet', filters=[('entry_pdb_id', '=', pid)]).to_pylist()
     columns = ['entry_pdb_id', 'system_id', 'system_biounit_id', 'ligand_id', 'ligand_ccd_code',
-               'ligand_instance_chains', 'ligand_protein_chains_asym_id']
+               'ligand_instance_chains', 'ligand_protein_chains_asym_id', 'ligand_member_asym_ids',
+               'ligand_auth_id', 'ligand_residue_numbers']
     ann = pq.read_table(index / 'annotation_table.parquet', columns=columns,
                         filters=[('entry_pdb_id', '=', pid)]).to_pylist()
     ident = case['identity']
     targets = {x[0] for x in ident['target_residue_instances']}
     binding = {x[0] for x in ident['binding_instances']}
-    matched = [r for r in ann if str(r['system_biounit_id']) == str(ident['assembly'])
-               and set(r['ligand_instance_chains'] or []) == targets
-               and set(r['ligand_protein_chains_asym_id'] or []) == binding]
-    systems = sorted({r['system_id'] for r in matched})
-    links = (pq.read_table(index / 'linked_apo_structures.parquet',
-                           filters=[('reference_system_id', 'in', systems)]).to_pylist() if systems else [])
     rev = (f"{revisions[0]['source_mmcif_major_revision']}.{revisions[0]['source_mmcif_minor_revision']}"
            if revisions else None)
+    matched, chain_hints = [], []
+    if ann:
+        import holo_source_mapping as mapping
+        block = gemmi.cif.read(case['source_uri']).sole_block()
+        structure = gemmi.make_structure_from_block(block)
+        instances = mapping.assembly_instances(structure, str(ident['assembly']), structure[0])
+        for row in ann:
+            if (str(row['system_biounit_id']) != str(ident['assembly'])
+                    or set(row['ligand_protein_chains_asym_id'] or []) != binding):
+                continue
+            chains = set(row['ligand_instance_chains'] or [])
+            if chains == targets:
+                granularity = plinder_instance_match(row, ident, instances, rev, block)
+                if granularity == 'INSTANCE':
+                    matched.append(row | {'match_granularity': granularity})
+                elif granularity == 'CHAIN_HINT':
+                    chain_hints.append(row | {'match_granularity': granularity})
+    selected = matched or chain_hints
+    systems = sorted({r['system_id'] for r in selected})
+    links = (pq.read_table(index / 'linked_apo_structures.parquet',
+                           filters=[('reference_system_id', 'in', systems)]).to_pylist() if systems else [])
+    for link in links:
+        link['target_match_granularity'] = 'INSTANCE' if matched else 'CHAIN_HINT'
     status = ('no_entry_coverage' if not revisions else 'entry_without_system_annotation' if not ann
-              else 'no_matching_target_instance' if not matched
+              else 'no_matching_target_instance' if not selected
+              else 'chain_level_candidate_hints' if not matched and links
               else 'candidates' if links else 'matched_no_linked_candidates')
     return {'status': status, 'release': 'PLINDER 2026-09', 'holo_revision': ident['revision'],
             'source_revision': rev, 'same_revision': rev == ident['revision'] if rev else None,
-            'matched_annotations': matched, 'links': links}
+            'matched_annotations': matched, 'chain_level_hints': chain_hints, 'links': links}
+
+
+def plinder_instance_match(row, identity, instances, source_revision, block):
+    """Resolve author residue identity from the matching PLINDER assembly copy."""
+    targets = identity['target_residue_instances']
+    if set(row['ligand_member_asym_ids'] or []) != {t[1] for t in targets}:
+        return None
+    if len(targets) != 1:
+        return 'CHAIN_HINT'
+    instance, label, _, entity, author, native, ccd = targets[0]
+    if (str(row['ligand_ccd_code']).upper() != ccd.upper() or row.get('ligand_auth_id') != author):
+        return None
+    if source_revision != identity['revision'] or instance not in instances:
+        return 'CHAIN_HINT'
+    _, observed_label, residues = instances[instance]
+    if observed_label != label:
+        return None
+    matching = [r for ach, r in residues if ach == author and r.name == ccd and
+                str(r.entity_id) == str(entity) and not r.is_water()]
+    verified = [r for r in matching if str(r.seqid) == str(native)]
+    if len(verified) != 1:
+        return None
+    scheme = block.get_mmcif_category('_pdbx_nonpoly_scheme.')
+    keys = ['asym_id', 'entity_id', 'mon_id', 'pdb_strand_id', 'pdb_seq_num', 'pdb_ins_code', 'ndb_seq_num']
+    if not all(k in scheme for k in keys):
+        return 'CHAIN_HINT'
+    residue = verified[0]
+    native_rows = [ord_ for lab, ent, comp, ach, number, ins, ord_ in zip(*(scheme[k] for k in keys))
+                   if (lab, str(ent), comp, ach, str(number), str(ins or '').strip()) ==
+                   (label, str(entity), ccd, author, str(residue.seqid.num), residue.seqid.icode.strip())]
+    if len(native_rows) == 1 and row['ligand_residue_numbers']:
+        return 'INSTANCE' if {str(v) for v in row['ligand_residue_numbers']} == set(native_rows) else None
+    return 'CHAIN_HINT'
 
 
 def uniprot_mappings(run, pdb):
@@ -184,15 +243,41 @@ def relevant_uniprot(case, mappings):
             if any(m.get('struct_asym_id') in labels for m in v.get('mappings', []))}
 
 
+class RcsbPageError(RuntimeError):
+    def __init__(self, name, offset, expected, hits, pages, exc):
+        super().__init__(f'{name} page {offset}: {exc}')
+        self.progress = {'query_id': name, 'missing_offset': offset, 'total_count': expected,
+                         'retained_hits': len(hits), 'pages': pages}
+
+
 def rcsb_query(run, name, node):
     all_hits, pages = [], []
-    start = 0
+    start, total = 0, None
+    seen = set()
     while True:
         query = {'query': node,
             'return_type': 'polymer_entity', 'request_options': {
                 'results_content_type': ['experimental'], 'paginate': {'start': start, 'rows': 1000}}}
-        body, info = cache_get(run, f'rcsb/{name}_{start}', 'https://search.rcsb.org/rcsbsearch/v2/query',
-                               params={'json': json.dumps(query, separators=(',', ':'))})
+        def validate(body, status):
+            if status == 204:
+                if start:
+                    raise ValueError('204 on a later page')
+                return
+            record = json.loads(body)
+            count, items = record['total_count'], record.get('result_set', [])
+            if not isinstance(count, int) or count < start or (total is not None and total != count):
+                raise ValueError('result total changed or is invalid')
+            if len(items) != min(1000, count - start):
+                raise ValueError('missing or excess entries in page')
+            identifiers = {x['identifier'] for x in items}
+            if len(identifiers) != len(items) or identifiers & seen:
+                raise ValueError('duplicate entities within or across pages')
+
+        try:
+            body, info = cache_get(run, f'rcsb/{name}_{start}', 'https://search.rcsb.org/rcsbsearch/v2/query',
+                                   params={'json': json.dumps(query, separators=(',', ':'))}, validate=validate)
+        except Exception as exc:
+            raise RcsbPageError(name, start, total, all_hits, pages, exc) from exc
         pages.append(info)
         if info['status'] == 204:
             return {'query_id': name, 'total_count': 0, 'hits': [], 'pages': pages, 'query': query}
@@ -200,7 +285,8 @@ def rcsb_query(run, name, node):
         hits = result.get('result_set', [])
         all_hits.extend(hits)
         total = result['total_count']
-        if len(all_hits) >= total:
+        seen.update(x['identifier'] for x in hits)
+        if len(all_hits) == total:
             break
         if not hits:
             raise RuntimeError(f'RCSB pagination ended early at {len(all_hits)}/{total}')
@@ -291,6 +377,15 @@ def case_file(run, case):
     return run / 'search' / (case['id'].replace(':', '_') + '.json')
 
 
+def attempts(path):
+    return ([path] if path.exists() else []) + sorted(path.parent.glob(path.stem + '.retry*.json'))
+
+
+def next_attempt(path):
+    prior = attempts(path)
+    return path if not prior else path.with_name(path.stem + f'.retry{len(prior):06d}.json')
+
+
 def search_cases(args):
     run = Path(args.run)
     cases = read_json(run / 'samples.json')
@@ -304,16 +399,19 @@ def search_cases(args):
         shutil.copy2(Path(__file__), code_snapshot)
     for case in selected:
         path = case_file(run, case)
-        if path.exists():
-            previous = [path] + sorted(path.parent.glob(path.stem + '.retry*.json'))
-            latest = read_json(previous[-1])
+        previous = attempts(path)
+        latest = read_json(previous[-1]) if previous else {}
+        if latest:
             if not args.retry_failed or not any(latest[k]['status'] == 'technical_failure'
                                                 for k in ('plinder', 'sifts_rcsb', 'ahoj')):
                 print('REUSE', case['id'], flush=True)
                 continue
-            path = path.with_name(path.stem + f'.retry{len(previous):03d}.json')
+            path = next_attempt(path)
         result = {'sample': case['id'], 'started_utc': now(), 'code_sha256': sha(Path(__file__))}
         for name in ('plinder', 'sifts_rcsb', 'ahoj'):
+            if name in latest and latest[name]['status'] != 'technical_failure':
+                result[name] = latest[name]
+                continue
             try:
                 if name == 'plinder':
                     result[name] = plinder(case, index)
@@ -332,6 +430,8 @@ def search_cases(args):
                                     'searches': searches}
                 else:
                     result[name] = ahoj(case, run)
+            except RcsbPageError as exc:
+                result[name] = {'status': 'technical_failure', 'error': str(exc), 'pagination': exc.progress}
             except Exception as exc:
                 result[name] = {'status': 'technical_failure', 'error': f'{type(exc).__name__}: {exc}'}
         sets = {

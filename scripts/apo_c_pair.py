@@ -154,27 +154,63 @@ def align_coordinates(holo, candidate):
     return rotation, translation, rmsd(holo @ rotation + translation, candidate)
 
 
-def write_assembly(structure, assembly_id, path):
+def write_assembly(structure, assembly_id, path, required_connections=()):
     assembly = next((a for a in structure.assemblies if a.name == assembly_id), None)
     if assembly is None:
         raise ValueError(f'candidate assembly absent: {assembly_id}')
-    model = gemmi.make_assembly(assembly, structure[0], gemmi.HowToNameCopiedChain.AddNumber)
-    out = gemmi.Structure()
-    out.name = structure.name
-    out.cell = structure.cell
-    out.spacegroup_hm = structure.spacegroup_hm
-    out.add_model(model)
-    out.setup_entities()
-    out.make_mmcif_document().write_file(str(path))
+    naming = gemmi.HowToNameCopiedChain.AddNumber
+    model = gemmi.make_assembly(assembly, structure[0], naming)
+    out = structure.clone()
+    for i in range(len(out) - 1, 0, -1):
+        del out[i]
+    out.transform_to_assembly(assembly_id, naming, merge_dist=0.)
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(path)
+    doc = out.make_mmcif_document()
+    with path.open('x', encoding='utf8') as f:
+        f.write(doc.as_string())
     reloaded = gemmi.read_structure(str(path))
     expected, actual = model.count_atom_sites(), reloaded[0].count_atom_sites()
     if expected != actual or actual == 0:
         raise ValueError(f'assembly readback atom count differs: {expected} vs {actual}')
     def inventory(m):
-        return Counter((r.name, a.name, a.element.name, round(a.occ, 2)) for c in m for r in c for a in r)
+        return Counter((c.name, str(r.seqid), r.name, a.name, a.element.name, a.altloc, round(a.occ, 3))
+                       for c in m for r in c for a in r)
     if inventory(model) != inventory(reloaded[0]):
-        raise ValueError('assembly readback changed component or atom inventory')
+        raise ValueError('assembly readback changed atom identity, altloc or occupancy')
+
+    def atom_positions(m):
+        return sorted((c.name, str(r.seqid), r.name, a.name, a.altloc, (a.pos.x, a.pos.y, a.pos.z))
+                      for c in m for r in c for a in r)
+
+    src, dst = atom_positions(model), atom_positions(reloaded[0])
+    assert all(a[:-1] == b[:-1] for a, b in zip(src, dst))
+    max_delta = max(float(np.linalg.norm(np.subtract(a[-1], b[-1]))) for a, b in zip(src, dst))
+    if max_delta > 0.001:
+        raise ValueError(f'assembly readback coordinates differ by {max_delta:.6f} A')
+
+    def links(st):
+        identities = []
+        for link in st.connections:
+            for endpoint in (link.partner1, link.partner2):
+                if st[0].find_cra(endpoint).atom is None:
+                    raise ValueError(f'connection endpoint absent: {link.name} {endpoint}')
+            identities.append((str(link.type), str(link.partner1), str(link.partner2)))
+        return Counter(identities)
+
+    if links(out) != links(reloaded):
+        raise ValueError('assembly readback changed deposited connection endpoints')
+    kept_links = {link.name for link in reloaded.connections}
+    if set(required_connections) - kept_links:
+        raise ValueError(f'required deposited connections absent in assembly: {sorted(set(required_connections) - kept_links)}')
+    # A source link can legitimately fall outside the assembly. Preserve a
+    # diagnostic for the source/display difference rather than hiding it.
     return {'expected_atoms': expected, 'readback_atoms': actual, 'component_atom_inventory': 'PASS',
+            'max_coordinate_delta_A': max_delta, 'source_connections': len(structure.connections),
+            'readback_connection_endpoints': len(reloaded.connections), 'connection_endpoints': 'PASS',
+            'required_connections': sorted(required_connections),
+            'display_scope': 'first deposited model; atom coordinates transformed to selected assembly, copy chains renamed',
             'sha256': sha(path), 'bytes': path.stat().st_size}
 
 
