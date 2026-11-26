@@ -207,18 +207,20 @@ def scheduler(root, url, *, child_mode=None):
                       acceptance=acc,batch_size=2,jobs=1,fetch_jobs=4,reserve_gib=0,primary_budget=1,
                       archive_ancillary=2,retry_jobs=1,max_retries=1,max_pending=6,max_main_batches=None,
                       stop_after_partition=(1 if child_mode=='stop' else 3),plan_only=False)
-    if child_mode in ('balance-kill','balance-timeout','balance-clears'):
-        a.balance_retries=True; a.balance_budget=1 if child_mode in ('balance-timeout','balance-clears') else 12
+    if child_mode in ('balance-kill','balance-timeout','balance-clears','main-priority'):
+        a.balance_retries=True; a.balance_budget=12 if child_mode=='balance-kill' else 1
         a.max_pending=2; a.retry_only=False
+        a.prioritize_main_batches=child_mode=='main-priority'
     wave=[]
     waiting=False
     def retry(run,row,archive,previous,known,n,consumed=0,prefer_ranges=False):
         t=time.monotonic(); identity=row['source']; p=identity['pdb_id']; wave.append((p,waiting,t))
         time.sleep(.14)
-        state=({'attempts':0,'next_epoch':time.time()+(1.5 if child_mode=='balance-clears' else 60),'state':'FAILED'} if
-               child_mode=='balance-timeout' or (child_mode=='balance-clears' and not (root/f'retry_deferred_{p}').exists()) else
+        defer_once=child_mode in ('balance-clears','main-priority') and not (root/f'retry_deferred_{p}').exists()
+        state=({'attempts':0,'next_epoch':time.time()+(1.5 if defer_once else 60),'state':'FAILED'} if
+               child_mode=='balance-timeout' or defer_once else
                {'attempts':1,'next_epoch':0,'state':'READY','check':identity | {'retry_network_bytes':0,'availability':'VERIFIED'}})
-        if child_mode=='balance-clears' and state['state']=='FAILED':
+        if defer_once:
             (root/f'retry_deferred_{p}').touch()
         key=digest(tuple(identity[k] for k in rolling.SPEC)); queue=run/'retry_cache'/key
         queue.mkdir(exist_ok=True,parents=True); durable_json(queue/'attempt.json',state)
@@ -237,7 +239,8 @@ def scheduler(root, url, *, child_mode=None):
             assert saved['started_epoch']==marker['started_epoch']
             durable_json(root/'balance_resumed.json',saved)
         pending=keys if (child_mode is None and label in ('b0001','b0002') or
-                         child_mode in ('balance-kill','balance-timeout','balance-clears') and label=='b0001') else []
+                         child_mode in ('balance-kill','balance-timeout','balance-clears') and label=='b0001' or
+                         child_mode=='main-priority' and '-r' not in label) else []
         if child_mode=='download' and label=='b0001':
             frozen=pin(PDB) | {'expected_bytes':len(BODY)}
             proof=done/'source_proofs'/f'{PDB}.json'; marker=root/'killed_download.json'
@@ -328,7 +331,13 @@ def real_supervised(root,url):
     assert state['restarts']>=1 and read(cleared/'rolling_progress.json')['partitions_completed']==3
     assert read(cleared/'retry_progress.json')['queued']==0
     assert read(cleared/'retry_balance'/'b0002.json')['previous_holds'][0]['state']=='DRAIN_TIMEOUT'
-    return {'persisted_timeout_rechecked_and_drained':True,'recovery_budget_exhaustion':True,'durable_balance_resumed_after_SIGKILL':True,'balance_timeout_stops_primary':True,
+    _,priority,state=run_site('main-priority')
+    reports=sorted((read(f)['sequence'],f.stem) for f in (priority/'receipts').glob('*.json'))
+    assert [label for _,label in reports[:3]]==['b0001','b0002','b0003']
+    assert state['restarts']==0 and read(priority/'rolling_progress.json')['new_settled_entries']==5
+    assert read(priority/'retry_progress.json')['queued']==0
+    return {'main_priority_dispatches_with_backlog_then_drains':True,
+            'persisted_timeout_rechecked_and_drained':True,'recovery_budget_exhaustion':True,'durable_balance_resumed_after_SIGKILL':True,'balance_timeout_stops_primary':True,
             'verified_download_proof_reused_after_real_exit':True,'signal':'SIGKILL','automatic_restarts':1,'waited_for_descendant_lease':True,
             'receipt_hash_preserved':True,'unique_records_after_restart':2,'intentional_stop_restarts':0}
 

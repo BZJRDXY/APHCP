@@ -502,6 +502,9 @@ def rolling(a):
         balance = {'high':high,'low':high//2,'budget_s':a.balance_budget,
                    'stop_after':a.stop_after_partition,'retry_only':a.retry_only}
         config['retry_balance'] = balance
+    prioritize_main = getattr(a, 'prioritize_main_batches', False)
+    if prioritize_main:
+        config['prioritize_main_batches'] = True
     terminal=getattr(a,'terminal_plan_sha256',None)
     if terminal:
         config['terminal_plan_sha256']=terminal
@@ -880,18 +883,19 @@ def rolling(a):
         with ThreadPoolExecutor(max_workers=1) as ahead, ThreadPoolExecutor(max_workers=a.retry_jobs) as pool:
             a.pump_retry=pump
             future=None; prefetched=None; consecutive_failures=0; completed_here=0; pause_reason=None
-            if not unstarted and stop_after is not None and not retry_only:
+            if not unstarted and stop_after is not None and not retry_only and not prioritize_main:
                 drain_reason=balance_backlog(None,closing=True) if balance else None
                 pause_reason=drain_reason or 'PAUSED_OBSERVATION_LIMIT'
             for i,part in enumerate(unstarted):
                 if request.is_file(): break
                 collect()
                 if request.is_file(): break
-                if balance:
-                    pause_reason=balance_backlog(part['id'])
-                    if pause_reason or request.is_file(): break
-                if actionable_count(retry_status())>=a.max_pending:
-                    pause_reason='PAUSED_RETRY_BACKLOG'; break
+                if not prioritize_main:
+                    if balance:
+                        pause_reason=balance_backlog(part['id'])
+                        if pause_reason or request.is_file(): break
+                    if actionable_count(retry_status())>=a.max_pending:
+                        pause_reason='PAUSED_RETRY_BACKLOG'; break
                 disk_guard(a)
                 schedule(pool)
                 label=part['id']; rows=rows_for(part); adopt=bool(legacy and i==0 and
@@ -932,15 +936,20 @@ def rolling(a):
                 if request.is_file(): break
                 collect(); schedule(pool)
                 write(run/'retry_progress.json',retry_status())
-                consecutive_failures=consecutive_failures+1 if len(result['pending'])*4>result['total'] else 0
-                if consecutive_failures>=3:
-                    pause_reason='PAUSED_SOURCE_FAILURE'; break
+                if not prioritize_main:
+                    consecutive_failures=consecutive_failures+1 if len(result['pending'])*4>result['total'] else 0
+                    if consecutive_failures>=3:
+                        pause_reason='PAUSED_SOURCE_FAILURE'; break
                 if ((a.max_main_batches is not None and completed_here>=a.max_main_batches) or
                     (stop_after is not None and i+1==len(unstarted))):
-                    drain_reason=balance_backlog(None,closing=True) if balance else None
-                    pause_reason=drain_reason or 'PAUSED_OBSERVATION_LIMIT'; break
+                    if not prioritize_main:
+                        drain_reason=balance_backlog(None,closing=True) if balance else None
+                        pause_reason=drain_reason or 'PAUSED_OBSERVATION_LIMIT'
+                    break
             if not pause_reason and not request.is_file():
-                # Drain bounded retries at the end; don't keep retrying forever.
+                # Finish existing per-entry retry budgets after the last primary partition.
+                if prioritize_main:
+                    progress('DRAINING_FINAL_RETRIES')
                 last_merge=time.monotonic()
                 while not request.is_file():
                     pump()
@@ -952,6 +961,8 @@ def rolling(a):
                     if not active_jobs and wake is None and not ready: break
                     if active_jobs: wait(active_jobs.values(),timeout=.5,return_when=FIRST_COMPLETED)
                     else: time.sleep(.5 if wake is None else min(.5,max(.01,wake-time.time())))
+                if prioritize_main:
+                    pause_reason='PAUSED_OBSERVATION_LIMIT'
         a.pump_retry=lambda:None
         # No asynchronous writer is left when publishing an actual paused state.
         if request.is_file(): pause_reason='PAUSED_AT_BOUNDARY'
@@ -999,6 +1010,8 @@ def main():
     p.add_argument('--max-retries',type=int,default=3)
     p.add_argument('--max-pending',type=int,default=550)
     p.add_argument('--balance-retries',action='store_true',help='Drain bounded actionable backlog at partition boundaries')
+    p.add_argument('--prioritize-main-batches', action='store_true',
+                   help='Dispatch main partitions through the absolute stop without waiting for retry backlog')
     p.add_argument('--balance-budget',type=int,default=900,help='Maximum seconds allowed for one balance hold')
     limit=p.add_mutually_exclusive_group()
     limit.add_argument('--max-main-batches',type=int)
@@ -1011,6 +1024,7 @@ def main():
     if (min(a.jobs,a.fetch_jobs,a.batch_size,a.reserve_gib,a.primary_budget,a.max_pending,a.max_retries)<1 or
         a.max_retries>6 or a.balance_budget<1 or not 1<=a.retry_jobs<=a.archive_ancillary<a.fetch_jobs or
         (a.reuse_unsealed_m2 and (not a.continue_from or a.retry_only)) or
+        (a.prioritize_main_batches and (not a.stop_after_partition or not a.balance_retries)) or
         (a.source_feed and not a.stop_after_partition) or
         (a.feed_reserve is not None and (not a.source_feed or a.feed_reserve<1)) or
         (a.max_main_batches is not None and a.max_main_batches<1) or
