@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 import gzip
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import shutil
@@ -19,6 +20,7 @@ from scipy.spatial import cKDTree
 import apo_c_pair
 import apo_c_pilot
 import apo_c_rank_audit
+import apo_c_science
 import apo_c_triplet_regression
 import apo_c_union_triage
 import holo_source_mapping
@@ -90,6 +92,7 @@ def prepare_holo(case):
     edges = apo_c_triplet_regression.connections_for_target(block, identity)
     external = [x for x in edges if x['kind'] == 'covale' and sum(x['target_endpoint_membership']) == 1]
     public = {'status': 'HOLO_OBSERVED_SITE_READY', 'system_id': case['id'], 'holo_status': case['holo_status'],
+              'qc': case.get('qc') or {}, 'role': case.get('role'), 'role_evidence': case.get('role_evidence'),
               'identity': identity, 'source': str(path), 'source_sha256': sha(path),
               'source_revision': revision, 'first_public_model_date': first_date, 'model': structure[0].num,
               'binding_instance': key, 'binding_label': label, 'deposited_accessions': acc,
@@ -192,7 +195,6 @@ def fetch_candidate(run, pdb, origins, config):
         else:
             metadata, info = apo_c_pilot.cache_get(run, f'rcsb_entry/{pdb.lower()}',
                                                    f'https://data.rcsb.org/rest/v1/core/entry/{pdb}')
-            import json
             accession = json.loads(metadata)['rcsb_accession_info']
             major, minor = int(accession['major_revision']), int(accession['minor_revision'])
             basis = 'RCSB current fixed revision; AHoJ revision not established'
@@ -369,6 +371,18 @@ def reuse_searches(run, previous):
         write_json(record, {'source_run': str(source), 'entries': entries})
 
 
+def read_holo_role(catalog, case):
+    with apo_c_pilot.open_catalog(Path(catalog)) as db:
+        row = db.execute("SELECT error_message FROM run_item WHERE object_id=? AND stage='STRUCTURE_OBSERVATION' "
+                         "AND output_uri IS NOT NULL ORDER BY updated_at DESC,run_id DESC LIMIT 1", (case['id'],)).fetchone()
+    if row is None:
+        raise ValueError('sealed Holo role row is missing')
+    record = json.loads(row[0])
+    if record['identity'] != case['identity']:
+        raise ValueError('sealed Holo role row has a different identity')
+    return {'role': record.get('role'), 'role_evidence': record.get('role_evidence')}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', required=True)
@@ -385,7 +399,7 @@ def main():
         p.error('invalid candidate inspection budget')
     run, sample_path = Path(args.run), Path(args.samples)
     deps = [Path(__file__), Path(apo_c_pilot.__file__), Path(apo_c_pair.__file__),
-            Path(apo_c_rank_audit.__file__), Path(apo_c_triplet_regression.__file__),
+            Path(apo_c_rank_audit.__file__), Path(apo_c_science.__file__), Path(apo_c_triplet_regression.__file__),
             Path(apo_c_union_triage.__file__), Path(holo_source_mapping.__file__)]
     config = {'sample_spec_sha256': sha(sample_path), 'catalog': str(Path(args.catalog).resolve()),
               'index': str(Path(args.index).resolve()), 'per_source_rank': args.per_source_rank,
@@ -396,7 +410,7 @@ def main():
               'reuse_runs': [str(Path(x).resolve()) for x in args.reuse_run],
               'reuse_search_run': str(Path(args.reuse_search_run).resolve()) if args.reuse_search_run else None,
               'code_sha256': {x.name: sha(x) for x in deps},
-              'formal_pair_acceptance': False}
+              'scientific_rule': apo_c_science.RULE, 'formal_pair_acceptance': False}
     started, clock = now(), time.monotonic()
     if not run.exists():
         apo_c_pilot.initial_samples(SimpleNamespace(samples=str(sample_path), run=str(run),
@@ -430,6 +444,7 @@ def main():
                   'rankings_top10': {k: v[:10] for k, v in rank.items()}, 'selected_candidates': chosen,
                   'candidates': [], 'formal_pair_acceptance': False}
         try:
+            case.update(read_holo_role(args.catalog, case))
             holo, prepared = prepare_holo(case)
             result['holo_evidence'] = holo
             if prepared is not None:
@@ -455,6 +470,8 @@ def main():
                     print('CANDIDATE_START', case['id'], item['pdb'], flush=True)
                     try:
                         evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config)
+                        evidence['scientific_decision'] = apo_c_science.decide_candidate(holo, prepared, evidence)
+                        evidence['search_origins'] = item['sources']
                         selected_assemblies = sorted({o['assembly'] for e in evidence.get('entities', [])
                                 for o in e.get('assembly_observations', [])
                                 if o.get('status') == 'ACTUAL_CONTACTS_MEASURED'})[:config['max_derivative_assemblies_per_candidate']]
@@ -471,7 +488,9 @@ def main():
                                 evidence['materialized_assemblies'].append({'assembly': assembly, 'path': str(out), 'qc': qc})
                     except Exception as exc:
                         evidence = {'status': 'TECHNICAL_FAILURE', 'pdb': item['pdb'],
-                                    'error': f'{type(exc).__name__}: {exc}'}
+                                    'error': f'{type(exc).__name__}: {exc}',
+                                    'scientific_decision': {'status': 'TECHNICAL_GAP', 'rule': apo_c_science.RULE,
+                                                            'reasons': ['CANDIDATE_INSPECTION_FAILED']}}
                     write_json(candidate_path, evidence)
                     result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
                                                  'evidence_path': str(candidate_path)})
@@ -485,6 +504,10 @@ def main():
         print('RESULT', case['id'], result['holo_evidence']['status'],
               'selected', len(chosen), 'examined', len(result['candidates']), flush=True)
     states = Counter(candidate['status'] for result in results for candidate in result['candidates'])
+    research = {}
+    for result in results:
+        research[result['system_id']] = [read_json(Path(candidate['evidence_path']))['scientific_decision']['status']
+                                         for candidate in result['candidates']]
     observations = Counter(o['research_screen'] for result in results for candidate in result['candidates']
                            for e in read_json(Path(candidate['evidence_path'])).get('entities', [])
                            for o in e.get('assembly_observations', [])
@@ -492,7 +515,9 @@ def main():
     summary = {'started_utc': started, 'finished_utc': now(), 'elapsed_s': round(time.monotonic() - clock, 3),
                'holo_dispatched': len(results), 'candidate_entry_outcomes': dict(states),
                'chain_observations': dict(observations), 'formal_pair_acceptances': 0,
-               'unbound_experiment_evidence': 'not automatically established',
+               'scientific_rule': apo_c_science.RULE,
+               'research_pair_outcomes': dict(Counter(s for values in research.values() for s in values)),
+               'holo_with_research_pair': sum('SUPPORTED_RESEARCH_PAIR' in values for values in research.values()),
                'limits': ['Search routes can fail independently.', 'Multi-chain targets remain review.',
                           'An observed no-contact scope is not proof of an unbound experiment.',
                           'No population accuracy, blind assessment or formal acceptance is claimed.']}

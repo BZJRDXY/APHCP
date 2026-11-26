@@ -106,6 +106,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', required=True)
     p.add_argument('--output-name', default='independent_autopilot_audit.json')
+    p.add_argument('--pair', action='append', nargs=2, metavar=('HOLO', 'CANDIDATE'),
+                   help='Check each observable Assembly copy for the selected Entry pair')
     args = p.parse_args()
     if Path(args.output_name).name != args.output_name:
         p.error('output name must be a filename')
@@ -114,24 +116,28 @@ def main():
     if output.exists():
         raise FileExistsError(output)
     samples = {x['id']: x for x in json.loads((run / 'samples.json').read_text())}
-    wanted = [('1E2E', '1E2D'), ('1QZ5', '2PBD'), ('1FC0', '1EM6'),
-              ('1OLM', '1O6U'), ('1MJ9', '1FY7'), ('1OWZ', '2O7A')]
+    wanted = args.pair or [('1E2E', '1E2D'), ('1QZ5', '2PBD'), ('1FC0', '1EM6'),
+                           ('1OLM', '1O6U'), ('1MJ9', '1FY7'), ('1OWZ', '2O7A')]
     checks = []
     for holo, candidate in wanted:
         casepath = next((run / 'automated').glob(f'holo_{holo}_*/result.json'))
         case = json.loads(casepath.read_text())
         row = next(x for x in case['candidates'] if x['pdb'] == candidate)
         evidence = json.loads(Path(row['evidence_path']).read_text())
-        entity = next(e for e in evidence['entities'] if any(
-            'research_screen' in o for o in e.get('assembly_observations', [])))
-        observation = next(o for o in entity['assembly_observations'] if 'research_screen' in o)
         sample = samples[case['system_id']]
-        result = check_observation(sample, case['holo_evidence'], evidence, entity, observation)
-        result.update({'holo': holo, 'candidate': candidate, 'evidence_path': row['evidence_path'],
-                       'holo_source_hash_matches': digest(sample['source_uri']) == sample['identity']['source_sha256'],
-                       'candidate_source_hash_matches': digest(evidence['candidate_source']['path']) ==
-                                                        evidence['candidate_source']['sha256']})
-        checks.append(result)
+        observable = [(e, o) for e in evidence['entities'] for o in e.get('assembly_observations', [])
+                      if 'research_screen' in o]
+        if not observable:
+            raise ValueError(f'No physically observable site for {holo} → {candidate}')
+        if not args.pair:
+            observable = observable[:1]
+        hhash = digest(sample['source_uri']) == sample['identity']['source_sha256']
+        chash = digest(evidence['candidate_source']['path']) == evidence['candidate_source']['sha256']
+        for entity, observation in observable:
+            result = check_observation(sample, case['holo_evidence'], evidence, entity, observation)
+            result.update({'holo': holo, 'candidate': candidate, 'evidence_path': row['evidence_path'],
+                           'holo_source_hash_matches': hhash, 'candidate_source_hash_matches': chash})
+            checks.append(result)
     readbacks = []
     for casepath in sorted((run / 'automated').glob('*/result.json')):
         case = json.loads(casepath.read_text())

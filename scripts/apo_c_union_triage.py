@@ -136,7 +136,7 @@ def candidate_evidence(run, holo, pdb, source_rows, q, qblock, qstruct, qseq, qs
                         site_rows.append(row)
                     contacts = component_contacts(instances, {key}, site_atoms, None)
                     record['assembly_observations'].append({'assembly': assembly.name, 'instance': key,
-                        'label_asym': label, 'model': structure[0].num, 'mapped_site': site_rows,
+                        'label_asym': label, 'author_chain': rows[0][0], 'model': structure[0].num, 'mapped_site': site_rows,
                         'site_observed_residues': sum(x['observed_positive_heavy_atoms'] > 0 for x in site_rows),
                         'site_complete_relative_holo_residues': sum(x['observed_positive_heavy_atoms'] > 0 and
                             x.get('same_residue_component') and not x.get('missing_relative_holo_heavy_atoms') for x in site_rows),
