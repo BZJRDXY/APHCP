@@ -102,6 +102,61 @@ def check_observation(sample, holo_evidence, evidence, entity, observation):
             'instance': observation['instance'], 'assembly': observation['assembly']}
 
 
+def audit_delivery_assembly(source, original_metadata, assembly_id, model_num, output, required_connections=()):
+    """Compare the final deliverable against its fixed experimental source."""
+    block = gemmi.cif.read(str(source)).sole_block()
+    structure = gemmi.make_structure_from_block(block)
+    pdb = gemmi.cif.as_string(block.find_value('_entry.id') or '')
+    revision_rows = block.find('_pdbx_audit_revision_history.', ['data_content_type', 'major_revision', 'minor_revision'])
+    revisions = [(int(row[1]), int(row[2])) for row in revision_rows
+                 if gemmi.cif.as_string(row[0]).casefold() == 'structure model']
+    seen_revision = '.'.join(map(str, max(revisions))) if revisions else None
+    assembly = next(a for a in structure.assemblies if a.name == str(assembly_id))
+    model = next(m for m in structure if m.num == model_num)
+    naming = gemmi.HowToNameCopiedChain.AddNumber
+    expected = gemmi.make_assembly(assembly, model, naming)
+    actual = gemmi.read_structure(output['path'])
+
+    def inventory(m):
+        return sorted((c.name, str(r.seqid), r.name, a.name, a.element.name, a.altloc,
+                       (a.pos.x, a.pos.y, a.pos.z, a.occ))
+                      for c in m for r in c for a in r)
+
+    first, last = inventory(expected), inventory(actual[0])
+    same_identifiers = len(first) == len(last) and all(x[:-1] == y[:-1] for x, y in zip(first, last))
+    coordinate_delta = occupancy_delta = None
+    if same_identifiers and first:
+        delta = np.asarray([x[-1] for x in first]) - np.asarray([y[-1] for y in last])
+        coordinate_delta = float(np.linalg.norm(delta[:, :3], axis=1).max())
+        occupancy_delta = float(np.abs(delta[:, 3]).max())
+
+    def connections(st):
+        return Counter((c.name, str(c.type), str(c.partner1), str(c.partner2)) for c in st.connections)
+
+    applicable = structure.clone()
+    for i in range(len(applicable) - 1, -1, -1):
+        if applicable[i].num != model_num:
+            del applicable[i]
+    applicable.transform_to_assembly(str(assembly_id), naming, merge_dist=0.)
+    required = set(required_connections)
+    same_links = (required <= {c.name for c in structure.connections}
+                  and required <= {c.name for c in actual.connections}
+                  and connections(applicable) == connections(actual)
+                  and all(actual[0].find_cra(p).atom is not None for c in actual.connections
+                          for p in (c.partner1, c.partner2)))
+    source_ok = (pdb.upper() == original_metadata['pdb'].upper()
+                 and seen_revision == original_metadata['revision'] and digest(source) == original_metadata['sha256'])
+    return {'path': output['path'], 'fixed_original': str(source), 'source_identity_revision_and_hash_ok': source_ok,
+            'entry': pdb, 'revision': seen_revision, 'assembly': str(assembly_id), 'model': model_num,
+            'output_model_matches': len(actual) == 1 and actual[0].num == model_num,
+            'atom_ids_and_altloc_ok': same_identifiers,
+            'coordinates_ok': coordinate_delta is not None and coordinate_delta <= 0.001,
+            'max_coordinate_delta_A': coordinate_delta, 'occupancy_ok': occupancy_delta is not None and occupancy_delta <= 0.0005,
+            'max_occupancy_delta': occupancy_delta, 'applicable_connection_endpoints_ok': same_links,
+            'applicable_connections': len(actual.connections), 'required_connections': sorted(required),
+            'hash_ok': digest(output['path']) == output['qc']['sha256'], 'atoms': len(last)}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', required=True)
@@ -118,9 +173,11 @@ def main():
     samples = {x['id']: x for x in json.loads((run / 'samples.json').read_text())}
     wanted = args.pair or [('1E2E', '1E2D'), ('1QZ5', '2PBD'), ('1FC0', '1EM6'),
                            ('1OLM', '1O6U'), ('1MJ9', '1FY7'), ('1OWZ', '2O7A')]
+    casefiles = [max([p, *p.parent.glob('result.retry*.json')])
+                 for p in sorted((run / 'automated').glob('*/result.json'))]
     checks = []
     for holo, candidate in wanted:
-        casepath = next((run / 'automated').glob(f'holo_{holo}_*/result.json'))
+        casepath = next(p for p in casefiles if p.parent.name.startswith(f'holo_{holo}_'))
         case = json.loads(casepath.read_text())
         row = next(x for x in case['candidates'] if x['pdb'] == candidate)
         evidence = json.loads(Path(row['evidence_path']).read_text())
@@ -138,8 +195,8 @@ def main():
             result.update({'holo': holo, 'candidate': candidate, 'evidence_path': row['evidence_path'],
                            'holo_source_hash_matches': hhash, 'candidate_source_hash_matches': chash})
             checks.append(result)
-    readbacks = []
-    for casepath in sorted((run / 'automated').glob('*/result.json')):
+    readbacks, delivery_checks = [], []
+    for casepath in casefiles:
         case = json.loads(casepath.read_text())
         if case.get('holo_system'):
             info = case['holo_system']
@@ -153,12 +210,26 @@ def main():
                 readbacks.append({'path': info['path'], 'hash_ok': digest(info['path']) == info['qc']['sha256'],
                                   'atoms': s[0].count_atom_sites(),
                                   'atom_count_ok': s[0].count_atom_sites() == info['qc']['expected_atoms']})
+        for delivery in case.get('deliveries', []):
+            h = delivery['holo_identity']
+            c = delivery['apo_original']
+            obs = delivery['apo_observation']
+            targets = {e['id'] for e in case['holo_evidence']['target_connections']}
+            delivery_checks.append(audit_delivery_assembly(
+                delivery['holo_original'], {'pdb': h['pdb_id'], 'revision': h['revision'], 'sha256': h['source_sha256']},
+                h['assembly'], case['holo_evidence']['model'], delivery['holo_assembly'], targets))
+            delivery_checks.append(audit_delivery_assembly(
+                c['path'], {'pdb': delivery['candidate'], 'revision': c['revision'], 'sha256': c['sha256']},
+                obs['assembly'], obs['model'], delivery['apo_assembly']))
     all_pass = all(c['holo_site_matches_source'] and c['candidate_site_observed_count_matches']
                    and c['candidate_contact_set_and_distances_match'] and c['holo_source_hash_matches']
                    and c['candidate_source_hash_matches'] for c in checks)
     all_pass = all_pass and all(x['hash_ok'] and x['atoms'] > 0 and x.get('atom_count_ok', True) for x in readbacks)
+    all_pass = all_pass and all(x['atoms'] > 0 and all(x[k] for k in (
+        'source_identity_revision_and_hash_ok', 'output_model_matches', 'atom_ids_and_altloc_ok', 'coordinates_ok', 'occupancy_ok',
+        'applicable_connection_endpoints_ok', 'hash_ok')) for x in delivery_checks)
     result = {'created_utc': datetime.now(timezone.utc).isoformat(), 'code_sha256': digest(__file__),
-              'checks': checks, 'structure_readbacks': readbacks, 'all_pass': all_pass,
+              'checks': checks, 'structure_readbacks': readbacks, 'delivery_assemblies': delivery_checks, 'all_pass': all_pass,
               'limits': ['Selected after seeing the technical trial; not a blind sample.',
                          'Verifies geometry and source readback, not experimental unbound status or formal Pair acceptance.']}
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +238,7 @@ def main():
     if not snap.exists():
         shutil.copy2(__file__, snap)
     print(json.dumps({'output': str(output), 'source_observations': len(checks),
-                      'structure_readbacks': len(readbacks), 'all_pass': all_pass}))
+                      'structure_readbacks': len(readbacks), 'delivery_assemblies': len(delivery_checks), 'all_pass': all_pass}))
     if not all_pass:
         raise SystemExit(1)
 

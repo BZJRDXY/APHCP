@@ -522,7 +522,7 @@ def main():
                     print('CANDIDATE_DONE', case['id'], item['pdb'], evidence['status'], flush=True)
                 for row in result['candidates']:
                     e = read_json(Path(row['evidence_path']))
-                    if e['scientific_decision']['status'] != 'SUPPORTED_RESEARCH_PAIR':
+                    if not e['scientific_decision'].get('delivery_eligible'):
                         continue
                     obs, = [o for ent in e['entities'] for o in ent['assembly_observations']
                             if o['decision']['status'] == 'SUPPORTED_RESEARCH_PAIR']
@@ -549,7 +549,8 @@ def main():
                         'apo_original': e['candidate_source'], 'apo_assembly': assembly,
                         'apo_observation': {k: obs[k] for k in ('model', 'instance', 'label_asym', 'author_chain', 'assembly')},
                         'holo_target_members': holo['target_members'], 'mapped_site': obs['mapped_site'],
-                        'assessment': obs['decision'], 'candidate_evidence': row['evidence_path']})
+                        'assessment': obs['decision'], 'candidate_experiment': e['scientific_decision']['candidate_experiment'],
+                        'candidate_evidence': row['evidence_path']})
             else:
                 result['candidate_review'] = 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'
         except Exception as exc:
@@ -561,9 +562,19 @@ def main():
               'selected', len(chosen), 'examined', len(result['candidates']), flush=True)
     states = Counter(candidate['status'] for result in results for candidate in result['candidates'])
     research = {}
+    structure_only = Counter()
     for result in results:
-        research[result['system_id']] = [read_json(Path(candidate['evidence_path']))['scientific_decision']['status']
-                                         for candidate in result['candidates']]
+        statuses = []
+        for candidate in result['candidates']:
+            evidence = read_json(Path(candidate['evidence_path']))
+            status = evidence['scientific_decision']['status']
+            statuses.append(status)
+            if status != 'SUPPORTED_RESEARCH_PAIR' and any(
+                o.get('decision', {}).get('site_observation', {}).get('status') == 'OBSERVED_NO_COMPETING_OCCUPANCY'
+                for entity in evidence.get('entities', []) for o in entity.get('assembly_observations', [])
+            ):
+                structure_only[result['system_id']] += 1
+        research[result['system_id']] = statuses
     observations = Counter(o['research_screen'] for result in results for candidate in result['candidates']
                            for e in read_json(Path(candidate['evidence_path'])).get('entities', [])
                            for o in e.get('assembly_observations', [])
@@ -573,6 +584,8 @@ def main():
                'chain_observations': dict(observations), 'formal_pair_acceptances': 0,
                'scientific_rule': apo_c_science.RULE,
                'research_pair_outcomes': dict(Counter(s for values in research.values() for s in values)),
+               'structural_candidates_with_observed_clear_site': sum(structure_only.values()),
+               'holo_with_structural_candidates_with_observed_clear_site': len(structure_only),
                'holo_with_research_pair': sum('SUPPORTED_RESEARCH_PAIR' in values for values in research.values()),
                'research_pairs_delivered': sum(len(r.get('deliveries', [])) for r in results),
                'holo_with_delivered_research_pair': sum(bool(r.get('deliveries')) for r in results),

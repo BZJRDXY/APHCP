@@ -8,10 +8,10 @@ from scipy.spatial import cKDTree
 
 from apo_c_pair import align_coordinates
 from apo_c_triplet_regression import positive_heavy, residue_index
-from holo_source_mapping import assembly_instances, connection_edges
+from holo_source_mapping import assembly_instances, connection_edges, observed_endpoint
 
 
-RULE = 'single-chain-observed-site-v2'
+RULE = 'single-chain-observed-site-v3'
 STANDARD = set('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL'.split())
 
 
@@ -69,33 +69,114 @@ def deposited_target_role(holo, block, structure):
             'source_sha256': holo['source_sha256']}
 
 
-def experiment_record(block, holo_members, holo_block):
+def primary_experiment(block):
+    cat = block.get_mmcif_category('_citation.')
+    for i, key in enumerate(cat.get('id', [])):
+        if key == 'primary':
+            return {k: cat[k][i] for k in ('title', 'pdbx_database_id_DOI', 'pdbx_database_id_PubMed') if k in cat}
+    return {}
+
+
+def experiment_record(block, holo_members, holo_block, binding_role):
     title = text_value(block, '_struct.title')
     growth = block.get_mmcif_category('_exptl_crystal_grow.').get('pdbx_details', [])
     target_codes = {v['component'] for v in holo_members}
     components = holo_block.get_mmcif_category('_chem_comp.')
-    names = set()
+    names = {code.lower() for code in target_codes}
     for i, code in enumerate(components.get('id', [])):
         if code in target_codes:
             for key in ('name', 'pdbx_synonyms'):
                 name = str(components.get(key, [''] * len(components['id']))[i] or '')
                 names.update(v.strip().lower() for v in re.split(r'[;]', name) if len(v.strip()) >= 5)
-    conflicts = []
-    if re.search(r'\b(?:bound|complex(?:ed)? with)\b', title, re.I) and any(
-            re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', title.lower()) for name in names):
+    terms = '|'.join(re.escape(v) for v in sorted(names, key=lambda name: (-len(name), name)))
+    target = r'(?<!\w)(?:' + terms + r')(?!\w)'
+    conflicts, explicit = [], []
+    if re.search(r'\b(?:bound|complex(?:ed)? with)\b', title, re.I) and re.search(target, title, re.I):
         conflicts.append({'field': '_struct.title', 'text': title, 'reason': 'depositor title names the target'})
     for detail in filter(None, growth):
         lower = detail.lower()
-        if any(re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', lower) for name in names):
+        if re.search(r'\b(?:without|absence of|no added)\s+' + target, lower):
+            explicit.append({'field': '_exptl_crystal_grow.pdbx_details', 'text': detail,
+                             'basis': 'TARGET_EXPLICITLY_ABSENT_IN_DEPOSITION'})
+        elif re.search(target, lower):
             conflicts.append({'field': '_exptl_crystal_grow.pdbx_details', 'text': detail})
         elif re.search(r'\b(?:co[- ]?crystallized with|soaked (?:with|in)|in the presence of)\b', lower):
             conflicts.append({'field': '_exptl_crystal_grow.pdbx_details', 'text': detail,
                               'reason': 'added component requires context'})
-    return {'title': title, 'method': text_value(block, '_exptl.method'),
+    apo_title = bool(re.search(r'\b(?:unliganded|ligand[- ]free|apo[- ]?form|apo)\b', title, re.I))
+    cite, holo_cite = primary_experiment(block), primary_experiment(holo_block)
+    common_citation = any(cite.get(key) and holo_cite.get(key) and
+                          str(cite[key]).casefold() == str(holo_cite[key]).casefold()
+                          for key in ('pdbx_database_id_DOI', 'pdbx_database_id_PubMed'))
+    study = cite.get('title') or ''
+    bound_term = binding_role.get('matched_term')
+    # Match the deposition's identified bound ligand to the two states in the
+    # shared primary paper. An apo keyword or a protein-only model is insufficient.
+    paired_study = (apo_title and common_citation and bound_term
+                    and study.casefold() == (holo_cite.get('title') or '').casefold()
+                    and re.search(r'\b(?:apo|unliganded|ligand[- ]free)\b', study, re.I)
+                    and re.search(r'(?<!\w)' + re.escape(bound_term) + r'[- ]bound\b', study, re.I))
+    if paired_study:
+        explicit.append({'field': '_struct.title and _citation.title', 'basis': 'APO_ARM_OF_MATCHED_PRIMARY_EXPERIMENT',
+                         'deposition_title': title, 'paired_primary_citation': cite, 'bound_target_term': bound_term})
+    status = ('CONFLICT' if conflicts else 'EXPLICIT_UNBOUND' if explicit else
+              'DEPOSITION_CONTEXT' if apo_title or re.search(r'\bnative\b', title, re.I) else 'NOT_ESTABLISHED')
+    return {'status': status, 'evidence': explicit, 'title': title, 'method': text_value(block, '_exptl.method'),
             'growth_details': growth, 'citation': block.get_mmcif_category('_citation.'),
-            'native_or_unliganded_title_signal': bool(re.search(r'\b(?:unliganded|ligand[- ]free|apo[- ]?form|apo|native)\b',
-                                                               title, re.I)),
+            'primary_citation': cite, 'source_entry': text_value(block, '_entry.id'),
             'preparation_conflicts_or_unresolved_additions': conflicts}
+
+
+def site_metal_coordination(edges, assembly, instance, residues):
+    """Resolve deposited coordination on the selected model and assembly copy."""
+    operator, label, _ = assembly[instance]
+
+    def residue_matches(end, author, residue):
+        return (residue.subchain == end['label_asym'] and residue.name == end['ccd']
+                and (not end['auth_asym'] or author == end['auth_asym'])
+                and (not end['label_seq'] or str(residue.label_seq) == str(end['label_seq']))
+                and (not end['auth_seq'] or str(residue.seqid.num) == str(end['auth_seq']))
+                and residue.seqid.icode.strip() == str(end.get('insertion') or '').strip())
+
+    def endpoint(end, key, op, author, residue):
+        if not observed_endpoint(end, residue, author):
+            return []
+        return [{'instance': key, 'label_asym': residue.subchain, 'author_chain': author,
+                 'author_seq': str(residue.seqid), 'label_seq': residue.label_seq, 'component': residue.name,
+                 'atom': a.name, 'element': a.element.name, 'is_metal': a.element.is_metal,
+                 'altloc': a.altloc if a.altloc != '\0' else '', 'occupancy': a.occ,
+                 'xyz': [p.x, p.y, p.z]} for a in residue
+                if a.name == end['atom'] and a.occ > 0 and
+                (not end['altloc'] or a.altloc == end['altloc'])
+                for p in [op.transform.apply(a.pos)]]
+
+    records = []
+    for edge in edges:
+        if edge['kind'] != 'metalc':
+            continue
+        for i, site_end in enumerate(edge['ends']):
+            if site_end['label_asym'] != label:
+                continue
+            matched = [(author, r) for author, r in residues if residue_matches(site_end, author, r)]
+            if not matched:
+                continue
+            partner = edge['ends'][1-i]
+            site_atoms = [a for author, r in matched for a in endpoint(site_end, instance, operator, author, r)]
+            partner_atoms = [a for key, (op, subchain, rows) in assembly.items()
+                             if subchain == partner['label_asym'] and operator.transform.approx(op.transform, 1e-6)
+                             for author, r in rows if residue_matches(partner, author, r)
+                             for a in endpoint(partner, key, op, author, r)]
+            resolved = (len(site_atoms) == len(partner_atoms) == 1
+                        and all(e['symmetry'] in (None, '1_555') for e in edge['ends'])
+                        and (site_atoms[0]['is_metal'] or partner_atoms[0]['is_metal']))
+            distance = float(np.linalg.norm(np.subtract(site_atoms[0]['xyz'], partner_atoms[0]['xyz']))) if resolved else None
+            if resolved and (any(a['altloc'] for a in site_atoms + partner_atoms) or not 0 < distance <= 4):
+                resolved = False
+            records.append({'connection': edge, 'site_endpoint': i,
+                            'site_atoms': site_atoms, 'partner_atoms': partner_atoms,
+                            'status': 'COORDINATION_OBSERVED' if resolved else 'DECLARED_COORDINATION_UNRESOLVED',
+                            'observed_distance_A': round(distance, 4) if distance is not None else None})
+    return records
 
 
 def reference_segments(block, accession, author_chain):
@@ -191,6 +272,9 @@ def inspect_observation(obs, holo_geometry, structure, block):
                  str(end.get('insertion') or '').replace('?', '').replace('.', '') in positions)
                 for end in edge['ends']):
             linked_site.append(edge)
+    metal_links = site_metal_coordination(
+        connection_edges(block), assembly, obs['instance'],
+        [cres[n] for n in {row['candidate_label_seq'] for row in obs['mapped_site']} if n in cres])
     contacts = obs['actual_component_contacts'].get('nonwater', [])
     near = [c for c in contacts if c['atoms_within_4A_of_mapped_site'] > 0]
     ambiguous_ligands = []
@@ -250,6 +334,12 @@ def inspect_observation(obs, holo_geometry, structure, block):
         atoms = [a for a in positive_heavy(partners[0], c_op) if not a['altloc']]
         from apo_c_triplet_regression import ccd_heavy_atoms
         expected = ccd_heavy_atoms(block, contact['component'])
+        if any(c['connection']['ends'][1-c['site_endpoint']]['label_asym'] == contact['label_asym']
+               and c['connection']['ends'][1-c['site_endpoint']]['ccd'] == contact['component']
+               and str(c['connection']['ends'][1-c['site_endpoint']]['auth_seq']) == str(partners[0].seqid.num)
+               for c in metal_links):
+            unresolved.append(contact | {'basis': 'DEPOSITED_SITE_COORDINATION'})
+            continue
         if (len(atoms) == 1 and expected == [atoms[0]['name']]
                 and fit and fit[2] <= 1 and projected
                 and all(m['missing_ccd_heavy_atom_names'] == [] for m, _, _ in projected)):
@@ -291,6 +381,7 @@ def inspect_observation(obs, holo_geometry, structure, block):
                                                                       if row.get('author_chain')), None),
             'local_alignment_ca_count': len(alpha_h), 'local_ca_rmsd_A': round(fit[2], 4) if fit else None,
             'near_nonwater_instances': near, 'occupied_subsites': assignments, 'covalent_site_links': linked_site,
+            'site_metal_coordination': metal_links,
             'noncompetitive_companions': companions, 'unresolved_nonwater_contacts': unresolved,
             'zero_occupancy_nearby_components': ambiguous_ligands,
             'holo_site_altloc_positions': sorted(holo_altlocs),
@@ -300,13 +391,17 @@ def inspect_observation(obs, holo_geometry, structure, block):
 def decide_candidate(holo, prepared, evidence):
     if evidence['status'] != 'SOURCE_AND_ENTITY_READ':
         technical = evidence['status'] not in {'SOURCE_ENTITY_NOT_RESOLVED', 'SOURCE_REVISION_CONFLICT_REQUIRES_REVIEW'}
-        return {'rule': RULE, 'status': 'TECHNICAL_GAP' if technical else 'REVIEW', 'reasons': [evidence['status']]}
+        return {'rule': RULE, 'status': 'TECHNICAL_GAP' if technical else 'REVIEW', 'reasons': [evidence['status']],
+                'candidate_experiment': {'status': 'NOT_ASSESSED'}, 'delivery_eligible': False}
     hblock, hs, _, _, _ = prepared
     block = gemmi.cif.read(evidence['candidate_source']['path']).sole_block()
     structure = gemmi.make_structure_from_block(block)
-    experimental = experiment_record(block, holo['target_members'], hblock)
-    hgeom = target_geometry(holo, hs)
     binding_role = deposited_target_role(holo, hblock, hs)
+    experimental = experiment_record(block, holo['target_members'], hblock, binding_role)
+    experimental.update(fixed_revision=evidence['candidate_source']['revision'],
+                        source_sha256=evidence['candidate_source']['sha256'])
+    hgeom = target_geometry(holo, hs)
+    models = [m.num for m in structure]
     members = holo['target_members']
     ordinary_target = (len(members) == 1 and members[0]['entity_type'] == 'EntityType.NonPolymer'
                        and len(members[0]['observed_heavy_atoms']) >= 3
@@ -326,6 +421,9 @@ def decide_candidate(holo, prepared, evidence):
                     obs['decision'] = {'status': 'TECHNICAL_GAP' if obs['status'] == 'TECHNICAL_FAILURE' else 'REVIEW',
                                        'reasons': [obs['status']],
                                        'unknown_holo_positions': [x['holo_label_seq'] for x in obs.get('mapped_site', [])]}
+                obs['decision']['site_observation'] = {'status': 'UNAVAILABLE',
+                    'observed_model': obs.get('model'), 'assembly': obs.get('assembly'), 'instance': obs.get('instance')}
+                obs['decision']['delivery_eligible'] = False
                 observations.append(obs)
                 continue
             identity = len(entity.get('common_uniprot', [])) == 1
@@ -356,8 +454,9 @@ def decide_candidate(holo, prepared, evidence):
                 reasons.append('ALTERNATE_CONFORMATIONS_REQUIRE_REVIEW')
             if facts['covalent_site_links'] or any(r.get('component') not in STANDARD for r in obs['mapped_site']):
                 reasons.append('SITE_MODIFICATION_OR_COVALENT_CONTEXT')
-            if facts['unresolved_nonwater_contacts'] or (facts['noncompetitive_companions'] and not
-                    experimental['native_or_unliganded_title_signal']):
+            if facts['site_metal_coordination']:
+                reasons.append('SITE_METAL_COORDINATION_REQUIRES_REVIEW')
+            if facts['unresolved_nonwater_contacts']:
                 reasons.append('NONWATER_CONTACT_IN_MAPPED_SITE')
             if facts['zero_occupancy_nearby_components']:
                 reasons.append('DEPOSITED_NEARBY_COMPONENT_HAS_ZERO_OCCUPANCY')
@@ -365,18 +464,36 @@ def decide_candidate(holo, prepared, evidence):
                 reasons.append('EXPERIMENT_PREPARATION_CONTEXT_REQUIRES_REVIEW')
             if experimental['method'] != 'X-RAY DIFFRACTION' or len(structure) != 1 or len(hs) != 1:
                 reasons.append('METHOD_OR_MODEL_OUTSIDE_ORDINARY_SCOPE')
+            site_status = ('OCCUPIED' if facts['occupied_subsites'] else
+                           'INCOMPLETE' if missing or not complete_target else
+                           'UNRESOLVED' if (not identity or target_alt or facts['candidate_site_altloc_positions']
+                               or facts['unresolved_nonwater_contacts'] or facts['site_metal_coordination']
+                               or facts['covalent_site_links'] or facts['zero_occupancy_nearby_components']
+                               or any(r.get('component') not in STANDARD for r in obs['mapped_site'])) else
+                           'OBSERVED_NO_COMPETING_OCCUPANCY')
             if ordinary_target and identity and facts['occupied_subsites']:
-                status = 'SCIENTIFIC_EXCLUSION'
-                reasons.insert(0, 'OCCUPIED_MAPPED_SUBSITE')
+                if len(models) == 1:
+                    status = 'SCIENTIFIC_EXCLUSION'
+                    reasons.insert(0, 'OCCUPIED_MAPPED_SUBSITE')
+                else:
+                    status = 'REVIEW'
+                    reasons.insert(0, 'OCCUPIED_IN_INSPECTED_MODEL_OTHER_MODELS_NOT_CHECKED')
             else:
+                if experimental['status'] != 'EXPLICIT_UNBOUND' and experimental['status'] != 'CONFLICT':
+                    reasons.append('EXPERIMENT_UNBOUND_NOT_ESTABLISHED')
                 status = 'REVIEW' if reasons else 'SUPPORTED_RESEARCH_PAIR'
             obs['decision'] = {'status': status, 'reasons': reasons or ['OBSERVED_MAPPED_SITE_WITHOUT_RELATED_MODELLED_OCCUPANCY'],
-                               'unknown_holo_positions': missing, **facts}
+                               'unknown_holo_positions': missing, 'delivery_eligible': status == 'SUPPORTED_RESEARCH_PAIR',
+                               'experimental_state': experimental['status'],
+                               'site_observation': {'status': site_status, 'observed_model': obs['model'],
+                                                    'assembly': obs['assembly'], 'instance': obs['instance'],
+                                                    'unexamined_models': [m for m in models if m != obs['model']]}, **facts}
             observations.append(obs)
     viable = [o for o in observations if o['decision']['status'] == 'SUPPORTED_RESEARCH_PAIR']
     if viable and len(observations) != 1:
         for obs in viable:
-            obs['decision'].update(status='REVIEW', reasons=['CANDIDATE_ASSEMBLY_OR_CHAIN_NOT_UNIQUE'])
+            obs['decision'].update(status='REVIEW', reasons=['CANDIDATE_ASSEMBLY_OR_CHAIN_NOT_UNIQUE'],
+                                   delivery_eligible=False)
     states = [o['decision']['status'] for o in observations]
     if 'SUPPORTED_RESEARCH_PAIR' in states:
         status = 'SUPPORTED_RESEARCH_PAIR'
@@ -387,6 +504,8 @@ def decide_candidate(holo, prepared, evidence):
     else:
         status = 'REVIEW'
     return {'rule': RULE, 'status': status, 'candidate_experiment': experimental, 'holo_target_role': binding_role,
+            'delivery_eligible': status == 'SUPPORTED_RESEARCH_PAIR',
+            'candidate_model_scope': {'deposited': models, 'inspected': models[:1], 'unexamined': models[1:]},
             'observation_states': states,
             'scope': 'Specified positive-occupancy mapped site and deposited experimental assembly/model. '
                      'Supported research pairs require complete ordinary Holo target and a unique candidate chain observation.'}
