@@ -12,7 +12,7 @@ from apo_c_triplet_regression import positive_heavy, residue_index
 from holo_source_mapping import assembly_instances, connection_edges, observed_endpoint
 
 
-RULE = 'single-chain-observed-site-v5'
+RULE = 'single-chain-observed-site-v6'
 STANDARD = set('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL'.split())
 
 
@@ -121,9 +121,14 @@ def experiment_record(block, holo_members, holo_block, binding_role):
                          'deposition_title': title, 'paired_primary_citation': cite, 'bound_target_term': bound_term})
     status = ('CONFLICT' if conflicts else 'EXPLICIT_UNBOUND' if explicit else
               'DEPOSITION_CONTEXT' if apo_title or re.search(r'\bnative\b', title, re.I) else 'NOT_ESTABLISHED')
+    assoc = block.get_mmcif_category('_pdbx_database_related.')
+    related = [{'entry': str(pdb).upper(), 'details': str(detail or '')}
+               for db, pdb, detail in zip(*(assoc.get(k, ()) for k in ('db_name', 'db_id', 'details')))
+               if str(db).upper() == 'PDB' and pdb]
     return {'status': status, 'evidence': explicit, 'title': title, 'method': text_value(block, '_exptl.method'),
             'growth_details': growth, 'citation': block.get_mmcif_category('_citation.'),
             'primary_citation': cite, 'holo_primary_citation': holo_cite, 'source_entry': text_value(block, '_entry.id'),
+            'related_deposits': related,
             'preparation_conflicts_or_unresolved_additions': conflicts}
 
 

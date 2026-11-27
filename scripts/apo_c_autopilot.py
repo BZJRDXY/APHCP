@@ -392,12 +392,14 @@ def read_holo_role(catalog, case):
 
 
 def has_technical_gap(evidence):
+    science = evidence['scientific_decision']
+    literature = science.get('candidate_experiment', {}).get('literature', {})
     return (evidence['scientific_decision']['status'] == 'TECHNICAL_GAP'
             or any(o.get('status') == 'TECHNICAL_FAILURE' for e in evidence.get('entities', [])
                    for o in e.get('assembly_observations', []))
             or bool(evidence.get('candidate_sifts_error'))
-            or bool(evidence['scientific_decision'].get('candidate_experiment', {}).get('literature', {}).get('fetch_error')
-                    and not evidence['scientific_decision'].get('delivery_eligible')))
+            or bool((literature.get('fetch_error') or literature.get('related_deposit_fetch_error'))
+                    and not science.get('delivery_eligible')))
 
 
 def source_hints(origins):
@@ -579,12 +581,15 @@ def main():
     p.add_argument('--reuse-search-run', help='prior Run with the identical Holo search implementation and inputs')
     p.add_argument('--per-source-rank', type=int, default=3)
     p.add_argument('--max-unique-per-holo', type=int, default=6)
+    p.add_argument('--max-candidate-download-attempts', type=int, default=10)
     p.add_argument('--literature-cache', help='shared author-source cache, defaults to the parent of the Run directory')
     p.add_argument('--retry-failed', action='store_true',
                    help='Retry missing search pages, fixed inputs, and technical observations in an existing run')
     args = p.parse_args()
     if not 1 <= args.per_source_rank <= 10 or not 1 <= args.max_unique_per_holo <= 30:
         p.error('invalid candidate inspection budget')
+    if args.max_candidate_download_attempts < 0:
+        p.error('invalid candidate download budget')
     run, sample_path = Path(args.run), Path(args.samples)
     literature_cache = Path(args.literature_cache).resolve() if args.literature_cache else run.parent.resolve() / '.apo-literature-cache'
     deps = [Path(__file__), Path(apo_c_pilot.__file__), Path(apo_c_pair.__file__),
@@ -595,7 +600,8 @@ def main():
               'index': str(Path(args.index).resolve()), 'per_source_rank': args.per_source_rank,
               'max_unique_per_holo': args.max_unique_per_holo, 'max_compressed_bytes': 20000000,
               'max_asymmetric_unit_atoms': 200000, 'max_assembly_instances': 128,
-              'max_candidate_download_attempts': 10, 'max_derivative_assemblies_per_candidate': 2,
+              'max_candidate_download_attempts': args.max_candidate_download_attempts,
+              'max_derivative_assemblies_per_candidate': 2,
               'download_deadline_seconds': 30, 'download_order': 'round-robin-holo-missing-originals',
               'assembly_scope': 'mapped-receptor-site',
               'reuse_runs': [str(Path(x).resolve()) for x in args.reuse_run],
@@ -617,10 +623,13 @@ def main():
     if args.reuse_search_run:
         reuse_searches(run, args.reuse_search_run)
     config['retry_failed'] = args.retry_failed
+    scan_start = time.monotonic()
     apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
+    inspection_start = time.monotonic()
     literature = apo_c_literature.PrimaryLiterature(run, literature_cache)
     results = run_in_download_order(
         run_case(run, case, config, literature) for case in read_json(run / 'samples.json'))
+    inspection_seconds = round(time.monotonic() - inspection_start, 3)
     states = Counter(candidate['status'] for result in results for candidate in result['candidates'])
     research = {}
     structure_only = Counter()
@@ -641,6 +650,7 @@ def main():
                            for o in e.get('assembly_observations', [])
                            if 'research_screen' in o)
     summary = {'started_utc': started, 'finished_utc': now(), 'elapsed_s': round(time.monotonic() - clock, 3),
+               'search_elapsed_s': round(inspection_start - scan_start, 3), 'inspection_elapsed_s': inspection_seconds,
                'holo_dispatched': len(results), 'candidate_entry_outcomes': dict(states),
                'chain_observations': dict(observations), 'formal_pair_acceptances': 0,
                'scientific_rule': apo_c_science.RULE,

@@ -13,7 +13,8 @@ import apo_c_pair
 import apo_c_pilot
 import apo_c_triplet_regression
 import holo_source_mapping
-from apo_c_pair import anchored_end_alignment, get_sequence, reference_positions, revision, sequence_map
+from apo_c_pair import (anchored_end_alignment, deposited_tag_positions, get_sequence, reference_positions,
+                        revision, sequence_map, tagged_end_alignment)
 from apo_c_pilot import now, read_json, sha, write_json
 from apo_c_triplet_regression import (component_contacts, deposited_metadata, positive_heavy,
                                       residue_index, unobserved_records)
@@ -93,14 +94,19 @@ def candidate_evidence(run, holo, pdb, source_rows, q, qblock, qstruct, qseq, qs
         cacc = accessions(block, entity_id)
         common = sorted(set(q['sifts_common_uniprot'] or []) & set(cacc))
         mapping, alignment = sequence_map(qseq, cseq)
-        if len(common) == 1 and len(qseq) != len(cseq) and not alignment['mismatches']:
+        if len(common) == 1 and (len(qseq) != len(cseq) or alignment['mismatches']):
             h_authors = {row['author_chain'] for row in qsite.values()}
             c_authors = {chain.name for chain, _ in chain_match}
             if len(h_authors) == 1:
-                h_ref = reference_positions(qblock, common[0], next(iter(h_authors)))
+                h_author = next(iter(h_authors))
+                h_ref = reference_positions(qblock, common[0], h_author)
                 refs = [reference_positions(block, common[0], chain) for chain in sorted(c_authors)]
                 if refs and refs[0] and all(ref == refs[0] for ref in refs):
-                    mapping, alignment = anchored_end_alignment(qseq, cseq, mapping, alignment, h_ref, refs[0], qsite)
+                    h_tags = deposited_tag_positions(qblock, common[0], h_author)
+                    c_tags = set.intersection(*(deposited_tag_positions(block, common[0], chain) for chain in c_authors))
+                    tagged = tagged_end_alignment(qseq, cseq, alignment, h_ref, refs[0], qsite, h_tags, c_tags)
+                    mapping, alignment = tagged or anchored_end_alignment(
+                        qseq, cseq, mapping, alignment, h_ref, refs[0], qsite)
         covered = {x: mapping[x] for x in qsite if x in mapping}
         record = {'entity_id': entity_id, 'source_accessions': cacc, 'common_uniprot': common,
                   'sequence_alignment': alignment, 'holo_site_residues': len(qsite),

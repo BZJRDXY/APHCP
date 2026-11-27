@@ -148,6 +148,51 @@ def reference_positions(block, accession, author_chain):
     return positions if len(set(positions.values())) == len(positions) else {}
 
 
+def deposited_tag_positions(block, accession, author_chain):
+    differences = block.get_mmcif_category('_struct_ref_seq_dif.')
+    fields = ('pdbx_seq_db_accession_code', 'pdbx_pdb_strand_id', 'seq_num', 'pdbx_seq_db_seq_num', 'details')
+    return {int(label) for acc, chain, label, db_pos, detail in zip(*(differences.get(k, ()) for k in fields))
+            if acc == accession and chain == author_chain and str(label).isdecimal()
+            and db_pos in (None, False, '.', '?')
+            and str(detail).strip().casefold() in {'expression tag', 'initiating methionine'}}
+
+
+def exact_aligned_span(query, target, alignment, holo_start, candidate_start, count, basis, anchor_count):
+    holo_end, candidate_end = holo_start + count - 1, candidate_start + count - 1
+    corrected = dict(zip(range(holo_start, holo_end + 1), range(candidate_start, candidate_end + 1)))
+    operations = [(holo_start - 1, 'I'), (candidate_start - 1, 'D'), (count, 'M'),
+                  (len(query) - holo_end, 'I'), (len(target) - candidate_end, 'D')]
+    return corrected, alignment | {
+        'basis': basis, 'reference_anchor_count': anchor_count,
+        'cigar': ''.join(f'{n}{op}' for n, op in operations if n),
+        'paired_positions': count, 'identity_on_aligned_positions': 1.0, 'mismatches': [],
+        'query_coverage': count / len(query), 'candidate_coverage': count / len(target),
+        'unaligned_holo_positions': [q for q in range(1, len(query) + 1) if q not in corrected],
+        'unaligned_candidate_positions': [t for t in range(1, len(target) + 1) if not candidate_start <= t <= candidate_end]}
+
+
+def tagged_end_alignment(query, target, alignment, holo_reference, candidate_reference, site, holo_tags, candidate_tags):
+    """Align identical reference cores when all extra residues are depositor-tagged ends."""
+    if not holo_reference or len(holo_reference) != len(candidate_reference) or not set(site) <= holo_reference.keys():
+        return None
+    count = len(holo_reference)
+    a, b = min(holo_reference), min(candidate_reference)
+    span = list(range(holo_reference[a], holo_reference[a] + count))
+    left = list(range(a, a + count))
+    right = list(range(b, b + count))
+    if (left[-1] > len(query) or right[-1] > len(target)
+            or [holo_reference.get(q) for q in left] != span
+            or [candidate_reference.get(t) for t in right] != span
+            or query[a - 1:left[-1]] != target[b - 1:right[-1]]):
+        return None
+    extra_holo = set(range(1, len(query) + 1)) - set(left)
+    extra_candidate = set(range(1, len(target) + 1)) - set(right)
+    if not (extra_holo or extra_candidate) or not extra_holo <= holo_tags or not extra_candidate <= candidate_tags:
+        return None
+    return exact_aligned_span(query, target, alignment, a, b, count,
+                              'FIXED_UNIPROT_CORE_AND_ANNOTATED_TERMINAL_TAGS', count)
+
+
 def anchored_end_alignment(query, target, mapping, alignment, holo_reference, candidate_reference, site):
     """Resolve equivalent gap placements for a construct with an exact end extension."""
     if len(query) == len(target) or alignment['mismatches'] or not set(site) <= holo_reference.keys():
@@ -167,15 +212,8 @@ def anchored_end_alignment(query, target, mapping, alignment, holo_reference, ca
     corrected = dict(zip(range(h_start, h_end + 1), range(c_start, c_end + 1)))
     if any(corrected.get(q) != c for q, c in anchors.items()) or corrected == mapping:
         return mapping, alignment
-    operations = [(h_start - 1, 'I'), (c_start - 1, 'D'), (count, 'M'),
-                  (len(query) - h_end, 'I'), (len(target) - c_end, 'D')]
-    return corrected, alignment | {
-        'basis': 'FIXED_UNIPROT_END_ALIGNMENT', 'reference_anchor_count': len(anchors),
-        'cigar': ''.join(f'{n}{op}' for n, op in operations if n),
-        'paired_positions': count, 'identity_on_aligned_positions': 1.0,
-        'query_coverage': count / len(query), 'candidate_coverage': count / len(target),
-        'unaligned_holo_positions': [q for q in range(1, len(query) + 1) if q not in corrected],
-        'unaligned_candidate_positions': [t for t in range(1, len(target) + 1) if not c_start <= t <= c_end]}
+    return exact_aligned_span(query, target, alignment, h_start, c_start, count,
+                              'FIXED_UNIPROT_END_ALIGNMENT', len(anchors))
 
 
 def atom_pos(atom, operator):

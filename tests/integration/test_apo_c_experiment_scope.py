@@ -10,7 +10,7 @@ import gemmi
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from apo_c_literature import PrimaryLiterature, accession_conflict, accession_state
-from apo_c_pair import anchored_end_alignment
+from apo_c_pair import anchored_end_alignment, tagged_end_alignment
 from apo_c_priority import order_rankings
 from apo_c_science import complete_altlocs, experiment_record
 
@@ -179,6 +179,55 @@ class ExperimentScopeTests(unittest.TestCase):
                                                        q_ref, c_ref, {3, 4})
         self.assertEqual(resolved[6], 6)
         self.assertEqual(alignment['unaligned_candidate_positions'], [7, 8])
+
+    def test_tagged_ends_allow_only_an_identical_deposited_core(self):
+        left, right = list('HHACDE'), list('MSGACDE')
+        left_ref = dict(zip(range(3, 7), range(10, 14)))
+        right_ref = dict(zip(range(4, 8), range(10, 14)))
+        mapping, identity = tagged_end_alignment(
+            left, right, {'mismatches': [1]}, left_ref, right_ref, {4, 5}, {1, 2}, {1, 2, 3})
+        self.assertEqual(mapping, {3: 4, 4: 5, 5: 6, 6: 7})
+        self.assertEqual(identity['unaligned_holo_positions'], [1, 2])
+        self.assertEqual(identity['mismatches'], [])
+        self.assertIsNone(tagged_end_alignment(
+            left, list('MSGACNE'), {}, left_ref, right_ref, {4, 5}, {1, 2}, {1, 2, 3}))
+        self.assertIsNone(tagged_end_alignment(
+            left, right, {}, left_ref, right_ref, {4, 5}, {1, 2}, {1, 3}))
+        self.assertIsNone(tagged_end_alignment(
+            left, right, {}, left_ref, right_ref, {1, 5}, {1, 2}, {1, 2, 3}))
+
+    def test_author_state_by_accession_and_matching_crystallization_methods(self):
+        doc = ET.fromstring("""
+            <article><body><sec><p>Human enzyme-A was crystallized in its apo form and in complexes with phosphate.</p></sec>
+            <p>PDB codes: Human enzyme-A (#9XYZ), Human enzyme-A bound to phosphate (#9XYA).</p>
+            <p>Data deposition: Inhibitor-bound enzyme (accession number 9XYB) and apo-form enzyme-C
+            (accession number 9XYC) were deposited in the Protein Data Bank.</p></body></article>
+        """)
+        self.assertEqual(accession_state(doc, '9XYZ')[0], 'ARTICLE_METHODS_WITH_DEPOSITION_GROUP')
+        self.assertEqual(accession_state(doc, '9XYC')[0], 'ARTICLE_STATE_BEFORE_ACCESSION')
+        self.assertIsNone(accession_state(doc, '9XYA'))
+        self.assertIsNone(accession_state(doc, '9XYB'))
+        self.assertIsNone(accession_state(ET.fromstring(
+            '<article><body><p>PDB codes: Human enzyme-A (#9XYZ), Human enzyme-A bound to phosphate (#9XYA).'
+            '</p></body></article>'), '9XYZ'))
+
+    def test_related_deposition_requires_same_primary_study_and_incoming_apo_label(self):
+        import json
+
+        reader = PrimaryLiterature(None)
+        citation = {'pdbx_database_id_PubMed': '123', 'pdbx_database_id_DOI': '10.0000/control'}
+        reader.get_document = lambda _: ({'status': 'PRIMARY_CITATION_READ', 'pmid': '123'}, '', None)
+        deposited = {'rcsb_id': '9XYA', 'rcsb_primary_citation': dict(citation),
+                     'pdbx_database_related': [{'db_name': 'PDB', 'db_id': '9XYZ', 'details': 'unliganded protein'}]}
+        reader.get = lambda *args, **kwargs: (json.dumps(deposited).encode(), {'status': 200})
+        info = {'primary_citation': citation, 'source_entry': '9XYZ', 'title': 'Crystal structure',
+                'related_deposits': [{'entry': '9XYA', 'details': 'related crystal form'}]}
+        self.assertEqual(reader.assess(info)['support']['basis'], 'RECIPROCAL_PDB_DEPOSITION_SAME_PRIMARY_STUDY')
+        deposited['rcsb_primary_citation']['pdbx_database_id_DOI'] = '10.0000/unrelated'
+        self.assertNotIn('support', reader.assess(info))
+        deposited['rcsb_primary_citation'] = citation
+        deposited['pdbx_database_related'][0]['details'] = 'not unliganded'
+        self.assertNotIn('support', reader.assess(info))
 
     def test_rank_order_removes_wrong_domain_and_promotes_unbound_hint(self):
         def entry(pdb, title, begin):
