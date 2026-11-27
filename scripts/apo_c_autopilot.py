@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 import requests
 from scipy.spatial import cKDTree
 
+import apo_c_literature
 import apo_c_pair
 import apo_c_pilot
 import apo_c_rank_audit
@@ -388,12 +389,75 @@ def has_technical_gap(evidence):
     return (evidence['scientific_decision']['status'] == 'TECHNICAL_GAP'
             or any(o.get('status') == 'TECHNICAL_FAILURE' for e in evidence.get('entities', [])
                    for o in e.get('assembly_observations', []))
-            or bool(evidence.get('candidate_sifts_error')))
+            or bool(evidence.get('candidate_sifts_error'))
+            or bool(evidence['scientific_decision'].get('candidate_experiment', {}).get('literature', {}).get('fetch_error')
+                    and not evidence['scientific_decision'].get('delivery_eligible')))
 
 
 def source_hints(origins):
     return {(name, tuple(row.get(k) for k in ('entity', 'author_chain', 'assembly', 'chain_instance')))
             for name, route in origins.items() for row in route['source_rows']}
+
+
+def materialize_candidate(evidence, pdb, directory, limit):
+    observations = [o for e in evidence.get('entities', []) for o in e.get('assembly_observations', [])
+                    if o.get('status') == 'ACTUAL_CONTACTS_MEASURED']
+    accepted = {o['assembly'] for o in observations if o['decision']['delivery_eligible']}
+    measured = {o['assembly'] for o in observations}
+    selected = sorted(accepted) + sorted(measured - accepted)[:max(0, limit - len(accepted))]
+    assets = []
+    if selected:
+        candidate = gemmi.read_structure(evidence['candidate_source']['path'])
+        for assembly in selected:
+            out = directory / f'{pdb}_assembly_{assembly}.cif'
+            attempt = 1
+            while out.exists():
+                attempt += 1
+                out = directory / f'{pdb}_assembly_{assembly}_attempt{attempt:03d}.cif'
+            qc = apo_c_pair.write_assembly(candidate, assembly, out)
+            assets.append({'assembly': assembly, 'path': str(out), 'qc': qc})
+    return assets
+
+
+def deliver_observations(case, holo, prepared, candidates, directory):
+    deliveries = []
+    holo_asset = None
+    for row in candidates:
+        evidence = read_json(Path(row['evidence_path']))
+        scientific = evidence['scientific_decision']
+        if not scientific.get('delivery_eligible'):
+            continue
+        assemblies = {a['assembly']: a for a in evidence['materialized_assemblies']}
+        accepted = [o for e in evidence['entities'] for o in e['assembly_observations']
+                    if o['decision']['delivery_eligible']]
+        if holo_asset is None:
+            path = directory / 'holo_full_assembly.cif'
+            attempt = 1
+            while path.exists() and not path.with_suffix('.json').exists():
+                attempt += 1
+                path = directory / f'holo_full_assembly_attempt{attempt:03d}.cif'
+            if not path.exists():
+                qc = apo_c_pair.write_assembly(prepared[1], str(case['identity']['assembly']), path,
+                        required_connections={edge['id'] for edge in holo['target_connections']})
+                write_json(path.with_suffix('.json'), qc)
+            qc = read_json(path.with_suffix('.json'))
+            if sha(path) != qc['sha256']:
+                raise ValueError('delivered Holo assembly differs from readback')
+            holo_asset = {'path': str(path), 'qc': qc}
+        for assembly_id in {o['assembly'] for o in accepted}:
+            assembly = assemblies[assembly_id]
+            if sha(Path(assembly['path'])) != assembly['qc']['sha256']:
+                raise ValueError('delivered Apo assembly differs from readback')
+        for obs in accepted:
+            deliveries.append({
+                'system_id': case['id'], 'candidate': row['pdb'], 'role_evidence': scientific['holo_target_role'],
+                'holo_identity': holo['identity'], 'holo_original': holo['source'], 'holo_assembly': holo_asset,
+                'apo_original': evidence['candidate_source'], 'apo_assembly': assemblies[obs['assembly']],
+                'apo_observation': {k: obs[k] for k in ('model', 'instance', 'label_asym', 'author_chain', 'assembly')},
+                'holo_target_members': holo['target_members'], 'mapped_site': obs['mapped_site'],
+                'assessment': obs['decision'], 'candidate_experiment': scientific['candidate_experiment'],
+                'candidate_evidence': row['evidence_path']})
+    return deliveries
 
 
 def main():
@@ -415,7 +479,7 @@ def main():
     run, sample_path = Path(args.run), Path(args.samples)
     deps = [Path(__file__), Path(apo_c_pilot.__file__), Path(apo_c_pair.__file__),
             Path(apo_c_rank_audit.__file__), Path(apo_c_science.__file__), Path(apo_c_triplet_regression.__file__),
-            Path(apo_c_union_triage.__file__), Path(holo_source_mapping.__file__)]
+            Path(apo_c_union_triage.__file__), Path(holo_source_mapping.__file__), Path(apo_c_literature.__file__)]
     config = {'sample_spec_sha256': sha(sample_path), 'catalog': str(Path(args.catalog).resolve()),
               'index': str(Path(args.index).resolve()), 'per_source_rank': args.per_source_rank,
               'max_unique_per_holo': args.max_unique_per_holo, 'max_compressed_bytes': 20000000,
@@ -441,6 +505,7 @@ def main():
         reuse_searches(run, args.reuse_search_run)
     config['retry_failed'] = args.retry_failed
     apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
+    literature = apo_c_literature.PrimaryLiterature(run)
     results = []
     for case in read_json(run / 'samples.json'):
         key = case['id'].replace(':', '_')
@@ -495,21 +560,10 @@ def main():
                     print('CANDIDATE_START', case['id'], item['pdb'], flush=True)
                     try:
                         evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config)
-                        evidence['scientific_decision'] = apo_c_science.decide_candidate(holo, prepared, evidence)
-                        selected_assemblies = sorted({o['assembly'] for e in evidence.get('entities', [])
-                                for o in e.get('assembly_observations', [])
-                                if o.get('status') == 'ACTUAL_CONTACTS_MEASURED'})[:config['max_derivative_assemblies_per_candidate']]
-                        evidence['materialized_assemblies'] = []
-                        if selected_assemblies:
-                            candidate = gemmi.read_structure(evidence['candidate_source']['path'])
-                            for assembly in selected_assemblies:
-                                out = derived / f"{item['pdb']}_assembly_{assembly}.cif"
-                                attempt = 1
-                                while out.exists():
-                                    attempt += 1
-                                    out = derived / f"{item['pdb']}_assembly_{assembly}_attempt{attempt:03d}.cif"
-                                qc = apo_c_pair.write_assembly(candidate, assembly, out)
-                                evidence['materialized_assemblies'].append({'assembly': assembly, 'path': str(out), 'qc': qc})
+                        evidence['scientific_decision'] = apo_c_science.decide_candidate(
+                            holo, prepared, evidence, literature.assess)
+                        evidence['materialized_assemblies'] = materialize_candidate(
+                            evidence, item['pdb'], derived, config['max_derivative_assemblies_per_candidate'])
                     except Exception as exc:
                         evidence = {'status': 'TECHNICAL_FAILURE', 'pdb': item['pdb'],
                                     'error': f'{type(exc).__name__}: {exc}',
@@ -520,37 +574,7 @@ def main():
                     result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
                                                  'evidence_path': str(candidate_path)})
                     print('CANDIDATE_DONE', case['id'], item['pdb'], evidence['status'], flush=True)
-                for row in result['candidates']:
-                    e = read_json(Path(row['evidence_path']))
-                    if not e['scientific_decision'].get('delivery_eligible'):
-                        continue
-                    obs, = [o for ent in e['entities'] for o in ent['assembly_observations']
-                            if o['decision']['status'] == 'SUPPORTED_RESEARCH_PAIR']
-                    assembly, = [i for i in e['materialized_assemblies'] if i['assembly'] == obs['assembly']]
-                    full_holo = derived / 'holo_full_assembly.cif'
-                    if full_holo.exists() and not full_holo.with_suffix('.json').exists():
-                        n = 2
-                        while (derived / f'holo_full_assembly_attempt{n:03d}.cif').exists() and not (
-                               derived / f'holo_full_assembly_attempt{n:03d}.json').exists():
-                            n += 1
-                        full_holo = derived / f'holo_full_assembly_attempt{n:03d}.cif'
-                    if not full_holo.exists():
-                        holo_qc = apo_c_pair.write_assembly(
-                            prepared[1], str(case['identity']['assembly']), full_holo,
-                            required_connections={edge['id'] for edge in holo['target_connections']})
-                        write_json(full_holo.with_suffix('.json'), holo_qc)
-                    holo_qc = read_json(full_holo.with_suffix('.json'))
-                    if sha(full_holo) != holo_qc['sha256'] or sha(Path(assembly['path'])) != assembly['qc']['sha256']:
-                        raise ValueError('delivered assembly differs from readback')
-                    result['deliveries'].append({
-                        'system_id': case['id'], 'candidate': row['pdb'], 'role_evidence': e['scientific_decision']['holo_target_role'],
-                        'holo_identity': holo['identity'], 'holo_original': holo['source'],
-                        'holo_assembly': {'path': str(full_holo), 'qc': holo_qc},
-                        'apo_original': e['candidate_source'], 'apo_assembly': assembly,
-                        'apo_observation': {k: obs[k] for k in ('model', 'instance', 'label_asym', 'author_chain', 'assembly')},
-                        'holo_target_members': holo['target_members'], 'mapped_site': obs['mapped_site'],
-                        'assessment': obs['decision'], 'candidate_experiment': e['scientific_decision']['candidate_experiment'],
-                        'candidate_evidence': row['evidence_path']})
+                result['deliveries'] = deliver_observations(case, holo, prepared, result['candidates'], derived)
             else:
                 result['candidate_review'] = 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'
         except Exception as exc:

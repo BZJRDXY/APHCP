@@ -11,7 +11,7 @@ from apo_c_triplet_regression import positive_heavy, residue_index
 from holo_source_mapping import assembly_instances, connection_edges, observed_endpoint
 
 
-RULE = 'single-chain-observed-site-v3'
+RULE = 'single-chain-observed-site-v4'
 STANDARD = set('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL'.split())
 
 
@@ -109,13 +109,12 @@ def experiment_record(block, holo_members, holo_block, binding_role):
                           str(cite[key]).casefold() == str(holo_cite[key]).casefold()
                           for key in ('pdbx_database_id_DOI', 'pdbx_database_id_PubMed'))
     study = cite.get('title') or ''
-    bound_term = binding_role.get('matched_term')
-    # Match the deposition's identified bound ligand to the two states in the
-    # shared primary paper. An apo keyword or a protein-only model is insufficient.
+    aliases = [binding_role.get('matched_term'), *sorted(names, key=lambda name: (-len(name), name))]
+    bound_term = next((term for term in aliases if term
+        and re.search(r'(?<!\w)' + re.escape(term) + r'[- ]bound\b', study, re.I)), None)
     paired_study = (apo_title and common_citation and bound_term
                     and study.casefold() == (holo_cite.get('title') or '').casefold()
-                    and re.search(r'\b(?:apo|unliganded|ligand[- ]free)\b', study, re.I)
-                    and re.search(r'(?<!\w)' + re.escape(bound_term) + r'[- ]bound\b', study, re.I))
+                    and re.search(r'\b(?:apo|unliganded|ligand[- ]free)\b', study, re.I))
     if paired_study:
         explicit.append({'field': '_struct.title and _citation.title', 'basis': 'APO_ARM_OF_MATCHED_PRIMARY_EXPERIMENT',
                          'deposition_title': title, 'paired_primary_citation': cite, 'bound_target_term': bound_term})
@@ -237,24 +236,65 @@ def target_geometry(holo, holo_structure):
     return op, residues, members, altlocs
 
 
-def inspect_observation(obs, holo_geometry, structure, block):
+def complete_altlocs(atoms, required):
+    """Check each measured local conformation together with its shared atoms."""
+    locations = {a['altloc'] for a in atoms if a['altloc']}
+    return all(required <= {a['name'] for a in atoms if a['altloc'] in ('', alt)}
+               for alt in locations)
+
+
+def end_segments_only(positions, length):
+    if not positions:
+        return True
+    shared = set(range(1, length + 1)).difference(positions)
+    if not shared:
+        return False
+    first, last = min(shared), max(shared)
+    return all(p < first or p > last for p in positions)
+
+
+def compare_construct(alignment, hres, hop, holo_site, cres, op, site_coords):
+    left = alignment['unaligned_holo_positions']
+    right = alignment['unaligned_candidate_positions']
+    if not left and not right and alignment['identity_on_aligned_positions'] == 1:
+        return {'status': 'IDENTICAL'}
+    record = {'status': 'UNRESOLVED', 'unaligned_holo_positions': left,
+              'unaligned_candidate_positions': right}
+    if (alignment['identity_on_aligned_positions'] != 1
+            or not end_segments_only(left, alignment['query_length'])
+            or not end_segments_only(right, alignment['candidate_length'])
+            or set(left).intersection(holo_site)):
+        return record
+    holo_coords = [a['xyz'] for p in holo_site for a in positive_heavy(hres[p][1], hop)]
+    for positions, index, operator, site in ((left, hres, hop, holo_coords), (right, cres, op, site_coords)):
+        extension = [a['xyz'] for p in positions if p in index for a in positive_heavy(index[p][1], operator)]
+        if extension and min(cKDTree(site).query(extension)[0]) <= 4:
+            return record | {'basis': 'TERMINAL_RESIDUES_CONTACT_THE_OBSERVED_SITE'}
+    return record | {'status': 'TERMINAL_ONLY_OUTSIDE_OBSERVED_SITE'}
+
+
+def inspect_observation(obs, holo_geometry, structure, block, alignment):
     hop, hres, members, holo_altlocs = holo_geometry
     assembly = assembly_instances(structure, str(obs['assembly']), structure[0], include_water=True)
     op, label, rows = assembly[obs['instance']]
     cres = residue_index(rows)
     coordinates, alpha_h, alpha_c = defaultdict(list), [], []
-    uncertain_altlocs = []
+    candidate_altlocs, incomplete_altlocs = [], []
     for row in obs['mapped_site']:
         q, n = row['holo_label_seq'], row['candidate_label_seq']
         if n not in cres:
             continue
         residue = cres[n][1]
         atoms = positive_heavy(residue, op)
+        holo_atoms = positive_heavy(hres[q][1], hop)
+        required = {a['name'] for a in holo_atoms}
+        if not complete_altlocs(holo_atoms, required) or not complete_altlocs(atoms, required):
+            incomplete_altlocs.append(q)
         if any(a['altloc'] for a in atoms):
-            uncertain_altlocs.append(q)
+            candidate_altlocs.append(q)
         for a in atoms:
             coordinates[q].append(a)
-        hca = next((a for a in positive_heavy(hres[q][1], hop) if a['name'] == 'CA' and not a['altloc']), None)
+        hca = next((a for a in holo_atoms if a['name'] == 'CA' and not a['altloc']), None)
         cca = next((a for a in atoms if a['name'] == 'CA' and not a['altloc']), None)
         hp, cp = (hca['xyz'] if hca else None), (cca['xyz'] if cca else None)
         if hp is not None and cp is not None:
@@ -278,7 +318,8 @@ def inspect_observation(obs, holo_geometry, structure, block):
     contacts = obs['actual_component_contacts'].get('nonwater', [])
     near = [c for c in contacts if c['atoms_within_4A_of_mapped_site'] > 0]
     ambiguous_ligands = []
-    site_tree = cKDTree([a['xyz'] for values in coordinates.values() for a in values])
+    site_coords = [a['xyz'] for atoms in coordinates.values() for a in atoms]
+    site_tree = cKDTree(site_coords)
     for instance, (comp_op, _, residues) in assembly.items():
         if instance == obs['instance']:
             continue
@@ -385,10 +426,13 @@ def inspect_observation(obs, holo_geometry, structure, block):
             'noncompetitive_companions': companions, 'unresolved_nonwater_contacts': unresolved,
             'zero_occupancy_nearby_components': ambiguous_ligands,
             'holo_site_altloc_positions': sorted(holo_altlocs),
-            'candidate_site_altloc_positions': uncertain_altlocs}
+            'candidate_site_altloc_positions': candidate_altlocs,
+            'incomplete_site_altloc_positions': incomplete_altlocs,
+            'construct_comparison': compare_construct(alignment, hres, hop,
+                [r['holo_label_seq'] for r in obs['mapped_site']], cres, op, site_coords)}
 
 
-def decide_candidate(holo, prepared, evidence):
+def decide_candidate(holo, prepared, evidence, literature=None):
     if evidence['status'] != 'SOURCE_AND_ENTITY_READ':
         technical = evidence['status'] not in {'SOURCE_ENTITY_NOT_RESOLVED', 'SOURCE_REVISION_CONFLICT_REQUIRES_REVIEW'}
         return {'rule': RULE, 'status': 'TECHNICAL_GAP' if technical else 'REVIEW', 'reasons': [evidence['status']],
@@ -408,7 +452,10 @@ def decide_candidate(holo, prepared, evidence):
                        and not holo['external_covalent_connections'])
     complete_target = ordinary_target and members[0]['missing_ccd_heavy_atom_names'] == []
     target_alt = any(a['altloc'] for m in members for a in m['observed_heavy_atoms'])
+    target_alt_complete = all(complete_altlocs(m['observed_heavy_atoms'],
+                                              set(m['observed_heavy_atom_names'])) for m in members)
     observations = []
+    pending_experiment = []
     for entity in evidence.get('entities', []):
         obs_rows = entity.get('assembly_observations', [])
         for obs in obs_rows:
@@ -430,7 +477,7 @@ def decide_candidate(holo, prepared, evidence):
             if 'sifts_chain_mappings' in entity:
                 identity = identity and any(m['struct_asym_id'] == obs['label_asym'] for rows in
                                            entity['sifts_chain_mappings'].values() for m in rows)
-            facts = inspect_observation(obs, hgeom, structure, block)
+            facts = inspect_observation(obs, hgeom, structure, block, entity['sequence_alignment'])
             missing = [row['holo_label_seq'] for row in obs['mapped_site']
                        if not row.get('observed_positive_heavy_atoms') or
                        not row.get('same_residue_component') or row.get('missing_relative_holo_heavy_atoms')]
@@ -444,13 +491,14 @@ def decide_candidate(holo, prepared, evidence):
                 reasons.append('HOLO_ROLE_OR_SCOPE_QC_PENDING')
             if missing:
                 reasons.append('MAPPED_SITE_NOT_FULLY_OBSERVED')
-            al = entity['sequence_alignment']
-            if (al['query_length'] != al['candidate_length'] or al['query_coverage'] != 1
-                    or al['identity_on_aligned_positions'] != 1):
+            if facts['construct_comparison']['status'] == 'UNRESOLVED':
                 reasons.append('CONSTRUCT_DIFF_REQUIRES_REVIEW')
-            # When the Holo target itself has a single shared coordinate set, testing
-            # the union of its receptor contacts only enlarges the required observed site.
-            if target_alt or facts['candidate_site_altloc_positions']:
+            has_altlocs = target_alt or facts['candidate_site_altloc_positions'] or facts['holo_site_altloc_positions']
+            # The union of measured conformations can establish absence of nearby components.
+            # A real contact with alternate positions needs assessment in compatible conformations.
+            altloc_pending = bool(has_altlocs and (not target_alt_complete
+                or facts['incomplete_site_altloc_positions'] or facts['near_nonwater_instances']))
+            if altloc_pending:
                 reasons.append('ALTERNATE_CONFORMATIONS_REQUIRE_REVIEW')
             if facts['covalent_site_links'] or any(r.get('component') not in STANDARD for r in obs['mapped_site']):
                 reasons.append('SITE_MODIFICATION_OR_COVALENT_CONTEXT')
@@ -466,7 +514,7 @@ def decide_candidate(holo, prepared, evidence):
                 reasons.append('METHOD_OR_MODEL_OUTSIDE_ORDINARY_SCOPE')
             site_status = ('OCCUPIED' if facts['occupied_subsites'] else
                            'INCOMPLETE' if missing or not complete_target else
-                           'UNRESOLVED' if (not identity or target_alt or facts['candidate_site_altloc_positions']
+                            'UNRESOLVED' if (not identity or altloc_pending
                                or facts['unresolved_nonwater_contacts'] or facts['site_metal_coordination']
                                or facts['covalent_site_links'] or facts['zero_occupancy_nearby_components']
                                or any(r.get('component') not in STANDARD for r in obs['mapped_site'])) else
@@ -479,21 +527,30 @@ def decide_candidate(holo, prepared, evidence):
                     status = 'REVIEW'
                     reasons.insert(0, 'OCCUPIED_IN_INSPECTED_MODEL_OTHER_MODELS_NOT_CHECKED')
             else:
-                if experimental['status'] != 'EXPLICIT_UNBOUND' and experimental['status'] != 'CONFLICT':
-                    reasons.append('EXPERIMENT_UNBOUND_NOT_ESTABLISHED')
                 status = 'REVIEW' if reasons else 'SUPPORTED_RESEARCH_PAIR'
-            obs['decision'] = {'status': status, 'reasons': reasons or ['OBSERVED_MAPPED_SITE_WITHOUT_RELATED_MODELLED_OCCUPANCY'],
+            obs['decision'] = {'status': status, 'reasons': reasons,
                                'unknown_holo_positions': missing, 'delivery_eligible': status == 'SUPPORTED_RESEARCH_PAIR',
                                'experimental_state': experimental['status'],
                                'site_observation': {'status': site_status, 'observed_model': obs['model'],
                                                     'assembly': obs['assembly'], 'instance': obs['instance'],
                                                     'unexamined_models': [m for m in models if m != obs['model']]}, **facts}
+            if site_status != 'OCCUPIED':
+                pending_experiment.append(obs['decision'])
             observations.append(obs)
-    viable = [o for o in observations if o['decision']['status'] == 'SUPPORTED_RESEARCH_PAIR']
-    if viable and len(observations) != 1:
-        for obs in viable:
-            obs['decision'].update(status='REVIEW', reasons=['CANDIDATE_ASSEMBLY_OR_CHAIN_NOT_UNIQUE'],
-                                   delivery_eligible=False)
+    if (literature is not None and experimental['status'] in {'DEPOSITION_CONTEXT', 'NOT_ESTABLISHED'}
+            and any(d['delivery_eligible'] for d in pending_experiment)):
+        article = literature(experimental)
+        experimental['literature'] = article
+        if article.get('support'):
+            experimental['status'] = 'EXPLICIT_UNBOUND'
+            experimental['evidence'].append(article['support'])
+    for decision in pending_experiment:
+        decision['experimental_state'] = experimental['status']
+        if experimental['status'] not in {'EXPLICIT_UNBOUND', 'CONFLICT'}:
+            decision['reasons'].append('EXPERIMENT_UNBOUND_NOT_ESTABLISHED')
+            decision.update(status='REVIEW', delivery_eligible=False)
+        elif not decision['reasons']:
+            decision['reasons'].append('OBSERVED_MAPPED_SITE_WITHOUT_RELATED_MODELLED_OCCUPANCY')
     states = [o['decision']['status'] for o in observations]
     if 'SUPPORTED_RESEARCH_PAIR' in states:
         status = 'SUPPORTED_RESEARCH_PAIR'
@@ -508,4 +565,4 @@ def decide_candidate(holo, prepared, evidence):
             'candidate_model_scope': {'deposited': models, 'inspected': models[:1], 'unexamined': models[1:]},
             'observation_states': states,
             'scope': 'Specified positive-occupancy mapped site and deposited experimental assembly/model. '
-                     'Supported research pairs require complete ordinary Holo target and a unique candidate chain observation.'}
+                     'Each supported observation has its own assembly, model and receptor chain copy.'}
