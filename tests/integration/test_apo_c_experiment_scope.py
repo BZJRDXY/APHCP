@@ -81,6 +81,7 @@ class ExperimentScopeTests(unittest.TestCase):
         reader.get_document = lambda _: (
             {'pmid': '123', 'doi': '10.0000/control'},
             'We report crystal structures of the receptor in the apo form and in complex with a ligand.', None)
+        reader.publisher_article = lambda _: (None, None, None, [{'source': 'CROSSREF_WORK', 'status': 404}])
         data = {'primary_citation': {}, 'source_entry': '9XYZ', 'title': 'Crystal structure of apo receptor'}
         self.assertEqual(reader.assess(data)['support']['basis'], 'MATCHED_APO_DEPOSITION_AND_PRIMARY_ABSTRACT')
         self.assertNotIn('support', reader.assess(data | {'title': 'Receptor structure'}))
@@ -169,6 +170,29 @@ class ExperimentScopeTests(unittest.TestCase):
             self.assertEqual(meta['literature_cache'], 'shared')
             self.assertEqual(second.stats['shared_hits'], 1)
             self.assertEqual(fetch.call_count, 1)
+
+    def test_document_response_is_reused_from_read_only_prior_cache(self):
+        from base64 import b64encode
+        from hashlib import sha256
+        import gzip
+        import json
+
+        body = b'<PubmedArticleSet />'
+        receipt = {'status': 200, 'response_sha256': sha256(body).hexdigest(),
+                   'response_bytes': len(body), 'elapsed_s': 0.1}
+        with TemporaryDirectory() as root:
+            prior = Path(root) / 'prior'
+            prior.mkdir()
+            key = sha256(json.dumps(['https://example.invalid/source', {'id': '123'}],
+                                    sort_keys=True).encode()).hexdigest()
+            (prior / (key + '.json.gz')).write_bytes(gzip.compress(json.dumps({
+                'payload': b64encode(body).decode('ascii'), 'receipt': receipt}).encode()))
+            with patch('apo_c_literature.cache_get', side_effect=AssertionError('must not fetch prior cache')):
+                reader = PrimaryLiterature(Path(root) / 'new', prior_cache=prior)
+                data, meta = reader.get('pubmed/123', 'https://example.invalid/source', {'id': '123'})
+            self.assertEqual(data, body)
+            self.assertEqual(meta['literature_cache'], 'prior_cache')
+            self.assertEqual(reader.stats['prior_cache_hits'], 1)
 
     def test_reference_anchors_resolve_equal_terminal_repeat_alignments(self):
         query, candidate = list('ACDEPH'), list('ACDEPHPH')

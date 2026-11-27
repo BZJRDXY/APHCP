@@ -277,6 +277,42 @@ def candidate_original(run, pdb, origins, config):
     return wanted, None, None, None
 
 
+def study_fingerprint(pdb, current, case, run, config):
+    source = current.get('candidate_source') if pdb == current['pdb'] else None
+    if source:
+        path, digest, size, revision = (source[key] for key in ('path', 'sha256', 'bytes', 'revision'))
+    elif pdb == case['pdb']:
+        path, digest, size, revision = (case['source_uri'], case['identity']['source_sha256'],
+                                         case['source_bytes'], case['identity']['revision'])
+    else:
+        search_runs = [run, *(Path(x) for x in config['reuse_runs'])]
+        if previous := config.get('replay_evidence_run'):
+            search_runs.append(Path(previous))
+        saved = next((row for previous in search_runs if (row := saved_original(previous, pdb, None)[0])), None)
+        if saved is None:
+            with apo_c_pilot.open_catalog(Path(config['catalog'])) as db:
+                saved = apo_c_union_triage.existing_original(db, pdb)
+        if saved is None:
+            return None
+        path, digest, size, revision = saved
+    path = Path(path)
+    if path.stat().st_size != size or size > config['max_compressed_bytes'] or sha(path) != digest:
+        return None
+    block = gemmi.cif.read(str(path)).sole_block()
+    if apo_c_pair.revision(block, pdb)[0] != revision:
+        return None
+    tags = {'a': '_cell.length_a', 'b': '_cell.length_b', 'c': '_cell.length_c',
+            'alpha': '_cell.angle_alpha', 'beta': '_cell.angle_beta', 'gamma': '_cell.angle_gamma',
+            'diffraction_high': '_reflns.d_resolution_high', 'refinement_high': '_refine.ls_d_res_high',
+            'wavelength': '_diffrn_source.pdbx_wavelength', 'r_work': '_refine.ls_R_factor_R_work',
+            'space_group': '_symmetry.space_group_name_H-M'}
+    fields = {key: gemmi.cif.as_string(values[0]) for key, tag in tags.items()
+              if len(values := block.find_values(tag)) == 1 and values[0] not in {'?', '.', ''}}
+    return {'entry': pdb, 'primary_citation': apo_c_science.primary_experiment(block), 'fields': fields,
+            'source_receipt': {'path': str(path), 'sha256': digest, 'bytes': size, 'revision': revision,
+                               'fields': {key: tags[key] for key in fields}}}
+
+
 def inspect_candidate(run, case, prepared, pdb, origins, config, original=None):
     block, structure, sequence, site, accessions = prepared
     wanted, source, source_origin, source_receipt = (
@@ -468,7 +504,41 @@ def deliver_observations(case, holo, prepared, candidates, directory):
     return deliveries
 
 
-def run_case(run, case, config, literature):
+def frozen_case(run, previous, case, limit):
+    key = case['id'].replace(':', '_')
+    prior_result = previous / 'automated' / key / 'result.json'
+    baseline = read_json(prior_result)
+    selected = baseline['selected_candidates']
+    inspected = baseline['candidates']
+    ids = [item['pdb'] for item in selected]
+    if (baseline['system_id'] != case['id'] or baseline['holo'] != case['pdb']
+            or baseline['holo_evidence']['identity'] != case['identity']
+            or ids != [row['pdb'] for row in inspected] or len(set(ids)) != len(ids) or len(ids) > limit):
+        raise ValueError(f'inconsistent frozen case: {prior_result}')
+    holo_original = Path(case['source_uri'])
+    if holo_original.stat().st_size != case['source_bytes'] or sha(holo_original) != case['identity']['source_sha256']:
+        raise ValueError(f'frozen Holo original differs: {holo_original}')
+    search = apo_c_pilot.case_file(run, case)
+    if sha(search) != baseline['search_sha256']:
+        raise ValueError(f'frozen search differs: {search}')
+    holo_system = Path(case['system_uri'])
+    if sha(holo_system) != baseline['holo_system']['sha256']:
+        raise ValueError(f'frozen Holo system differs: {holo_system}')
+    for item, row in zip(selected, inspected):
+        evidence_path = Path(row['evidence_path']).resolve()
+        if not evidence_path.is_relative_to(prior_result.parent.resolve()):
+            raise ValueError(f'candidate evidence is outside its frozen case: {evidence_path}')
+        evidence = read_json(evidence_path)
+        if evidence['pdb'] != item['pdb'] or evidence['search_origins'] != item['sources']:
+            raise ValueError(f'frozen candidate differs: {evidence_path}')
+        if source := evidence.get('candidate_source'):
+            path = Path(source['path'])
+            if path.stat().st_size != source['bytes'] or sha(path) != source['sha256']:
+                raise ValueError(f'frozen original differs: {path}')
+    return baseline
+
+
+def run_case(run, case, config, literature, baseline=None):
     """Yield before a missing original so other Holo get a turn to fetch."""
     key = case['id'].replace(':', '_')
     outcome = run / 'automated' / key / 'result.json'
@@ -482,23 +552,35 @@ def run_case(run, case, config, literature):
             print('RESULT_REUSE', case['id'], flush=True)
             return old
     search = read_json(search_path)
-    rank = rankings(search, case['pdb'])
-    chosen = select_budget(rank, config['per_source_rank'], config['max_unique_per_holo'])
+    if baseline is None:
+        rank = rankings(search, case['pdb'])
+        chosen = select_budget(rank, config['per_source_rank'], config['max_unique_per_holo'])
+        top10 = {k: v[:10] for k, v in rank.items()}
+    else:
+        chosen = baseline['selected_candidates']
+        top10 = baseline['rankings_top10']
     result = {'system_id': case['id'], 'holo': case['pdb'], 'search_evidence': str(search_path),
               'search_sha256': sha(search_path), 'source_status': {x: search[x]['status']
                      for x in ('plinder', 'sifts_rcsb', 'ahoj')},
-              'rankings_top10': {k: v[:10] for k, v in rank.items()}, 'selected_candidates': chosen,
+              'rankings_top10': top10, 'selected_candidates': chosen,
               'candidates': [], 'deliveries': [], 'formal_pair_acceptance': False}
     output_file = apo_c_pilot.next_attempt(outcome)
     try:
-        case.update(read_holo_role(config['catalog'], case))
+        if baseline is None:
+            case.update(read_holo_role(config['catalog'], case))
+        else:
+            prior_holo = baseline['holo_evidence']
+            case.update({k: prior_holo.get(k) for k in ('qc', 'role', 'role_evidence')})
         holo, prepared = prepare_holo(case)
         result['holo_evidence'] = holo
         if prepared is not None:
-            ordered, priority = apo_c_priority.prioritize(run, rank, prepared, config['max_unique_per_holo'])
-            chosen = select_budget(ordered, config['per_source_rank'], config['max_unique_per_holo'], original_rank=rank)
-            result.update(selected_candidates=chosen, candidate_priority=priority,
-                          priorities_top10={k: v[:10] for k, v in ordered.items()})
+            if baseline is None:
+                ordered, priority = apo_c_priority.prioritize(run, rank, prepared, config['max_unique_per_holo'])
+                chosen = select_budget(ordered, config['per_source_rank'], config['max_unique_per_holo'], original_rank=rank)
+                result.update(selected_candidates=chosen, candidate_priority=priority,
+                              priorities_top10={k: v[:10] for k, v in ordered.items()})
+            else:
+                result.update({k: baseline[k] for k in ('candidate_priority', 'priorities_top10') if k in baseline})
             derived = outcome.parent / 'structures'
             derived.mkdir(parents=True, exist_ok=True)
             holo_output = derived / 'holo_system.cif'
@@ -510,7 +592,7 @@ def run_case(run, case, config, literature):
             if not gemmi.read_structure(str(holo_output))[0].count_atom_sites():
                 raise ValueError('Holo system readback has no atoms')
             result['holo_system'] = {'path': str(holo_output), 'sha256': sha(holo_output)}
-            for item in chosen:
+            for index, item in enumerate(chosen):
                 candidate_path = outcome.parent / 'candidates' / f"{item['pdb']}.json"
                 history = apo_c_pilot.attempts(candidate_path)
                 if history:
@@ -524,15 +606,26 @@ def run_case(run, case, config, literature):
                 candidate_path = apo_c_pilot.next_attempt(candidate_path)
                 print('CANDIDATE_START', case['id'], item['pdb'], flush=True)
                 try:
-                    original = candidate_original(run, item['pdb'], item['sources'], config)
-                    if original[1] is None:
-                        yield
-                    evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config, original)
+                    if baseline is None:
+                        original = candidate_original(run, item['pdb'], item['sources'], config)
+                        if original[1] is None:
+                            yield
+                        evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config, original)
+                    else:
+                        old_path = baseline['candidates'][index]['evidence_path']
+                        evidence = read_json(Path(old_path))
+                        evidence['replayed_from'] = old_path
+                    def assess_experiment(experiment):
+                        return literature.assess(experiment, fixed_fingerprint=lambda pdb: study_fingerprint(
+                            pdb, evidence, case, run, config))
+
                     evidence['scientific_decision'] = apo_c_science.decide_candidate(
-                        holo, prepared, evidence, literature.assess)
+                        holo, prepared, evidence, assess_experiment)
                     evidence['materialized_assemblies'] = materialize_candidate(
                         evidence, item['pdb'], derived, config['max_derivative_assemblies_per_candidate'])
                 except Exception as exc:
+                    if baseline is not None:
+                        raise
                     evidence = {'status': 'TECHNICAL_FAILURE', 'pdb': item['pdb'],
                                 'error': f'{type(exc).__name__}: {exc}',
                                 'scientific_decision': {'status': 'TECHNICAL_GAP', 'rule': apo_c_science.RULE,
@@ -579,6 +672,7 @@ def main():
     p.add_argument('--reuse-run', action='append', default=[],
                    help='prior C research Run with hash-checked fixed candidate originals')
     p.add_argument('--reuse-search-run', help='prior Run with the identical Holo search implementation and inputs')
+    p.add_argument('--replay-evidence-run', help='reassess experiment evidence against an unchanged Run shard')
     p.add_argument('--per-source-rank', type=int, default=3)
     p.add_argument('--max-unique-per-holo', type=int, default=6)
     p.add_argument('--max-candidate-download-attempts', type=int, default=10)
@@ -590,6 +684,8 @@ def main():
         p.error('invalid candidate inspection budget')
     if args.max_candidate_download_attempts < 0:
         p.error('invalid candidate download budget')
+    if args.replay_evidence_run and (args.retry_failed or args.reuse_search_run or args.reuse_run):
+        p.error('evidence replay already fixes the search, measured structures and source gaps')
     run, sample_path = Path(args.run), Path(args.samples)
     literature_cache = Path(args.literature_cache).resolve() if args.literature_cache else run.parent.resolve() / '.apo-literature-cache'
     deps = [Path(__file__), Path(apo_c_pilot.__file__), Path(apo_c_pair.__file__),
@@ -609,10 +705,39 @@ def main():
               'literature_cache': str(literature_cache),
               'code_sha256': {x.name: sha(x) for x in deps},
               'scientific_rule': apo_c_science.RULE, 'formal_pair_acceptance': False}
+    previous = Path(args.replay_evidence_run).resolve() if args.replay_evidence_run else None
+    prior_cache = None
+    if previous is not None:
+        run = run.resolve()
+        if run.exists() or run.is_relative_to(previous):
+            raise ValueError('evidence replay requires a new Run outside the sealed baseline')
+        frozen_config = read_json(previous / 'frozen_config.json')
+        for key in ('catalog', 'index', 'per_source_rank', 'max_unique_per_holo', 'scientific_rule'):
+            if config[key] != frozen_config[key]:
+                raise ValueError(f'replay differs from frozen configuration: {key}')
+        for name, digest in config['code_sha256'].items():
+            if name not in {'apo_c_autopilot.py', 'apo_c_literature.py'} and frozen_config['code_sha256'][name] != digest:
+                raise ValueError(f'replay changes a frozen scientific or search dependency: {name}')
+        prior_cache = Path(frozen_config['literature_cache']).resolve()
+        if literature_cache.is_relative_to(prior_cache) or literature_cache.is_relative_to(previous):
+            raise ValueError('replay requires a separate writable literature cache')
+        config.update(replay_evidence_run=str(previous), prior_literature_cache=str(prior_cache),
+                      max_candidate_download_attempts=0, max_derivative_assemblies_per_candidate=0)
     started, clock = now(), time.monotonic()
     if not run.exists():
-        apo_c_pilot.initial_samples(SimpleNamespace(samples=str(sample_path), run=str(run),
-                                                    catalog=args.catalog, index=args.index))
+        if previous is None:
+            apo_c_pilot.initial_samples(SimpleNamespace(samples=str(sample_path), run=str(run),
+                                                        catalog=args.catalog, index=args.index))
+        else:
+            if (sha(sample_path) != frozen_config['sample_spec_sha256']
+                    or read_json(sample_path) != read_json(previous / 'sample_spec.json')):
+                raise ValueError('replay sample specification differs from the baseline')
+            run.mkdir(parents=True)
+            (run / 'code').mkdir()
+            for name in ('sample_spec.json', 'samples.json'):
+                shutil.copy2(previous / name, run / name)
+            write_json(run / 'run.json', dict(read_json(previous / 'run.json'), started_utc=started,
+                                             replay_evidence_run=str(previous)))
         write_json(run / 'frozen_config.json', config)
         for path in deps:
             snapshot = run / 'code' / f'{path.stem}-{sha(path)[:12]}.py'
@@ -620,15 +745,24 @@ def main():
                 shutil.copy2(path, snapshot)
     elif not (run / 'frozen_config.json').exists() or read_json(run / 'frozen_config.json') != config:
         raise ValueError('existing Run does not match the frozen configuration and code')
-    if args.reuse_search_run:
+    if previous is not None:
+        reuse_searches(run, previous)
+    elif args.reuse_search_run:
         reuse_searches(run, args.reuse_search_run)
     config['retry_failed'] = args.retry_failed
     scan_start = time.monotonic()
-    apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
+    cases = read_json(run / 'samples.json')
+    if previous is None:
+        apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
+        baselines = [None] * len(cases)
+    else:
+        baselines = [frozen_case(run, previous, case, config['max_unique_per_holo']) for case in cases]
     inspection_start = time.monotonic()
-    literature = apo_c_literature.PrimaryLiterature(run, literature_cache)
+    literature = apo_c_literature.PrimaryLiterature(run, literature_cache, prior_cache=prior_cache)
     results = run_in_download_order(
-        run_case(run, case, config, literature) for case in read_json(run / 'samples.json'))
+        run_case(run, case, config, literature, baseline) for case, baseline in zip(cases, baselines))
+    if previous is not None and any(result['holo_evidence']['status'] != 'HOLO_OBSERVED_SITE_READY' for result in results):
+        raise ValueError('one or more frozen Holo cases did not complete; inspect per-target output')
     inspection_seconds = round(time.monotonic() - inspection_start, 3)
     states = Counter(candidate['status'] for result in results for candidate in result['candidates'])
     research = {}

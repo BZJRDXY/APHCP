@@ -1,0 +1,287 @@
+"""Compare sealed Apo evaluation runs and independently read delivered structures."""
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from datetime import datetime, timezone
+from functools import cache
+import json
+from pathlib import Path
+
+import gemmi
+
+from verify_apo_c_autopilot import audit_delivery_assembly, check_observation, digest, instances
+
+
+OBS_KEYS = ('model', 'instance', 'label_asym', 'author_chain', 'assembly')
+ASSEMBLY_CHECKS = ('source_identity_revision_and_hash_ok', 'output_model_matches',
+                   'atom_ids_and_altloc_ok', 'coordinates_ok', 'occupancy_ok',
+                   'applicable_connection_endpoints_ok', 'hash_ok')
+GEOMETRY_CHECKS = ('holo_site_matches_source', 'candidate_site_observed_count_matches',
+                   'candidate_contact_set_and_distances_match')
+source_digest = cache(digest)
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding='utf-8'))
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def read_batch(root):
+    shards = sorted(p for p in root.glob('shard-*') if p.is_dir())
+    cases, literature, shard_seconds = {}, Counter(), {}
+    for shard in shards:
+        receipt = read_json(max((shard / 'receipts').glob('automation_run*.json')))
+        literature.update(receipt['literature'])
+        shard_seconds[shard.name] = receipt['elapsed_s']
+        samples = read_json(shard / 'samples.json')
+        require(receipt['holo_dispatched'] == len(samples), f'{shard}: sample count differs from receipt')
+        for sample in samples:
+            target = sample['id']
+            require(target not in cases, f'duplicate Holo target {target}')
+            directory = shard / 'automated' / target.replace(':', '_')
+            result_path = max([directory / 'result.json', *directory.glob('result.retry*.json')])
+            result = read_json(result_path)
+            require(result['system_id'] == target and result['holo'] == sample['pdb'],
+                    f'{result_path}: result target identity differs')
+            require(source_digest(result['search_evidence']) == result['search_sha256'],
+                    f'{result_path}: search checksum differs')
+            require(source_digest(sample['source_uri']) == sample['identity']['source_sha256'],
+                    f'{result_path}: Holo checksum differs')
+            holo_system = result['holo_system']
+            require(source_digest(holo_system['path']) == holo_system['sha256'] and
+                    source_digest(sample['system_uri']) == holo_system['sha256'],
+                    f'{result_path}: Holo system checksum differs')
+            selected = [row['pdb'] for row in result['selected_candidates']]
+            observed = [row['pdb'] for row in result['candidates']]
+            require(selected == observed and len(selected) == len(set(selected)) <= 6,
+                    f'{result_path}: candidate order, unique count or quota differs')
+            candidates = {row['pdb']: read_json(row['evidence_path']) for row in result['candidates']}
+            cases[target] = (sample, result, candidates, shard.name)
+    return cases, len(shards), dict(literature), shard_seconds
+
+
+def source_identity(evidence):
+    source = evidence.get('candidate_source')
+    if source is None:
+        return None
+    require(source.get('revision') and source_digest(source['path']) == source['sha256'],
+            f'{source.get("path")}: fixed candidate revision or checksum invalid')
+    return source['revision'], source['sha256']
+
+
+def compare_cases(baseline, replay):
+    require(list(baseline) == list(replay), 'Holo order or identity differs across shards')
+    checked_sources = 0
+    for target, (old_sample, old, old_candidates, old_shard) in baseline.items():
+        sample, result, candidates, shard = replay[target]
+        require(old_shard == shard and old_sample['identity'] == sample['identity'],
+                f'{target}: frozen Holo identity or shard differs')
+        require(old['holo_system']['sha256'] == result['holo_system']['sha256'] and
+                old['holo_evidence']['site_residues'] == result['holo_evidence']['site_residues'],
+                f'{target}: Holo system or observed site differs')
+        require(old['search_sha256'] == result['search_sha256'] and
+                old['selected_candidates'] == result['selected_candidates'],
+                f'{target}: frozen search or ordered candidates differ')
+        for code, old_evidence in old_candidates.items():
+            source = source_identity(old_evidence)
+            require(source == source_identity(candidates[code]), f'{target}/{code}: frozen candidate source differs')
+            checked_sources += source is not None
+    return checked_sources
+
+
+def atom_names(residue):
+    return {atom.name for atom in residue if atom.occ > 0 and not atom.element.is_hydrogen}
+
+
+def check_mapped_atoms(sample, candidate_source, observation):
+    holo = gemmi.read_structure(sample['source_uri'])
+    candidate = gemmi.read_structure(candidate_source['path'])
+    identity = sample['identity']
+    _, holo_rows = instances(holo, identity['assembly'])[identity['binding_instances'][0][0]]
+    _, candidate_rows = instances(candidate, observation['assembly'])[observation['instance']]
+    require(candidate[0].num == observation['model'], 'delivered model differs from verified source model')
+    holo_residues = {res.label_seq: res for _, res in holo_rows if res.label_seq is not None}
+    candidate_residues = {res.label_seq: (author, res) for author, res in candidate_rows if res.label_seq is not None}
+    mapped = observation['mapped_site']
+    require(mapped and len({row['candidate_label_seq'] for row in mapped}) == len(mapped),
+            'site mapping is empty or repeats candidate residues')
+    for row in mapped:
+        holo_residue = holo_residues[row['holo_label_seq']]
+        author, candidate_residue = candidate_residues[row['candidate_label_seq']]
+        require(candidate_residue.subchain == observation['label_asym'] and author == observation['author_chain'] and
+                candidate_residue.name == holo_residue.name and str(candidate_residue.seqid) == row['author_seq'],
+                f'wrong chain copy or residue identity at Holo label {holo_residue.label_seq}')
+        names = atom_names(holo_residue)
+        require(names and names <= atom_names(candidate_residue),
+                f'missing heavy atoms at Holo label {holo_residue.label_seq}')
+    return len(mapped)
+
+
+def check_delivery(sample, result, evidence, delivery):
+    code = delivery['candidate']
+    source = evidence['candidate_source']
+    identity = sample['identity']
+    copy = delivery['apo_observation']
+    require(delivery['system_id'] == sample['id'] and delivery['holo_identity'] == identity and
+            delivery['apo_original'] == source and delivery['holo_original'] == sample['source_uri'],
+            'delivery target or source differs from frozen evidence')
+    experiment = delivery['candidate_experiment']
+    require(experiment == evidence['scientific_decision']['candidate_experiment'] and
+            experiment['status'] == 'EXPLICIT_UNBOUND' and experiment['source_entry'].upper() == code and
+            experiment['fixed_revision'] == source['revision'] and experiment['source_sha256'] == source['sha256'] and
+            experiment['evidence'] and not experiment.get('literature', {}).get('conflict'),
+            'unbound evidence is missing, conflicting, or belongs to another candidate')
+    matches = [(entity, obs) for entity in evidence['entities'] for obs in entity['assembly_observations']
+               if all(obs.get(key) == copy[key] for key in OBS_KEYS)]
+    require(len(matches) == 1, 'delivery does not identify exactly one inspected chain copy')
+    entity, observation = matches[0]
+    decision = observation['decision']
+    require(decision['delivery_eligible'] and decision['status'] == 'SUPPORTED_RESEARCH_PAIR' and
+            decision['site_observation']['status'] == 'OBSERVED_NO_COMPETING_OCCUPANCY' and
+            not decision['unknown_holo_positions'] and decision == delivery['assessment'] and
+            observation['mapped_site'] == delivery['mapped_site'], 'ineligible or altered observation')
+    holo = result['holo_evidence']
+    require(sorted(row['holo_label_seq'] for row in observation['mapped_site']) ==
+            sorted(row['label_seq'] for row in holo['site_residues']), 'mapping does not cover the complete Holo site')
+    geometry = check_observation(sample, holo, evidence, entity, observation)
+    require(all(geometry[key] for key in GEOMETRY_CHECKS), 'source geometry differs from the delivered observation')
+    mapped_count = check_mapped_atoms(sample, source, observation)
+    holo_check = audit_delivery_assembly(
+        delivery['holo_original'], {'pdb': identity['pdb_id'], 'revision': identity['revision'],
+                                    'sha256': identity['source_sha256']}, identity['assembly'], holo['model'],
+        delivery['holo_assembly'], {edge['id'] for edge in holo['target_connections']})
+    apo_check = audit_delivery_assembly(
+        source['path'], {'pdb': code, 'revision': source['revision'], 'sha256': source['sha256']},
+        copy['assembly'], copy['model'], delivery['apo_assembly'])
+    require(all(item['atoms'] and all(item[key] for key in ASSEMBLY_CHECKS) for item in (holo_check, apo_check)),
+            'assembly readback differs from fixed originals')
+    return {'target': sample['id'], 'holo': sample['pdb'], 'candidate': code, 'observation': copy,
+            'mapped_residues_verified': mapped_count, 'geometry': geometry,
+            'holo_assembly': holo_check, 'apo_assembly': apo_check, 'experiment': experiment['evidence']}
+
+
+def delivered_pairs(cases):
+    return {(target, delivery['candidate']) for target, (_, result, _, _) in cases.items()
+            for delivery in result['deliveries']}
+
+
+def delivered_copy_count(cases):
+    return sum(len(result['deliveries']) for _, result, _, _ in cases.values())
+
+
+def target_outcomes(cases, pairs, requests):
+    outcomes = []
+    for holo, code in requests:
+        hits = []
+        for target, (sample, result, candidates, _) in cases.items():
+            if sample['pdb'] != holo:
+                continue
+            evidence = candidates.get(code, {})
+            decisions = [row['decision'] for entity in evidence.get('entities', [])
+                         for row in entity['assembly_observations'] if 'decision' in row]
+            hits.append({'target': target, 'selected': code in candidates, 'delivered': (target, code) in pairs,
+                         'status': evidence.get('scientific_decision', {}).get('status'),
+                         'site_statuses': sorted({row['site_observation']['status'] for row in decisions}),
+                         'reasons': sorted({reason for row in decisions for reason in row['reasons']}),
+                         'delivery_copies': sum(d['candidate'] == code for d in result['deliveries'])})
+        outcomes.append({'holo': holo, 'candidate': code, 'matches': hits})
+    return outcomes
+
+
+def relation_outcome(evidence):
+    scientific = evidence['scientific_decision']
+    decisions = [row['decision'] for entity in evidence.get('entities', [])
+                 for row in entity['assembly_observations'] if 'decision' in row]
+    return {'entry_status': evidence['status'], 'scientific_status': scientific['status'],
+            'experiment': scientific.get('candidate_experiment', {}).get('status'),
+            'chain_copy_reasons': dict(Counter(reason for decision in decisions for reason in decision['reasons']))}
+
+
+def relation_changes(baseline, replay):
+    transitions = Counter()
+    changes = []
+    for target, (sample, _, old_candidates, _) in baseline.items():
+        for code, evidence in replay[target][2].items():
+            old, new = relation_outcome(old_candidates[code]), relation_outcome(evidence)
+            transitions[(old['scientific_status'], new['scientific_status'])] += 1
+            if old != new:
+                changes.append({'target': target, 'holo': sample['pdb'], 'candidate': code, 'baseline': old, 'replay': new})
+    return {'status_transitions': [{'baseline': before, 'replay': after, 'count': count}
+                                   for (before, after), count in sorted(transitions.items())],
+            'changed': len(changes), 'relations': changes}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--baseline', required=True, type=Path)
+    parser.add_argument('--replay', required=True, type=Path)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--target', action='append', nargs=2, metavar=('HOLO', 'CANDIDATE'), default=[])
+    parser.add_argument('--expected-shards', type=int, default=10)
+    parser.add_argument('--expected-holo', type=int, default=100)
+    parser.add_argument('--expected-candidates', type=int, default=444)
+    parser.add_argument('--expected-sources', type=int, default=415)
+    args = parser.parse_args()
+    baseline_root, replay_root = args.baseline.resolve(), args.replay.resolve()
+    output = (args.output or replay_root / 'quality' / 'evidence_replay_audit.json').resolve()
+    if baseline_root == replay_root or output.is_relative_to(baseline_root) or output.exists():
+        parser.error('choose a distinct replay Run and an unused audit path outside the baseline')
+    receipt = {'created_utc': datetime.now(timezone.utc).isoformat(), 'code_sha256': digest(__file__),
+               'baseline': str(baseline_root), 'replay': str(replay_root), 'errors': [], 'delivery_checks': []}
+    errors = receipt['errors']
+    checked_errors = (KeyError, ValueError, RuntimeError, OSError, StopIteration)
+    try:
+        baseline, old_shards, baseline_literature, _ = read_batch(baseline_root)
+        replay, shards, literature, seconds = read_batch(replay_root)
+        require(old_shards == shards == args.expected_shards, 'unexpected shard count')
+        selected_count = sum(len(candidates) for _, _, candidates, _ in replay.values())
+        require(len(baseline) == len(replay) == args.expected_holo and selected_count == args.expected_candidates,
+                'unexpected target or inspected candidate count')
+        source_count = compare_cases(baseline, replay)
+        require(source_count == args.expected_sources, f'unexpected frozen candidate source count: {source_count}')
+        old_pairs, pairs = delivered_pairs(baseline), delivered_pairs(replay)
+        old_holo, now_holo = {h for h, _ in old_pairs}, {h for h, _ in pairs}
+        targets = [(holo.upper(), candidate.upper()) for holo, candidate in args.target]
+        receipt.update(shards=shards, holo=len(replay), candidates=selected_count, fixed_sources=source_count,
+                       prior_holo=len(old_holo), replay_holo=len(now_holo), prior_pairs=len(old_pairs),
+                       replay_pairs=len(pairs), prior_delivery_copies=delivered_copy_count(baseline),
+                       replay_delivery_copies=delivered_copy_count(replay),
+                       new_holo=sorted(now_holo - old_holo), lost_holo=sorted(old_holo - now_holo),
+                       new_pairs=sorted(pairs - old_pairs), lost_pairs=sorted(old_pairs - pairs),
+                       targets=target_outcomes(replay, pairs, targets), literature=literature,
+                       baseline_literature=baseline_literature, shard_seconds=seconds,
+                       relation_changes=relation_changes(baseline, replay))
+        for sample, result, candidates, _ in replay.values():
+            seen = set()
+            for delivery in result['deliveries']:
+                code = delivery['candidate']
+                try:
+                    copy = (code, *(delivery['apo_observation'][key] for key in OBS_KEYS))
+                    require(copy not in seen, 'duplicate delivered chain copy')
+                    seen.add(copy)
+                    require(all(Path(delivery[key]['path']).resolve().is_relative_to(replay_root)
+                                for key in ('holo_assembly', 'apo_assembly')),
+                            'delivered assembly is outside the replay Run')
+                    receipt['delivery_checks'].append(check_delivery(sample, result, candidates[code], delivery))
+                except checked_errors as exc:
+                    errors.append(f'{sample["id"]}/{code}: {exc}')
+    except checked_errors as exc:
+        errors.append(str(exc))
+    receipt['all_pass'] = not errors
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open('x', encoding='utf-8') as stream:
+        json.dump(receipt, stream, ensure_ascii=False, indent=2)
+        stream.write('\n')
+    print(json.dumps({'output': str(output), 'all_pass': receipt['all_pass'], 'errors': errors,
+                      'new_holo': receipt.get('new_holo'), 'lost_holo': receipt.get('lost_holo')}, ensure_ascii=False))
+    if errors:
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()
