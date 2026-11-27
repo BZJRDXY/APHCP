@@ -125,6 +125,59 @@ def sequence_map(query, target):
                          'unaligned_candidate_positions': [t for t in range(1, len(target) + 1) if t not in mapped_target]}
 
 
+def reference_segments(block, accession, author_chain):
+    rows = block.find('_struct_ref_seq.', ['pdbx_db_accession', 'pdbx_strand_id', 'seq_align_beg', 'seq_align_end',
+                                         'db_align_beg', 'db_align_end'])
+    ranges = []
+    for row in rows:
+        acc, chains, *positions = [gemmi.cif.as_string(v) for v in row]
+        if acc == accession and author_chain in (x.strip() for x in chains.split(',')) and all(p.isdecimal() for p in positions):
+            ranges.append(tuple(map(int, positions)))
+    return ranges
+
+
+def reference_positions(block, accession, author_chain):
+    """Map deposited sequence positions only through unambiguous ungapped reference spans."""
+    positions = {}
+    for first, last, start, end in reference_segments(block, accession, author_chain):
+        if last - first != end - start or first <= 0 or start <= 0:
+            continue
+        for key, value in zip(range(first, last + 1), range(start, end + 1)):
+            if positions.setdefault(key, value) != value:
+                return {}
+    return positions if len(set(positions.values())) == len(positions) else {}
+
+
+def anchored_end_alignment(query, target, mapping, alignment, holo_reference, candidate_reference, site):
+    """Resolve equivalent gap placements for a construct with an exact end extension."""
+    if len(query) == len(target) or alignment['mismatches'] or not set(site) <= holo_reference.keys():
+        return mapping, alignment
+    candidate_index = {ref: seq for seq, ref in candidate_reference.items()}
+    anchors = {q: candidate_index[ref] for q, ref in holo_reference.items() if ref in candidate_index}
+    if not anchors or not set(site) <= anchors.keys():
+        return mapping, alignment
+    delta = anchors[min(anchors)] - min(anchors)
+    if any(t - q != delta for q, t in anchors.items()):
+        return mapping, alignment
+    h_start, c_start = max(1, 1 - delta), max(1, 1 + delta)
+    count = min(len(query), len(target))
+    h_end, c_end = h_start + count - 1, c_start + count - 1
+    if h_end > len(query) or c_end > len(target) or query[h_start - 1:h_end] != target[c_start - 1:c_end]:
+        return mapping, alignment
+    corrected = dict(zip(range(h_start, h_end + 1), range(c_start, c_end + 1)))
+    if any(corrected.get(q) != c for q, c in anchors.items()) or corrected == mapping:
+        return mapping, alignment
+    operations = [(h_start - 1, 'I'), (c_start - 1, 'D'), (count, 'M'),
+                  (len(query) - h_end, 'I'), (len(target) - c_end, 'D')]
+    return corrected, alignment | {
+        'basis': 'FIXED_UNIPROT_END_ALIGNMENT', 'reference_anchor_count': len(anchors),
+        'cigar': ''.join(f'{n}{op}' for n, op in operations if n),
+        'paired_positions': count, 'identity_on_aligned_positions': 1.0,
+        'query_coverage': count / len(query), 'candidate_coverage': count / len(target),
+        'unaligned_holo_positions': [q for q in range(1, len(query) + 1) if q not in corrected],
+        'unaligned_candidate_positions': [t for t in range(1, len(target) + 1) if not c_start <= t <= c_end]}
+
+
 def atom_pos(atom, operator):
     p = operator.transform.apply(atom.pos)
     return np.array([p.x, p.y, p.z])

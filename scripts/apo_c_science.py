@@ -6,12 +6,13 @@ import gemmi
 import numpy as np
 from scipy.spatial import cKDTree
 
-from apo_c_pair import align_coordinates
+from apo_c_literature import deposited_apo
+from apo_c_pair import align_coordinates, reference_segments
 from apo_c_triplet_regression import positive_heavy, residue_index
 from holo_source_mapping import assembly_instances, connection_edges, observed_endpoint
 
 
-RULE = 'single-chain-observed-site-v4'
+RULE = 'single-chain-observed-site-v5'
 STANDARD = set('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL'.split())
 
 
@@ -103,7 +104,7 @@ def experiment_record(block, holo_members, holo_block, binding_role):
         elif re.search(r'\b(?:co[- ]?crystallized with|soaked (?:with|in)|in the presence of)\b', lower):
             conflicts.append({'field': '_exptl_crystal_grow.pdbx_details', 'text': detail,
                               'reason': 'added component requires context'})
-    apo_title = bool(re.search(r'\b(?:unliganded|ligand[- ]free|apo[- ]?form|apo)\b', title, re.I))
+    apo_title = deposited_apo(title)
     cite, holo_cite = primary_experiment(block), primary_experiment(holo_block)
     common_citation = any(cite.get(key) and holo_cite.get(key) and
                           str(cite[key]).casefold() == str(holo_cite[key]).casefold()
@@ -122,7 +123,7 @@ def experiment_record(block, holo_members, holo_block, binding_role):
               'DEPOSITION_CONTEXT' if apo_title or re.search(r'\bnative\b', title, re.I) else 'NOT_ESTABLISHED')
     return {'status': status, 'evidence': explicit, 'title': title, 'method': text_value(block, '_exptl.method'),
             'growth_details': growth, 'citation': block.get_mmcif_category('_citation.'),
-            'primary_citation': cite, 'source_entry': text_value(block, '_entry.id'),
+            'primary_citation': cite, 'holo_primary_citation': holo_cite, 'source_entry': text_value(block, '_entry.id'),
             'preparation_conflicts_or_unresolved_additions': conflicts}
 
 
@@ -176,17 +177,6 @@ def site_metal_coordination(edges, assembly, instance, residues):
                             'status': 'COORDINATION_OBSERVED' if resolved else 'DECLARED_COORDINATION_UNRESOLVED',
                             'observed_distance_A': round(distance, 4) if distance is not None else None})
     return records
-
-
-def reference_segments(block, accession, author_chain):
-    ranges = []
-    rows = block.find('_struct_ref_seq.', ['pdbx_db_accession', 'pdbx_strand_id', 'seq_align_beg', 'seq_align_end',
-                                         'db_align_beg', 'db_align_end'])
-    for row in rows:
-        acc, chains, *positions = [gemmi.cif.as_string(v) for v in row]
-        if acc == accession and author_chain in (x.strip() for x in chains.split(',')) and all(p.isdecimal() for p in positions):
-            ranges.append(tuple(map(int, positions)))
-    return ranges
 
 
 def domain_conflict(holo, hblock, block, entity, observation):
@@ -541,12 +531,17 @@ def decide_candidate(holo, prepared, evidence, literature=None):
             and any(d['delivery_eligible'] for d in pending_experiment)):
         article = literature(experimental)
         experimental['literature'] = article
-        if article.get('support'):
+        if article.get('conflict'):
+            experimental['status'] = 'CONFLICT'
+        elif article.get('support'):
             experimental['status'] = 'EXPLICIT_UNBOUND'
             experimental['evidence'].append(article['support'])
     for decision in pending_experiment:
         decision['experimental_state'] = experimental['status']
-        if experimental['status'] not in {'EXPLICIT_UNBOUND', 'CONFLICT'}:
+        if experimental.get('literature', {}).get('conflict'):
+            decision['reasons'].append('EXPERIMENT_DOCUMENTED_ACTIVE_SITE_INHIBITION')
+            decision.update(status='REVIEW', delivery_eligible=False)
+        elif experimental['status'] not in {'EXPLICIT_UNBOUND', 'CONFLICT'}:
             decision['reasons'].append('EXPERIMENT_UNBOUND_NOT_ESTABLISHED')
             decision.update(status='REVIEW', delivery_eligible=False)
         elif not decision['reasons']:

@@ -20,6 +20,7 @@ from scipy.spatial import cKDTree
 import apo_c_literature
 import apo_c_pair
 import apo_c_pilot
+import apo_c_priority
 import apo_c_rank_audit
 import apo_c_science
 import apo_c_triplet_regression
@@ -44,7 +45,7 @@ def rankings(search, holo):
             for k, v in [('PLINDER', pl), ('AHoJ', ah), ('RCSB', rc)]}
 
 
-def select_budget(ranked, per_source, max_unique):
+def select_budget(ranked, per_source, max_unique, original_rank=None):
     # Equal rank-depth first, then source order; provenance from all ranked lists is retained.
     selected = []
     for i in range(per_source):
@@ -52,8 +53,8 @@ def select_budget(ranked, per_source, max_unique):
             items = ranked[name]
             if i < len(items) and items[i]['pdb'] not in selected and len(selected) < max_unique:
                 selected.append(items[i]['pdb'])
-    return [{'pdb': pdb, 'sources': {name: item for name, items in ranked.items()
-                                    for item in items[:10] if item['pdb'] == pdb}}
+    return [{'pdb': pdb, 'sources': {name: item for name, items in (original_rank or ranked).items()
+                                    for item in items if item['pdb'] == pdb}}
             for pdb in selected]
 
 
@@ -471,15 +472,18 @@ def main():
     p.add_argument('--reuse-search-run', help='prior Run with the identical Holo search implementation and inputs')
     p.add_argument('--per-source-rank', type=int, default=3)
     p.add_argument('--max-unique-per-holo', type=int, default=6)
+    p.add_argument('--literature-cache', help='shared author-source cache, defaults to the parent of the Run directory')
     p.add_argument('--retry-failed', action='store_true',
                    help='Retry missing search pages, fixed inputs, and technical observations in an existing run')
     args = p.parse_args()
     if not 1 <= args.per_source_rank <= 10 or not 1 <= args.max_unique_per_holo <= 30:
         p.error('invalid candidate inspection budget')
     run, sample_path = Path(args.run), Path(args.samples)
+    literature_cache = Path(args.literature_cache).resolve() if args.literature_cache else run.parent.resolve() / '.apo-literature-cache'
     deps = [Path(__file__), Path(apo_c_pilot.__file__), Path(apo_c_pair.__file__),
             Path(apo_c_rank_audit.__file__), Path(apo_c_science.__file__), Path(apo_c_triplet_regression.__file__),
-            Path(apo_c_union_triage.__file__), Path(holo_source_mapping.__file__), Path(apo_c_literature.__file__)]
+            Path(apo_c_union_triage.__file__), Path(holo_source_mapping.__file__), Path(apo_c_literature.__file__),
+            Path(apo_c_priority.__file__)]
     config = {'sample_spec_sha256': sha(sample_path), 'catalog': str(Path(args.catalog).resolve()),
               'index': str(Path(args.index).resolve()), 'per_source_rank': args.per_source_rank,
               'max_unique_per_holo': args.max_unique_per_holo, 'max_compressed_bytes': 20000000,
@@ -488,6 +492,7 @@ def main():
               'download_deadline_seconds': 30,
               'reuse_runs': [str(Path(x).resolve()) for x in args.reuse_run],
               'reuse_search_run': str(Path(args.reuse_search_run).resolve()) if args.reuse_search_run else None,
+              'literature_cache': str(literature_cache),
               'code_sha256': {x.name: sha(x) for x in deps},
               'scientific_rule': apo_c_science.RULE, 'formal_pair_acceptance': False}
     started, clock = now(), time.monotonic()
@@ -505,7 +510,7 @@ def main():
         reuse_searches(run, args.reuse_search_run)
     config['retry_failed'] = args.retry_failed
     apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
-    literature = apo_c_literature.PrimaryLiterature(run)
+    literature = apo_c_literature.PrimaryLiterature(run, literature_cache)
     results = []
     for case in read_json(run / 'samples.json'):
         key = case['id'].replace(':', '_')
@@ -534,6 +539,10 @@ def main():
             holo, prepared = prepare_holo(case)
             result['holo_evidence'] = holo
             if prepared is not None:
+                ordered, priority = apo_c_priority.prioritize(run, rank, prepared, args.max_unique_per_holo)
+                chosen = select_budget(ordered, args.per_source_rank, args.max_unique_per_holo, original_rank=rank)
+                result.update(selected_candidates=chosen, candidate_priority=priority,
+                              priorities_top10={k: v[:10] for k, v in ordered.items()})
                 derived = outcome.parent / 'structures'
                 derived.mkdir(parents=True, exist_ok=True)
                 holo_output = derived / 'holo_system.cif'
@@ -613,6 +622,7 @@ def main():
                'holo_with_research_pair': sum('SUPPORTED_RESEARCH_PAIR' in values for values in research.values()),
                'research_pairs_delivered': sum(len(r.get('deliveries', [])) for r in results),
                'holo_with_delivered_research_pair': sum(bool(r.get('deliveries')) for r in results),
+               'literature': dict(literature.stats),
                'limits': ['Search routes can fail independently.', 'Multi-chain targets remain review.',
                           'An observed no-contact scope is not proof of an unbound experiment.',
                           'No population accuracy, blind assessment or formal acceptance is claimed.']}

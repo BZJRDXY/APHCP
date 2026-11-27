@@ -1,13 +1,17 @@
 """Check when a deposition supports a target-specific unbound state."""
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 import gemmi
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from apo_c_literature import PrimaryLiterature, accession_state
+from apo_c_literature import PrimaryLiterature, accession_conflict, accession_state
+from apo_c_pair import anchored_end_alignment
+from apo_c_priority import order_rankings
 from apo_c_science import complete_altlocs, experiment_record
 
 
@@ -107,6 +111,88 @@ class ExperimentScopeTests(unittest.TestCase):
         self.assertFalse(complete_altlocs(atoms, {'CA', 'CB', 'CG'}))
         atoms.append({'name': 'CG', 'altloc': 'B'})
         self.assertTrue(complete_altlocs(atoms, {'CA', 'CB', 'CG'}))
+
+    def test_uninhibited_deposition_and_experimental_abstract_skip_full_text(self):
+        reader = PrimaryLiterature(None)
+        reader.get_document = lambda _: (
+            {'status': 'PRIMARY_CITATION_READ', 'pmid': '123'},
+            'We determined the crystal structure of the inhibitor-free receptor.', 'PMC456')
+        reader.full_article = lambda _: self.fail('sufficient abstract should skip full text')
+        evidence = reader.assess({'primary_citation': {}, 'source_entry': '9XYZ',
+                                   'title': 'Crystal structure of uninhibited receptor'})
+        self.assertEqual(evidence['support']['basis'], 'MATCHED_APO_DEPOSITION_AND_PRIMARY_ABSTRACT')
+
+    def test_explicit_inhibition_belongs_to_the_accession_in_its_clause(self):
+        clause = ('We solved the crystal structures of the active site-inhibited receptor (PDB 9XYZ) '
+                  'and the other complex (PDB 9XYA).')
+        self.assertIsNotNone(accession_conflict(clause, '9XYZ'))
+        self.assertIsNone(accession_conflict(clause, '9XYA'))
+        reader = PrimaryLiterature(None)
+        reader.get_document = lambda _: ({'status': 'PRIMARY_CITATION_READ', 'pmid': '123'}, '', 'PMC456')
+        reader.full_article = lambda _: (ET.fromstring(f'<article><body><p>{clause}</p></body></article>'),
+                                          {'status': 200})
+        evidence = reader.assess({'primary_citation': {}, 'source_entry': '9XYZ', 'title': 'Receptor complex'})
+        self.assertIn('conflict', evidence)
+        self.assertNotIn('support', evidence)
+
+    def test_accession_link_and_crystal_table_identify_the_apo_column(self):
+        reader = PrimaryLiterature(None)
+        article = ET.fromstring("""
+            <article><body><table-wrap><caption>Crystallographic data collection</caption>
+            <table><tr><th></th><th>Receptor</th><th>Receptor + peptide</th></tr>
+            <tr><td>Protein Data Bank code</td><td>9XYZ</td><td>9XYA</td></tr></table>
+            <table-wrap-foot><fn>Apo-structure diffraction was collected experimentally.</fn></table-wrap-foot>
+            </table-wrap></body></article>
+        """)
+        self.assertIsNone(accession_state(article, '9XYA'))
+        reader.get = lambda *args, **kwargs: (b'{"esearchresult":{"idlist":["123"]}}', {'status': 200})
+        reader.get_document = lambda citation: (
+            ({'status': 'PRIMARY_CITATION_READ', 'pmid': '123', 'pdb_deposits': ['9XYZ']}, '', 'PMC456')
+            if citation else ({'status': 'PRIMARY_CITATION_UNAVAILABLE'}, '', None))
+        reader.full_article = lambda _: (article, {'status': 200})
+        evidence = reader.assess({'primary_citation': {}, 'source_entry': '9XYZ', 'title': 'Receptor'})
+        self.assertEqual(evidence['support']['basis'], 'ARTICLE_APO_CRYSTAL_COMPARISON')
+
+    def test_document_response_is_reused_across_different_runs(self):
+        from hashlib import sha256
+
+        body = b'<PubmedArticleSet />'
+        receipt = {'status': 200, 'response_sha256': sha256(body).hexdigest(),
+                   'response_bytes': len(body), 'elapsed_s': 0.1}
+        with TemporaryDirectory() as root, patch('apo_c_literature.cache_get', return_value=(body, receipt)) as fetch:
+            first = PrimaryLiterature(Path(root) / 'first', Path(root) / 'cache')
+            second = PrimaryLiterature(Path(root) / 'second', Path(root) / 'cache')
+            args = ('pubmed/123', 'https://example.invalid/source', {'id': '123'})
+            first.get(*args)
+            data, meta = second.get(*args)
+            self.assertEqual(data, body)
+            self.assertEqual(meta['literature_cache'], 'shared')
+            self.assertEqual(second.stats['shared_hits'], 1)
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_reference_anchors_resolve_equal_terminal_repeat_alignments(self):
+        query, candidate = list('ACDEPH'), list('ACDEPHPH')
+        old = {1: 1, 2: 2, 3: 3, 4: 4, 5: 7, 6: 8}
+        q_ref = {key: 100 + key for key in range(1, 7)}
+        c_ref = {key: 100 + key for key in range(1, 9)}
+        resolved, alignment = anchored_end_alignment(query, candidate, old, {'mismatches': []},
+                                                       q_ref, c_ref, {3, 4})
+        self.assertEqual(resolved[6], 6)
+        self.assertEqual(alignment['unaligned_candidate_positions'], [7, 8])
+
+    def test_rank_order_removes_wrong_domain_and_promotes_unbound_hint(self):
+        def entry(pdb, title, begin):
+            return {'rcsb_id': pdb, 'struct': {'title': title}, 'exptl': [{'method': 'X-RAY DIFFRACTION'}],
+                    'polymer_entities': [{'rcsb_polymer_entity_align': [{'reference_database_name': 'UniProt',
+                         'reference_database_accession': 'P00001',
+                         'aligned_regions': [{'ref_beg_seq_id': begin, 'length': 20}]}]}]}
+
+        ranked = {'one': [{'pdb': pdb} for pdb in ('9XYA', '9XYB', '9XYZ')]}
+        rows = [entry('9XYA', 'Extracellular domain', 1), entry('9XYB', 'Bound receptor', 100),
+                entry('9XYZ', 'Uninhibited receptor', 100)]
+        ordered, evidence = order_rankings(ranked, rows, 'P00001', {105, 106}, 3)
+        self.assertEqual([r['pdb'] for r in ordered['one']], ['9XYZ', '9XYB'])
+        self.assertTrue(evidence['9XYA']['target_domain_absent'])
 
 
 if __name__ == '__main__':
