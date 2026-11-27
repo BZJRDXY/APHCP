@@ -45,7 +45,7 @@ def existing_original(db, pdb, required_revision=None):
 
 
 def candidate_evidence(run, holo, pdb, source_rows, q, qblock, qstruct, qseq, qsite, db,
-                       fixed_source=None, fixed_origin=None):
+                       fixed_source=None, fixed_origin=None, max_assembly_instances=None):
     source = fixed_source or existing_original(db, pdb)
     source_origin = fixed_origin or 'sealed_catalog_asset_file'
     supplemental = run / 'rank_comparison' / 'supplemental_raw' / f'{pdb}.json'
@@ -111,13 +111,46 @@ def candidate_evidence(run, holo, pdb, source_rows, q, qblock, qstruct, qseq, qs
             record['status'] = 'NO_TARGET_SITE_SEQUENCE_COVERAGE'
         else:
             record['status'] = 'SITE_SEQUENCE_COVERAGE_REQUIRES_OBSERVATION_CHECK'
+        if max_assembly_instances is not None:
+            receptor_labels = {res.subchain: chain.name for chain, res in chain_match}
+            target_positions = set(covered.values())
+            site_labels = {res.subchain for _, res in chain_match if res.label_seq in target_positions
+                           and any(a.occ > 0 and not a.element.is_hydrogen for a in res)}
+            scope = {'considered': len(structure.assemblies), 'expanded': [],
+                     'without_receptor': [], 'without_observed_site': [], 'size_limited': [],
+                     'mapped_receptor_labels': sorted(site_labels)}
+            record['assembly_scope'] = scope
         for assembly in structure.assemblies:
+            if max_assembly_instances is not None:
+                generators = [g for g in assembly.generators if g.operators]
+                subchains = {label for g in generators for label in g.subchains}
+                relevant = subchains & receptor_labels.keys()
+                if not relevant:
+                    scope['without_receptor'].append(assembly.name)
+                    continue
+                if not (relevant & site_labels):
+                    scope['without_observed_site'].append(assembly.name)
+                    for label in sorted(relevant):
+                        record['assembly_observations'].append({
+                            'assembly': assembly.name, 'instance': None, 'label_asym': label,
+                            'author_chain': receptor_labels[label], 'model': structure[0].num,
+                            'mapped_site': [], 'status': 'SITE_UNMAPPED_OR_UNOBSERVED'})
+                    continue
+                expanded = sum(len(g.operators) * len(g.subchains) for g in generators)
+                if expanded > max_assembly_instances:
+                    scope['size_limited'].append({'assembly': assembly.name, 'instances': expanded})
+                    record['assembly_observations'].append({
+                        'assembly': assembly.name, 'status': 'TECHNICAL_FAILURE',
+                        'reason': 'mapped-site assembly exceeds expansion limit', 'assembly_instances': expanded})
+                    continue
             try:
                 instances = assembly_instances(structure, assembly.name, structure[0], include_water=True)
             except Exception as exc:
                 record['assembly_observations'].append({'assembly': assembly.name, 'status': 'TECHNICAL_FAILURE',
                                                          'error': f'{type(exc).__name__}: {exc}'})
                 continue
+            if max_assembly_instances is not None:
+                scope['expanded'].append(assembly.name)
             for key, (op, label, rows) in instances.items():
                 if not any(str(res.entity_id) == entity_id and res.entity_type == gemmi.EntityType.Polymer
                            for _, res in rows):

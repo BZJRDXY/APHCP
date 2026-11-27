@@ -263,53 +263,58 @@ def saved_original(run, pdb, wanted):
     return None, None
 
 
-def inspect_candidate(run, case, prepared, pdb, origins, config):
-    block, structure, sequence, site, accessions = prepared
+def candidate_original(run, pdb, origins, config):
     wanted = required_revision(pdb, origins, config)
     with apo_c_pilot.open_catalog(Path(read_json(run / 'run.json')['catalog'])) as db:
         source = apo_c_union_triage.existing_original(db, pdb, wanted)
-        source_origin, source_receipt = 'sealed_catalog_asset_file', None
-        if source is None:
-            for previous in [run, *(Path(x) for x in config['reuse_runs'])]:
-                source, source_receipt = saved_original(previous, pdb, wanted)
-                if source is not None:
-                    source_origin = 'wwpdb_fixed_version_download' if previous == run else 'verified_prior_run'
-                    break
-        if source is None:
-            fetched = fetch_candidate(run, pdb, origins, config, wanted)
-            key = pdb if wanted is None else f"{pdb}.v{wanted.replace('.', '-')}"
-            history = apo_c_pilot.attempts(run / 'fetch' / f'{key}.json')
-            if fetched is None:
-                return {'status': 'SOURCE_UNAVAILABLE_OR_BUDGET_EXHAUSTED', 'pdb': pdb,
-                        'fetch_receipt': str(history[-1]) if history else None,
-                        'required_revision': wanted}
-            source = (fetched['path'], fetched['sha256'], fetched['bytes'], fetched['revision'])
-            source_origin, source_receipt = 'wwpdb_fixed_version_download', str(history[-1])
-        path, _, size, _ = source
-        if size > config['max_compressed_bytes']:
-            return {'status': 'RESOURCE_LIMIT_REQUIRES_REVIEW', 'pdb': pdb,
-                    'reason': 'compressed source size exceeds frozen pilot budget', 'bytes': size}
-        candidate = gemmi.read_structure(path)
-        atom_count = sum(len(res) for chain in candidate[0] for res in chain)
-        expanded = max((sum(len(g.operators) * len(g.subchains) for g in a.generators)
-                        for a in candidate.assemblies), default=0)
-        if (atom_count > config['max_asymmetric_unit_atoms']
-                or len(candidate.assemblies) > config['max_assemblies']
-                or expanded > config['max_assembly_instances']):
-            return {'status': 'RESOURCE_LIMIT_REQUIRES_REVIEW', 'pdb': pdb, 'atom_count': atom_count,
-                    'assembly_count': len(candidate.assemblies), 'max_assembly_instances': expanded}
-        rows = [row for v in origins.values() for row in v['source_rows']]
-        # RCSB can name an entity while another source names a different author chain.
-        # Include both; never silently discard the chain-only source's entity.
-        authors = {r['author_chain'] for r in rows if r.get('author_chain')}
-        for chain in candidate[0]:
-            if chain.name in authors:
-                for residue in chain:
-                    if residue.entity_type == gemmi.EntityType.Polymer and residue.entity_id:
-                        rows.append({'entity': pdb + '_' + str(residue.entity_id)})
+    if source is not None:
+        return wanted, source, 'sealed_catalog_asset_file', None
+    for previous in [run, *(Path(x) for x in config['reuse_runs'])]:
+        source, receipt = saved_original(previous, pdb, wanted)
+        if source is not None:
+            origin = 'wwpdb_fixed_version_download' if previous == run else 'verified_prior_run'
+            return wanted, source, origin, receipt
+    return wanted, None, None, None
+
+
+def inspect_candidate(run, case, prepared, pdb, origins, config, original=None):
+    block, structure, sequence, site, accessions = prepared
+    wanted, source, source_origin, source_receipt = (
+        original if original is not None else candidate_original(run, pdb, origins, config))
+    if source is None:
+        attempted = len(config.get('download_session', ()))
+        fetched = fetch_candidate(run, pdb, origins, config, wanted)
+        if len(config.get('download_session', ())) > attempted:
+            print('DOWNLOAD_ATTEMPT', case['id'], pdb, wanted, flush=True)
+        key = pdb if wanted is None else f"{pdb}.v{wanted.replace('.', '-')}"
+        history = apo_c_pilot.attempts(run / 'fetch' / f'{key}.json')
+        if fetched is None:
+            reason = 'ARCHIVE_FETCH_FAILED' if history else 'BATCH_DOWNLOAD_LIMIT'
+            return {'status': 'SOURCE_UNAVAILABLE_OR_BUDGET_EXHAUSTED', 'pdb': pdb,
+                    'fetch_receipt': str(history[-1]) if history else None,
+                    'required_revision': wanted, 'source_gap_reason': reason}
+        source = (fetched['path'], fetched['sha256'], fetched['bytes'], fetched['revision'])
+        source_origin, source_receipt = 'wwpdb_fixed_version_download', str(history[-1])
+    path, _, size, _ = source
+    if size > config['max_compressed_bytes']:
+        return {'status': 'RESOURCE_LIMIT_REQUIRES_REVIEW', 'pdb': pdb,
+                'reason': 'compressed source size exceeds frozen pilot budget', 'bytes': size}
+    candidate = gemmi.read_structure(path)
+    atom_count = sum(len(res) for chain in candidate[0] for res in chain)
+    if atom_count > config['max_asymmetric_unit_atoms']:
+        return {'status': 'RESOURCE_LIMIT_REQUIRES_REVIEW', 'pdb': pdb, 'atom_count': atom_count,
+                'reason': 'asymmetric unit atom count exceeds frozen pilot budget'}
+    rows = [row for v in origins.values() for row in v['source_rows']]
+    # Include both entity and author-chain identities when sources differ.
+    authors = {r['author_chain'] for r in rows if r.get('author_chain')}
+    entities = {str(res.entity_id) for chain in candidate[0] if chain.name in authors
+                for res in chain if res.entity_type == gemmi.EntityType.Polymer and res.entity_id}
+    rows.extend({'entity': pdb + '_' + entity} for entity in sorted(entities))
+    with apo_c_pilot.open_catalog(Path(read_json(run / 'run.json')['catalog'])) as db:
         result = apo_c_union_triage.candidate_evidence(
             run, case['pdb'], pdb, rows, {'sifts_common_uniprot': accessions},
-            block, structure, sequence, site, db, fixed_source=source, fixed_origin=source_origin)
+            block, structure, sequence, site, db, fixed_source=source, fixed_origin=source_origin,
+            max_assembly_instances=config['max_assembly_instances'])
         if 'candidate_source' in result:
             result['candidate_source'].update(required_revision=wanted, receipt=source_receipt)
     if any(not e.get('common_uniprot') for e in result.get('entities', [])):
@@ -461,6 +466,108 @@ def deliver_observations(case, holo, prepared, candidates, directory):
     return deliveries
 
 
+def run_case(run, case, config, literature):
+    """Yield before a missing original so other Holo get a turn to fetch."""
+    key = case['id'].replace(':', '_')
+    outcome = run / 'automated' / key / 'result.json'
+    search_path = apo_c_pilot.attempts(apo_c_pilot.case_file(run, case))[-1]
+    old_results = apo_c_pilot.attempts(outcome)
+    if old_results:
+        old = read_json(old_results[-1])
+        if (old['search_sha256'] == sha(search_path) and
+                (not config['retry_failed'] or (old['holo_evidence']['status'] != 'TECHNICAL_FAILURE'
+                  and not any(has_technical_gap(read_json(Path(row['evidence_path']))) for row in old['candidates'])))):
+            print('RESULT_REUSE', case['id'], flush=True)
+            return old
+    search = read_json(search_path)
+    rank = rankings(search, case['pdb'])
+    chosen = select_budget(rank, config['per_source_rank'], config['max_unique_per_holo'])
+    result = {'system_id': case['id'], 'holo': case['pdb'], 'search_evidence': str(search_path),
+              'search_sha256': sha(search_path), 'source_status': {x: search[x]['status']
+                     for x in ('plinder', 'sifts_rcsb', 'ahoj')},
+              'rankings_top10': {k: v[:10] for k, v in rank.items()}, 'selected_candidates': chosen,
+              'candidates': [], 'deliveries': [], 'formal_pair_acceptance': False}
+    output_file = apo_c_pilot.next_attempt(outcome)
+    try:
+        case.update(read_holo_role(config['catalog'], case))
+        holo, prepared = prepare_holo(case)
+        result['holo_evidence'] = holo
+        if prepared is not None:
+            ordered, priority = apo_c_priority.prioritize(run, rank, prepared, config['max_unique_per_holo'])
+            chosen = select_budget(ordered, config['per_source_rank'], config['max_unique_per_holo'], original_rank=rank)
+            result.update(selected_candidates=chosen, candidate_priority=priority,
+                          priorities_top10={k: v[:10] for k, v in ordered.items()})
+            derived = outcome.parent / 'structures'
+            derived.mkdir(parents=True, exist_ok=True)
+            holo_output = derived / 'holo_system.cif'
+            source_holo = Path(case['system_uri'])
+            if holo_output.exists() and sha(holo_output) != sha(source_holo):
+                raise ValueError('existing Holo system differs from sealed source')
+            if not holo_output.exists():
+                shutil.copy2(source_holo, holo_output)
+            if not gemmi.read_structure(str(holo_output))[0].count_atom_sites():
+                raise ValueError('Holo system readback has no atoms')
+            result['holo_system'] = {'path': str(holo_output), 'sha256': sha(holo_output)}
+            for item in chosen:
+                candidate_path = outcome.parent / 'candidates' / f"{item['pdb']}.json"
+                history = apo_c_pilot.attempts(candidate_path)
+                if history:
+                    evidence = read_json(history[-1])
+                    if (source_hints(evidence.get('search_origins', {})) == source_hints(item['sources']) and
+                            (not config['retry_failed'] or not has_technical_gap(evidence))):
+                        result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
+                                                     'evidence_path': str(history[-1])})
+                        print('CANDIDATE_REUSE', case['id'], item['pdb'], flush=True)
+                        continue
+                candidate_path = apo_c_pilot.next_attempt(candidate_path)
+                print('CANDIDATE_START', case['id'], item['pdb'], flush=True)
+                try:
+                    original = candidate_original(run, item['pdb'], item['sources'], config)
+                    if original[1] is None:
+                        yield
+                    evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config, original)
+                    evidence['scientific_decision'] = apo_c_science.decide_candidate(
+                        holo, prepared, evidence, literature.assess)
+                    evidence['materialized_assemblies'] = materialize_candidate(
+                        evidence, item['pdb'], derived, config['max_derivative_assemblies_per_candidate'])
+                except Exception as exc:
+                    evidence = {'status': 'TECHNICAL_FAILURE', 'pdb': item['pdb'],
+                                'error': f'{type(exc).__name__}: {exc}',
+                                'scientific_decision': {'status': 'TECHNICAL_GAP', 'rule': apo_c_science.RULE,
+                                                        'reasons': ['CANDIDATE_INSPECTION_FAILED']}}
+                evidence['search_origins'] = item['sources']
+                write_json(candidate_path, evidence)
+                result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
+                                             'evidence_path': str(candidate_path)})
+                print('CANDIDATE_DONE', case['id'], item['pdb'], evidence['status'], flush=True)
+            result['deliveries'] = deliver_observations(case, holo, prepared, result['candidates'], derived)
+        else:
+            result['candidate_review'] = 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'
+    except Exception as exc:
+        result['holo_evidence'] = {'status': 'TECHNICAL_FAILURE', 'error': f'{type(exc).__name__}: {exc}'}
+        result['deliveries'] = []
+    write_json(output_file, result)
+    print('RESULT', case['id'], result['holo_evidence']['status'],
+          'selected', len(chosen), 'examined', len(result['candidates']), flush=True)
+    return result
+
+
+def run_in_download_order(tasks):
+    pending = list(enumerate(tasks))
+    results = [None] * len(pending)
+    while pending:
+        waiting = []
+        for index, task in pending:
+            try:
+                next(task)
+            except StopIteration as completed:
+                results[index] = completed.value
+            else:
+                waiting.append((index, task))
+        pending = waiting
+    return results
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', required=True)
@@ -487,9 +594,10 @@ def main():
     config = {'sample_spec_sha256': sha(sample_path), 'catalog': str(Path(args.catalog).resolve()),
               'index': str(Path(args.index).resolve()), 'per_source_rank': args.per_source_rank,
               'max_unique_per_holo': args.max_unique_per_holo, 'max_compressed_bytes': 20000000,
-              'max_asymmetric_unit_atoms': 200000, 'max_assemblies': 6, 'max_assembly_instances': 128,
+              'max_asymmetric_unit_atoms': 200000, 'max_assembly_instances': 128,
               'max_candidate_download_attempts': 10, 'max_derivative_assemblies_per_candidate': 2,
-              'download_deadline_seconds': 30,
+              'download_deadline_seconds': 30, 'download_order': 'round-robin-holo-missing-originals',
+              'assembly_scope': 'mapped-receptor-site',
               'reuse_runs': [str(Path(x).resolve()) for x in args.reuse_run],
               'reuse_search_run': str(Path(args.reuse_search_run).resolve()) if args.reuse_search_run else None,
               'literature_cache': str(literature_cache),
@@ -511,88 +619,8 @@ def main():
     config['retry_failed'] = args.retry_failed
     apo_c_pilot.search_cases(SimpleNamespace(run=str(run), case=None, split=None, retry_failed=args.retry_failed))
     literature = apo_c_literature.PrimaryLiterature(run, literature_cache)
-    results = []
-    for case in read_json(run / 'samples.json'):
-        key = case['id'].replace(':', '_')
-        outcome = run / 'automated' / key / 'result.json'
-        search_path = apo_c_pilot.attempts(apo_c_pilot.case_file(run, case))[-1]
-        old_results = apo_c_pilot.attempts(outcome)
-        if old_results:
-            old = read_json(old_results[-1])
-            if (old['search_sha256'] == sha(search_path) and
-                    (not args.retry_failed or (old['holo_evidence']['status'] != 'TECHNICAL_FAILURE'
-                      and not any(has_technical_gap(read_json(Path(row['evidence_path']))) for row in old['candidates'])))):
-                results.append(old)
-                print('RESULT_REUSE', case['id'], flush=True)
-                continue
-        search = read_json(search_path)
-        rank = rankings(search, case['pdb'])
-        chosen = select_budget(rank, args.per_source_rank, args.max_unique_per_holo)
-        result = {'system_id': case['id'], 'holo': case['pdb'], 'search_evidence': str(search_path),
-                  'search_sha256': sha(search_path), 'source_status': {x: search[x]['status']
-                         for x in ('plinder', 'sifts_rcsb', 'ahoj')},
-                  'rankings_top10': {k: v[:10] for k, v in rank.items()}, 'selected_candidates': chosen,
-                  'candidates': [], 'deliveries': [], 'formal_pair_acceptance': False}
-        output_file = apo_c_pilot.next_attempt(outcome)
-        try:
-            case.update(read_holo_role(args.catalog, case))
-            holo, prepared = prepare_holo(case)
-            result['holo_evidence'] = holo
-            if prepared is not None:
-                ordered, priority = apo_c_priority.prioritize(run, rank, prepared, args.max_unique_per_holo)
-                chosen = select_budget(ordered, args.per_source_rank, args.max_unique_per_holo, original_rank=rank)
-                result.update(selected_candidates=chosen, candidate_priority=priority,
-                              priorities_top10={k: v[:10] for k, v in ordered.items()})
-                derived = outcome.parent / 'structures'
-                derived.mkdir(parents=True, exist_ok=True)
-                holo_output = derived / 'holo_system.cif'
-                source_holo = Path(case['system_uri'])
-                if holo_output.exists() and sha(holo_output) != sha(source_holo):
-                    raise ValueError('existing Holo system differs from sealed source')
-                if not holo_output.exists():
-                    shutil.copy2(source_holo, holo_output)
-                if not gemmi.read_structure(str(holo_output))[0].count_atom_sites():
-                    raise ValueError('Holo system readback has no atoms')
-                result['holo_system'] = {'path': str(holo_output), 'sha256': sha(holo_output)}
-                for item in chosen:
-                    candidate_path = outcome.parent / 'candidates' / f"{item['pdb']}.json"
-                    history = apo_c_pilot.attempts(candidate_path)
-                    if history:
-                        evidence = read_json(history[-1])
-                        if (source_hints(evidence.get('search_origins', {})) == source_hints(item['sources']) and
-                                (not args.retry_failed or not has_technical_gap(evidence))):
-                            result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
-                                                         'evidence_path': str(history[-1])})
-                            print('CANDIDATE_REUSE', case['id'], item['pdb'], flush=True)
-                            continue
-                    candidate_path = apo_c_pilot.next_attempt(candidate_path)
-                    print('CANDIDATE_START', case['id'], item['pdb'], flush=True)
-                    try:
-                        evidence = inspect_candidate(run, case, prepared, item['pdb'], item['sources'], config)
-                        evidence['scientific_decision'] = apo_c_science.decide_candidate(
-                            holo, prepared, evidence, literature.assess)
-                        evidence['materialized_assemblies'] = materialize_candidate(
-                            evidence, item['pdb'], derived, config['max_derivative_assemblies_per_candidate'])
-                    except Exception as exc:
-                        evidence = {'status': 'TECHNICAL_FAILURE', 'pdb': item['pdb'],
-                                    'error': f'{type(exc).__name__}: {exc}',
-                                    'scientific_decision': {'status': 'TECHNICAL_GAP', 'rule': apo_c_science.RULE,
-                                                            'reasons': ['CANDIDATE_INSPECTION_FAILED']}}
-                    evidence['search_origins'] = item['sources']
-                    write_json(candidate_path, evidence)
-                    result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
-                                                 'evidence_path': str(candidate_path)})
-                    print('CANDIDATE_DONE', case['id'], item['pdb'], evidence['status'], flush=True)
-                result['deliveries'] = deliver_observations(case, holo, prepared, result['candidates'], derived)
-            else:
-                result['candidate_review'] = 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'
-        except Exception as exc:
-            result['holo_evidence'] = {'status': 'TECHNICAL_FAILURE', 'error': f'{type(exc).__name__}: {exc}'}
-            result['deliveries'] = []
-        write_json(output_file, result)
-        results.append(result)
-        print('RESULT', case['id'], result['holo_evidence']['status'],
-              'selected', len(chosen), 'examined', len(result['candidates']), flush=True)
+    results = run_in_download_order(
+        run_case(run, case, config, literature) for case in read_json(run / 'samples.json'))
     states = Counter(candidate['status'] for result in results for candidate in result['candidates'])
     research = {}
     structure_only = Counter()

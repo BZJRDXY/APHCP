@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from apo_c_autopilot import fetch_candidate, saved_original
+from apo_c_autopilot import fetch_candidate, run_in_download_order, saved_original
 from apo_c_pilot import RcsbPageError, rcsb_query, sha
 from apo_c_union_triage import existing_original
 from apo_c_pair import revision
@@ -96,6 +96,26 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(download.call_count, 2)
                 self.assertEqual(len(list((run / 'fetch').glob('*.json'))), 2)
                 self.assertEqual(len(list((run / 'raw').glob('*.gz'))), 1)
+
+    def test_waiting_holo_get_first_download_before_earlier_holo_get_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            config = {'max_compressed_bytes': 20000, 'download_deadline_seconds': 5,
+                      'max_candidate_download_attempts': 3}
+
+            def requests(entries):
+                for pdb in entries:
+                    yield
+                    fetch_candidate(run, pdb, {}, config, '1.1')
+                return len(entries)
+
+            with patch('apo_c_autopilot.download_bounded', side_effect=TimeoutError('injected')) as download:
+                results = run_in_download_order([requests(['1AAA', '1AAB', '1AAC']),
+                                                 requests([]), requests(['2AAA', '2AAB'])])
+            self.assertEqual(results, [3, 0, 2])
+            self.assertEqual([call.args[0].rsplit('/', 1)[1] for call in download.call_args_list],
+                             ['pdb_00001aaa_xyz_v1-1.cif.gz', 'pdb_00002aaa_xyz_v1-1.cif.gz',
+                              'pdb_00001aab_xyz_v1-1.cif.gz'])
 
 
 if __name__ == '__main__':

@@ -1,12 +1,17 @@
 """Checks for bounded candidate selection and conservative evidence states."""
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import gemmi
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from apo_c_autopilot import DownloadBudgetExceeded, download_bounded, observation_flags, observation_status, select_budget
+from apo_c_pilot import sha
+from apo_c_union_triage import candidate_evidence
 
 
 class ApoAutopilotTests(unittest.TestCase):
@@ -49,6 +54,63 @@ class ApoAutopilotTests(unittest.TestCase):
         self.assertEqual(caught.exception.evidence['head_declared_bytes'], 69723946)
         self.assertEqual(caught.exception.evidence['bytes_received'], 0)
         get.assert_not_called()
+
+    def test_expand_only_assemblies_with_mapped_receptor_and_keep_companions(self):
+        def chain(name, entity, position, occupancy):
+            receptor = gemmi.Chain(name)
+            residue = gemmi.Residue()
+            residue.name = 'ALA'
+            residue.entity_type = gemmi.EntityType.Polymer
+            residue.entity_id, residue.subchain = entity, name
+            residue.label_seq, residue.seqid = 1, gemmi.SeqId(1, ' ')
+            atom = gemmi.Atom()
+            atom.name, atom.element = 'CA', gemmi.Element('C')
+            atom.pos, atom.occ = gemmi.Position(position, 0, 0), occupancy
+            residue.add_atom(atom)
+            receptor.add_residue(residue)
+            return receptor
+
+        class Model(list):
+            num = 1
+
+        class Structure(list):
+            pass
+
+        structure = Structure([Model([chain('A', '1', 0, 1), chain('B', '2', 2, 1), chain('C', '1', 5, 0)])])
+        structure.entities = [SimpleNamespace(name='1', full_sequence=['ALA'])]
+
+        def assembly(name, labels, count=1):
+            return SimpleNamespace(name=name, generators=[SimpleNamespace(subchains=labels, operators=[None] * count)])
+
+        structure.assemblies = [assembly(str(n), ['B'], 200) for n in range(1, 8)]
+        structure.assemblies += [assembly('8', ['A', 'B']), assembly('9', ['C']), assembly('10', ['A'], 200)]
+        operator = SimpleNamespace(transform=gemmi.Transform())
+        instances = {f'1.{c.name}': (operator, c.name, [(c.name, c[0])]) for c in structure[0][:2]}
+        with TemporaryDirectory() as tmp:
+            original = Path(tmp) / 'source.cif'
+            original.write_text("""data_9XYZ
+_entry.id 9XYZ
+_struct.title 'Synthetic receptor and neighbor'
+loop_
+_pdbx_audit_revision_history.data_content_type
+_pdbx_audit_revision_history.major_revision
+_pdbx_audit_revision_history.minor_revision
+_pdbx_audit_revision_history.revision_date
+'Structure model' 1 1 2020-01-01
+""", encoding='utf8')
+            site = {1: {'author_seq': '1', 'author_chain': 'A', 'component': 'ALA', 'atom_names': {'CA'}}}
+            native = str(original), sha(original), original.stat().st_size, '1.1'
+            with patch('apo_c_union_triage.gemmi.make_structure_from_block', return_value=structure), \
+                    patch('apo_c_union_triage.assembly_instances', return_value=instances) as expand:
+                result = candidate_evidence(Path(tmp), '9XYA', '9XYZ', [{'entity': '9XYZ_1'}],
+                                            {'sifts_common_uniprot': []}, None, None, ['A'], site, None,
+                                            fixed_source=native, max_assembly_instances=128)
+        self.assertEqual([call.args[1] for call in expand.call_args_list], ['8'])
+        entity, = result['entities']
+        self.assertEqual(entity['assembly_scope']['without_observed_site'], ['9'])
+        self.assertEqual(entity['assembly_scope']['size_limited'], [{'assembly': '10', 'instances': 200}])
+        measured = next(o for o in entity['assembly_observations'] if o['status'] == 'ACTUAL_CONTACTS_MEASURED')
+        self.assertEqual(measured['actual_component_contacts']['nonwater'][0]['instance'], '1.B')
 
 
 if __name__ == '__main__':
