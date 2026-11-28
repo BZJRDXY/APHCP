@@ -169,6 +169,27 @@ class PublicReviewStatusTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not the independently verified'):
             render(self.root, self.runtime)
 
+    def test_apo_aggregate_keeps_zero_hidden_enrollment_distinct_from_recall(self):
+        code = self.root / 'scripts/apo_c_autopilot.py'
+        code.parent.mkdir()
+        code.write_bytes(b'pass\n')
+        counts = dict(natural_targets=980, natural_targets_with_terminal_results=980,
+                      natural_first_readback_passed=35, natural_delivered_pairs=39, natural_chain_copies=43,
+                      natural_pairs_sampled=20, natural_pairs_author_confirmed=19, natural_readback_errors=0,
+                      hidden_expected=20, hidden_actual=0, hidden_first_verified=0)
+        row = dict(counts=counts, created_utc='2026-01-04T09:00:00+08:00', run_elapsed_s=3600,
+                   formal_pair_acceptances=0, fixed_controls_all_pass=True, final_output_seal_sha256='a'*64,
+                   autopilot_sha256=sha256(code.read_bytes()).hexdigest(), run='PRIVATE_RUN_PATH')
+        self.write(self.root / SOURCES, self.sources | {'apo_trial': 'apo-trial.json'})
+        self.put('apo-trial.json', row)
+        page = render(self.root, self.runtime)
+        self.assertIn('**35/980**', page)
+        self.assertIn('Zero independently verified hidden positives enrolled. Recall unavailable.', page)
+        self.assertNotIn('PRIVATE_RUN_PATH', page)
+        self.put('apo-trial.json', row | {'counts': counts | {'hidden_first_verified': 1}})
+        with self.assertRaisesRegex(ValueError, 'Apo trial aggregates do not reconcile'):
+            render(self.root, self.runtime)
+
 
     def test_batch_200_requires_verified_stop_and_separates_the_two_denominators(self):
         checks = dict(accepted=True, same_input_replay=True, provenance_and_foreign_keys_ok=True)

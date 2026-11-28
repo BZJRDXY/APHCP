@@ -9,8 +9,9 @@ from unittest.mock import patch
 import gemmi
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from apo_c_autopilot import DownloadBudgetExceeded, download_bounded, observation_flags, observation_status, select_budget
-from apo_c_pilot import sha
+from apo_c_autopilot import (DownloadBudgetExceeded, download_bounded, observation_flags, observation_status,
+                             run_case, run_in_download_order, select_budget, select_first_run_budget)
+from apo_c_pilot import case_file, sha, write_json
 from apo_c_union_triage import candidate_evidence
 
 
@@ -25,6 +26,37 @@ class ApoAutopilotTests(unittest.TestCase):
         selected = select_budget(ranked, per_source=2, max_unique=2)
         self.assertEqual([x['pdb'] for x in selected], ['AAAA', 'BBBB'])
         self.assertEqual(set(selected[1]['sources']), {'PLINDER', 'AHoJ'})
+
+    def test_first_run_preserves_metadata_quota_but_uses_complete_raw_ranks(self):
+        ranked = {name: [{'pdb': f'{prefix}{rank:03}', 'entry_rank': rank} for rank in range(1, 12)]
+                  + [{'pdb': 'SHAR', 'entry_rank': 12}]
+                  for name, prefix in [('PLINDER', 'P'), ('AHoJ', 'A'), ('RCSB', 'R')]}
+        chosen = select_first_run_budget(ranked, ranked, per_source=3, max_unique=6)
+        self.assertEqual(len(chosen), 6)
+        self.assertEqual(chosen[0]['pdb'], 'SHAR')
+        self.assertEqual(set(chosen[0]['sources']), set(ranked))
+        self.assertEqual(select_first_run_budget(ranked, {k: [] for k in ranked}, 3, 6), [])
+
+    def test_first_run_quota_does_not_fill_unused_source_slots(self):
+        ranked = {'PLINDER': [{'pdb': f'P{rank:03}', 'entry_rank': rank} for rank in range(1, 9)],
+                  'AHoJ': [], 'RCSB': []}
+        ordered = dict(ranked, PLINDER=ranked['PLINDER'][6:])
+        chosen = select_first_run_budget(ranked, ordered, per_source=3, max_unique=6)
+        self.assertEqual([row['pdb'] for row in chosen], ['P001', 'P002'])
+
+    def test_no_candidates_does_not_mask_a_search_failure(self):
+        case = {'id': 'holo:9XYZ:fixture', 'pdb': '9XYZ'}
+        for status, expected in [('searched', 'NO_CANDIDATES'), ('technical_failure', 'SEARCH_INCOMPLETE')]:
+            with self.subTest(status=status), TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                write_json(case_file(run, case), {'plinder': {'status': 'matched_no_linked_candidates'},
+                           'ahoj': {'status': 'matched_target'}, 'sifts_rcsb': {'status': status}})
+                config = {'retry_failed': False, 'catalog': 'unused'}
+                with patch('apo_c_autopilot.read_holo_role', return_value={}), patch(
+                        'apo_c_autopilot.prepare_holo', return_value=({'status': 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'}, None)):
+                    result, = run_in_download_order([run_case(run, case, config, literature=None)])
+                self.assertEqual(result['candidate_availability'], expected)
+                self.assertEqual(result['selected_candidates'], [])
 
     def test_empty_observed_site_never_claims_unbound_or_acceptance(self):
         entity = {'common_uniprot': ['P12345'], 'holo_site_residues': 2}

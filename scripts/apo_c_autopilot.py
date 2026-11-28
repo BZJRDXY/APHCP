@@ -30,6 +30,10 @@ import holo_source_mapping
 from apo_c_pilot import now, read_json, sha, write_json
 
 
+RRF_OFFSET = 60
+FIRST_RUN_RANKING = 'metadata-quota-rrf-v1'
+
+
 def rankings(search, holo):
     pl = [{'pdb': x['source_entry_id'], 'author_chain': x['source_chain_auth_id'],
            'assembly': x['source_biounit_id'], 'source_rank': x['rank'],
@@ -68,12 +72,17 @@ def select_fused_budget(ranked, quota):
     def priority(item):
         pdb, sources = item
         ranks = [row['entry_rank'] for row in sources.values()]
-        return -sum(Fraction(1, 60 + rank) for rank in ranks), min(ranks), pdb
+        return -sum(Fraction(1, RRF_OFFSET + rank) for rank in ranks), min(ranks), pdb
 
     if len(candidates) < quota:
         raise ValueError('sealed search has fewer candidates than the frozen quota')
     return [{'pdb': pdb, 'sources': sources}
             for pdb, sources in sorted(candidates.items(), key=priority)[:quota]]
+
+
+def select_first_run_budget(ranked, metadata_order, per_source, max_unique):
+    quota = len(select_budget(metadata_order, per_source, max_unique))
+    return select_fused_budget(ranked, quota)
 
 
 def prepare_holo(case):
@@ -561,11 +570,13 @@ def run_case(run, case, config, literature, baseline=None):
     key = case['id'].replace(':', '_')
     outcome = run / 'automated' / key / 'result.json'
     search_path = apo_c_pilot.attempts(apo_c_pilot.case_file(run, case))[-1]
+    search_digest = sha(search_path)
     old_results = apo_c_pilot.attempts(outcome)
     if old_results:
         old = read_json(old_results[-1])
-        if (old['search_sha256'] == sha(search_path) and
+        if (old['search_sha256'] == search_digest and
                 (not config['retry_failed'] or (old['holo_evidence']['status'] != 'TECHNICAL_FAILURE'
+                  and not old.get('processing_failure') and not old.get('delivery_failures')
                   and not any(has_technical_gap(read_json(Path(row['evidence_path']))) for row in old['candidates'])))):
             print('RESULT_REUSE', case['id'], flush=True)
             return old
@@ -573,17 +584,23 @@ def run_case(run, case, config, literature, baseline=None):
     rerank = 'rerank_from_run' in config
     if baseline is None or rerank:
         rank = rankings(search, case['pdb'])
-        chosen = (select_fused_budget(rank, len(baseline['selected_candidates'])) if rerank else
-                  select_budget(rank, config['per_source_rank'], config['max_unique_per_holo']))
+        chosen = select_fused_budget(rank, len(baseline['selected_candidates'])) if rerank else []
         top10 = {k: v[:10] for k, v in rank.items()}
     else:
         chosen = baseline['selected_candidates']
         top10 = baseline['rankings_top10']
     result = {'system_id': case['id'], 'holo': case['pdb'], 'search_evidence': str(search_path),
-              'search_sha256': sha(search_path), 'source_status': {x: search[x]['status']
+              'search_sha256': search_digest, 'source_status': {x: search[x]['status']
                      for x in ('plinder', 'sifts_rcsb', 'ahoj')},
               'rankings_top10': top10, 'selected_candidates': chosen,
               'candidates': [], 'deliveries': [], 'formal_pair_acceptance': False}
+    if baseline is None:
+        result['ranking_counts'] = {name: len(rows) for name, rows in rank.items()}
+        partial = 'technical_failure' in result['source_status'].values()
+        if any(rank.values()):
+            result['candidate_availability'] = 'CANDIDATES_WITH_SOURCE_GAP' if partial else 'CANDIDATES_FOUND'
+        else:
+            result['candidate_availability'] = 'SEARCH_INCOMPLETE' if partial else 'NO_CANDIDATES'
     output_file = apo_c_pilot.next_attempt(outcome)
     try:
         if baseline is None:
@@ -595,12 +612,26 @@ def run_case(run, case, config, literature, baseline=None):
         result['holo_evidence'] = holo
         if prepared is not None:
             if baseline is None:
-                ordered, priority = apo_c_priority.prioritize(run, rank, prepared, config['max_unique_per_holo'])
-                chosen = select_budget(ordered, config['per_source_rank'], config['max_unique_per_holo'], original_rank=rank)
-                result.update(selected_candidates=chosen, candidate_priority=priority,
-                              priorities_top10={k: v[:10] for k, v in ordered.items()})
+                plan_path = outcome.parent / f'candidate_plan-{search_digest}.json'
+                if plan_path.exists():
+                    plan = read_json(plan_path)
+                    if plan['system_id'] != case['id'] or plan['search_sha256'] != search_digest:
+                        raise ValueError('candidate plan differs from current target or search')
+                else:
+                    ordered, priority = apo_c_priority.prioritize(run, rank, prepared, config['max_unique_per_holo'])
+                    chosen = select_first_run_budget(rank, ordered, config['per_source_rank'], config['max_unique_per_holo'])
+                    plan = {'system_id': case['id'], 'search_sha256': search_digest,
+                            'source_status': result['source_status'], 'ranking_counts': result['ranking_counts'],
+                            'selected_candidates': chosen, 'priorities_top10': {k: v[:10] for k, v in ordered.items()},
+                            'candidate_priority': {**priority, 'rule': FIRST_RUN_RANKING,
+                                                   'method': 'reciprocal_rank_fusion', 'k': RRF_OFFSET,
+                                                   'candidate_quota': len(chosen)}}
+                    write_json(plan_path, plan)
+                chosen = plan['selected_candidates']
+                result.update({k: plan[k] for k in ('selected_candidates', 'priorities_top10', 'candidate_priority')},
+                              candidate_plan=str(plan_path))
             elif rerank:
-                result['candidate_priority'] = {'method': 'reciprocal_rank_fusion', 'k': 60,
+                result['candidate_priority'] = {'method': 'reciprocal_rank_fusion', 'k': RRF_OFFSET,
                                                 'candidate_quota': len(chosen)}
             else:
                 result.update({k: baseline[k] for k in ('candidate_priority', 'priorities_top10') if k in baseline})
@@ -616,6 +647,24 @@ def run_case(run, case, config, literature, baseline=None):
                 raise ValueError('Holo system readback has no atoms')
             result['holo_system'] = {'path': str(holo_output), 'sha256': sha(holo_output)}
             prior = {row['pdb']: row['evidence_path'] for row in baseline['candidates']} if baseline else {}
+
+            def record_candidate(pdb, evidence, path):
+                row = {'pdb': pdb, 'status': evidence['status'], 'evidence_path': str(path)}
+                result['candidates'].append(row)
+                if baseline is not None or not evidence['scientific_decision'].get('delivery_eligible'):
+                    return
+                try:
+                    deliveries = deliver_observations(case, holo, prepared, [row], derived)
+                    if deliveries:
+                        first_path = outcome.parent / 'first_delivery.json'
+                        if not first_path.exists():
+                            write_json(first_path, {'system_id': case['id'], 'candidate': pdb,
+                                                   'written_utc': now(), 'deliveries': deliveries})
+                        result['first_delivery_receipt'] = str(first_path)
+                        result['deliveries'].extend(deliveries)
+                except (RuntimeError, OSError, ValueError, KeyError) as exc:
+                    result.setdefault('delivery_failures', []).append({'pdb': pdb, 'error': f'{type(exc).__name__}: {exc}'})
+
             for item in chosen:
                 candidate_path = outcome.parent / 'candidates' / f"{item['pdb']}.json"
                 history = apo_c_pilot.attempts(candidate_path)
@@ -623,8 +672,7 @@ def run_case(run, case, config, literature, baseline=None):
                     evidence = read_json(history[-1])
                     if (source_hints(evidence.get('search_origins', {})) == source_hints(item['sources']) and
                             (not config['retry_failed'] or not has_technical_gap(evidence))):
-                        result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
-                                                     'evidence_path': str(history[-1])})
+                        record_candidate(item['pdb'], evidence, history[-1])
                         print('CANDIDATE_REUSE', case['id'], item['pdb'], flush=True)
                         continue
                 candidate_path = apo_c_pilot.next_attempt(candidate_path)
@@ -660,15 +708,18 @@ def run_case(run, case, config, literature, baseline=None):
                                                         'reasons': ['CANDIDATE_INSPECTION_FAILED']}}
                 evidence['search_origins'] = item['sources']
                 write_json(candidate_path, evidence)
-                result['candidates'].append({'pdb': item['pdb'], 'status': evidence['status'],
-                                             'evidence_path': str(candidate_path)})
+                record_candidate(item['pdb'], evidence, candidate_path)
                 print('CANDIDATE_DONE', case['id'], item['pdb'], evidence['status'], flush=True)
-            result['deliveries'] = deliver_observations(case, holo, prepared, result['candidates'], derived)
+            if baseline is not None:
+                result['deliveries'] = deliver_observations(case, holo, prepared, result['candidates'], derived)
         else:
             result['candidate_review'] = 'MULTICHAIN_SCOPE_REQUIRES_REVIEW'
     except Exception as exc:
-        result['holo_evidence'] = {'status': 'TECHNICAL_FAILURE', 'error': f'{type(exc).__name__}: {exc}'}
-        result['deliveries'] = []
+        failure = {'status': 'TECHNICAL_FAILURE', 'error': f'{type(exc).__name__}: {exc}'}
+        if result['deliveries']:
+            result['processing_failure'] = failure
+        else:
+            result['holo_evidence'] = failure
     write_json(output_file, result)
     print('RESULT', case['id'], result['holo_evidence']['status'],
           'selected', len(chosen), 'examined', len(result['candidates']), flush=True)
@@ -707,16 +758,19 @@ def main():
     p.add_argument('--max-unique-per-holo', type=int, default=6)
     p.add_argument('--max-candidate-download-attempts', type=int, default=10)
     p.add_argument('--literature-cache', help='shared author-source cache, defaults to the parent of the Run directory')
-    p.add_argument('--retry-failed', action='store_true',
+    retry = p.add_mutually_exclusive_group()
+    retry.add_argument('--retry-inspection', action='store_true',
+                       help='retry failed inspection or writing against the recorded search and candidate order')
+    retry.add_argument('--retry-failed', action='store_true',
                    help='Retry missing search pages, fixed inputs, and technical observations in an existing run')
     args = p.parse_args()
     if not 1 <= args.per_source_rank <= 10 or not 1 <= args.max_unique_per_holo <= 30:
         p.error('invalid candidate inspection budget')
     if args.max_candidate_download_attempts < 0:
         p.error('invalid candidate download budget')
-    if args.replay_evidence_run and (args.retry_failed or args.reuse_search_run or args.reuse_run):
+    if args.replay_evidence_run and (args.retry_failed or args.retry_inspection or args.reuse_search_run or args.reuse_run):
         p.error('evidence replay already fixes the search, measured structures and source gaps')
-    if args.rerank_from_run and (args.retry_failed or args.reuse_search_run):
+    if args.rerank_from_run and (args.retry_failed or args.retry_inspection or args.reuse_search_run):
         p.error('ranking replay requires a new Run and uses the frozen search')
     run, sample_path = Path(args.run), Path(args.samples)
     literature_cache = Path(args.literature_cache).resolve() if args.literature_cache else run.parent.resolve() / '.apo-literature-cache'
@@ -741,6 +795,8 @@ def main():
     previous = Path(replay).resolve() if replay else None
     replay_key = 'rerank_from_run' if args.rerank_from_run else 'replay_evidence_run'
     prior_cache = None
+    if previous is None:
+        config['ranking_rule'] = FIRST_RUN_RANKING
     if previous is not None:
         run = run.resolve()
         if run.exists() or run.is_relative_to(previous):
@@ -790,7 +846,7 @@ def main():
         reuse_searches(run, previous)
     elif args.reuse_search_run:
         reuse_searches(run, args.reuse_search_run)
-    config['retry_failed'] = args.retry_failed
+    config['retry_failed'] = args.retry_failed or args.retry_inspection
     scan_start = time.monotonic()
     cases = read_json(run / 'samples.json')
     if previous is None:

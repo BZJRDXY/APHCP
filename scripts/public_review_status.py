@@ -368,6 +368,40 @@ def through200_section(root, source):
 '''
 
 
+def apo_trial_section(root, source):
+    trial, _ = receipt(root, source)
+    natural = counts(trial['counts'], ('natural_targets', 'natural_targets_with_terminal_results',
+                                     'natural_first_readback_passed', 'natural_delivered_pairs', 'natural_chain_copies',
+                                     'natural_pairs_sampled', 'natural_pairs_author_confirmed'))
+    cohort = trial['counts']
+    program_pairs = count(cohort.get('natural_program_pairs', natural['natural_delivered_pairs']))
+    hidden = count(cohort['hidden_actual'])
+    reference = count(cohort['hidden_first_verified'])
+    confirmed = natural['natural_first_readback_passed']
+    require(0 < natural['natural_targets'] and confirmed <= natural['natural_targets_with_terminal_results'] <= natural['natural_targets'] and
+            confirmed <= natural['natural_delivered_pairs'] <= natural['natural_chain_copies'] and
+            natural['natural_delivered_pairs'] <= program_pairs and
+            natural['natural_pairs_author_confirmed'] <= natural['natural_pairs_sampled'] <= program_pairs and
+            reference <= hidden <= count(cohort['hidden_expected']) and trial['formal_pair_acceptances'] == 0 and
+            trial['fixed_controls_all_pass'] is True and SHA.fullmatch(trial['final_output_seal_sha256']),
+            'Apo trial aggregates do not reconcile')
+    frozen = trial['autopilot_sha256']
+    require(SHA.fullmatch(frozen), 'Invalid verified Apo entry point digest')
+    actual = sha256((root / 'scripts/apo_c_autopilot.py').read_bytes()).hexdigest()
+    code = 'Matches the synchronized Apo entry point.' if actual == frozen else 'Earlier Apo entry point used.'
+    recovery = f'{reference}/{hidden} hidden positives recovered.' if hidden else 'Zero independently verified hidden positives enrolled. Recall unavailable.'
+    hours = trial['run_elapsed_s'] / 3600
+    require(hours > 0, 'Invalid Apo trial duration')
+    return f'''## Apo · Bounded first-run research trial
+
+- Independently checked on **{utc(trial['created_utc'])}**. {code}
+- Natural cohort: **{confirmed:,}/{natural['natural_targets']:,}** targets obtained a first Apo passing structural readback. **{natural['natural_delivered_pairs']:,}** distinct target–Apo relations and **{natural['natural_chain_copies']:,}** assembly-chain copies passed readback.
+- Author-source audit confirmed **{natural['natural_pairs_author_confirmed']}/{natural['natural_pairs_sampled']}** sampled relations. **{count(cohort['natural_readback_errors'])}** natural-cohort copy readbacks failed.
+- Hidden positives: {recovery} Running time **{hours:.2f} hours**, with **{confirmed / hours:.1f}** targets reaching a first readback per elapsed hour.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -440,6 +474,7 @@ def render(root: Path, current_runtime: str):
     speed = pipeline_speed_section(root, src['m3_pipeline_speed']) if src.get('m3_pipeline_speed') else ''
     through100 = through100_section(root, src['m3_through100']) if src.get('m3_through100') else ''
     through200 = through200_section(root, src['m3_through200']) if src.get('m3_through200') else ''
+    apo = apo_trial_section(root, src['apo_trial']) if src.get('apo_trial') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 
@@ -462,7 +497,7 @@ Public runtime fingerprint (SHA-256): `{current_runtime}`
 - **{unknown_type:,}** retrievable observations have an unknown primary chemical type. Unknown type does not by itself block eligible structures.
 - Verification and current public code: {m3_link}
 
-{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}{through100}{through200}## Open review
+{pilot}{production}{recovery}{production_gate}{after_ten}{three_main}{admission}{balanced}{speed}{through100}{through200}{apo}## Open review
 
 {pending}
 
