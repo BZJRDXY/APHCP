@@ -7,6 +7,9 @@ from fractions import Fraction
 import gzip
 import hashlib
 import json
+import os
+import re
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 from types import SimpleNamespace
 import shutil
@@ -290,6 +293,64 @@ def saved_original(run, pdb, wanted):
     return None, None
 
 
+def shared_fixed_original(directory, pdb, revision, fetched=None, receipt=None):
+    """Publish a receipt pointer only after validating the immutable archive and fixed identity."""
+    if not directory or not revision:
+        return None, None
+    if not re.fullmatch(r'[0-9][A-Z0-9]{3}', pdb) or not re.fullmatch(r'\d+\.\d+', revision):
+        raise ValueError('invalid archive identity')
+    root = Path(directory)
+    manifest = root / pdb[:2] / f'{pdb}-v{revision}.json'
+
+    def verified(row):
+        source = Path(row['path'])
+        if (row.get('revision') != revision or not source.is_file() or source.stat().st_size != row['bytes']
+                or sha(source) != row['sha256'] or apo_c_pair.revision(gemmi.cif.read(str(source)).sole_block(), pdb)[0] != revision):
+            raise ValueError(f'invalid shared fixed original for {pdb} {revision}')
+        return str(source), row['sha256'], row['bytes'], revision
+
+    if fetched is not None:
+        if fetched.get('status') != 'FETCHED' or not receipt or not Path(receipt).is_file():
+            raise ValueError('shared source has no successful originating receipt')
+        origin = read_json(Path(receipt))
+        fields = ('path', 'revision', 'bytes', 'sha256')
+        if origin.get('status') != 'FETCHED' or any(origin[k] != fetched[k] for k in fields):
+            raise ValueError('original and provenance disagree')
+        row = {k: fetched[k] for k in fields} | {'pdb': pdb, 'receipt': str(receipt), 'receipt_sha256': sha(Path(receipt))}
+        if not manifest.exists():
+            verified(row)
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(dir=manifest.parent, mode='w', encoding='utf8', delete=False) as tmp:
+                json.dump(row, tmp, sort_keys=True)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            try:
+                try:
+                    os.link(tmp.name, manifest)
+                except FileExistsError:
+                    pass
+            finally:
+                Path(tmp.name).unlink(missing_ok=True)
+    if not manifest.is_file():
+        return None, None
+    stored = read_json(manifest)
+    if (stored['pdb'] != pdb or (fetched and stored['sha256'] != fetched['sha256'])
+            or sha(Path(stored['receipt'])) != stored['receipt_sha256']):
+        raise ValueError('conflicting shared fixed source or changed provenance')
+    return verified(stored), str(manifest)
+
+
+def attempted_revision(run, pdb):
+    for path in reversed(apo_c_pilot.attempts(run / 'fetch' / f'{pdb}.json')):
+        row = read_json(path)
+        url = row.get('request', {}).get('url', '')
+        match = re.fullmatch(r'https://files-versioned\.rcsb\.org/pdb_versioned/data/entries/[a-z0-9]{2}/'
+                             + f'pdb_0000{pdb.lower()}/pdb_0000{pdb.lower()}_xyz_v' + r'(\d+)-(\d+)\.cif\.gz', url)
+        if match:
+            return '.'.join(match.groups())
+    return None
+
+
 def candidate_original(run, pdb, origins, config):
     wanted = required_revision(pdb, origins, config)
     with apo_c_pilot.open_catalog(Path(read_json(run / 'run.json')['catalog'])) as db:
@@ -301,7 +362,19 @@ def candidate_original(run, pdb, origins, config):
         if source is not None:
             origin = 'wwpdb_fixed_version_download' if previous == run else 'verified_prior_run'
             return wanted, source, origin, receipt
+    shared_revision = wanted or attempted_revision(run, pdb)
+    source, receipt = shared_fixed_original(config.get('shared_originals'), pdb, shared_revision)
+    if source is not None:
+        return shared_revision, source, 'verified_sibling_original', receipt
     return wanted, None, None, None
+
+
+def deposition_context(block, holo):
+    table = block.get_mmcif_category('_pdbx_database_related.')
+    rows = [(i, str(code).upper(), str(note or '')) for i, (database, code, note) in enumerate(
+        zip(*(table.get(k, []) for k in ('db_name', 'db_id', 'details'))), 1) if str(database).upper() == 'PDB']
+    return {'entry': holo['identity']['pdb_id'], 'sha256': holo['source_sha256'],
+            'revision': holo['source_revision'], 'rows': rows}
 
 
 def study_fingerprint(pdb, current, case, run, config):
@@ -358,6 +431,7 @@ def inspect_candidate(run, case, prepared, pdb, origins, config, original=None):
                     'required_revision': wanted, 'source_gap_reason': reason}
         source = (fetched['path'], fetched['sha256'], fetched['bytes'], fetched['revision'])
         source_origin, source_receipt = 'wwpdb_fixed_version_download', str(history[-1])
+        shared_fixed_original(config.get('shared_originals'), pdb, fetched['revision'], fetched, source_receipt)
     path, _, size, _ = source
     if size > config['max_compressed_bytes']:
         return {'status': 'RESOURCE_LIMIT_REQUIRES_REVIEW', 'pdb': pdb,
@@ -690,8 +764,9 @@ def run_case(run, case, config, literature, baseline=None):
                             raise ValueError('frozen evidence has different source hints')
                         evidence['replayed_from'] = old_path
                     def assess_experiment(experiment):
-                        return literature.assess(experiment, fixed_fingerprint=lambda pdb: study_fingerprint(
-                            pdb, evidence, case, run, config))
+                        return literature.assess(experiment, source_deposit=deposition_context(prepared[0], holo),
+                                                 fixed_fingerprint=lambda pdb: study_fingerprint(
+                                                     pdb, evidence, case, run, config))
 
                     # Keep measurements and adjudication fixed for overlapping ranking relations.
                     if not rerank or old_path is None:
@@ -757,6 +832,8 @@ def main():
     p.add_argument('--per-source-rank', type=int, default=3)
     p.add_argument('--max-unique-per-holo', type=int, default=6)
     p.add_argument('--max-candidate-download-attempts', type=int, default=10)
+    p.add_argument('--author-documents', help='hash-verified manifest of raw publisher supplements')
+    p.add_argument('--shared-originals', help='directory of fixed-revision, hash-verified source receipts shared between shards')
     p.add_argument('--literature-cache', help='shared author-source cache, defaults to the parent of the Run directory')
     retry = p.add_mutually_exclusive_group()
     retry.add_argument('--retry-inspection', action='store_true',
@@ -783,7 +860,7 @@ def main():
               'max_unique_per_holo': args.max_unique_per_holo, 'max_compressed_bytes': 20000000,
               'max_asymmetric_unit_atoms': 200000, 'max_assembly_instances': 128,
               'max_candidate_download_attempts': args.max_candidate_download_attempts,
-              'max_derivative_assemblies_per_candidate': 2,
+              'max_derivative_assemblies_per_candidate': 0,
               'download_deadline_seconds': 30, 'download_order': 'round-robin-holo-missing-originals',
               'assembly_scope': 'mapped-receptor-site',
               'reuse_runs': [str(Path(x).resolve()) for x in args.reuse_run],
@@ -791,6 +868,11 @@ def main():
               'literature_cache': str(literature_cache),
               'code_sha256': {x.name: sha(x) for x in deps},
               'scientific_rule': apo_c_science.RULE, 'formal_pair_acceptance': False}
+    if args.author_documents:
+        config['author_documents'] = {'path': str(Path(args.author_documents).resolve()), 'sha256': sha(Path(args.author_documents))}
+    if not args.replay_evidence_run:
+        config['shared_originals'] = str(Path(args.shared_originals).resolve() if args.shared_originals
+                                         else run.parent.resolve() / '.apo-fixed-originals')
     replay = args.rerank_from_run or args.replay_evidence_run
     previous = Path(replay).resolve() if replay else None
     replay_key = 'rerank_from_run' if args.rerank_from_run else 'replay_evidence_run'
@@ -856,6 +938,8 @@ def main():
         baselines = [frozen_case(run, previous, case, config['max_unique_per_holo']) for case in cases]
     inspection_start = time.monotonic()
     literature = apo_c_literature.PrimaryLiterature(run, literature_cache, prior_cache=prior_cache)
+    if args.author_documents:
+        literature.author_documents = apo_c_literature.AuthorDocuments(args.author_documents)
     results = run_in_download_order(
         run_case(run, case, config, literature, baseline) for case, baseline in zip(cases, baselines))
     if previous is not None and any(result['holo_evidence']['status'] != 'HOLO_OBSERVED_SITE_READY' for result in results):

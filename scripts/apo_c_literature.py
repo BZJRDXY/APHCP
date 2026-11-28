@@ -174,11 +174,43 @@ def explicitly_unbound(description):
             and not re.search(r'\+|\bor\b|\b(?:liganded|holo)\b', description, re.I))
 
 
+BACKGROUND_STATE = re.compile(
+    r'\b(?:no (?:\w+ ){0,4}(?:structures?|data)|neither|never|previous(?:ly)?|yet to be|remains? unknown|'
+    r'not (?:yet |previously )?(?:available|reported|known|solved|determined)|lacking|unavailable|'
+    r'would|might|predicted|template|used (?:as|for) (?:a )?(?:model|molecular replacement))\b', re.I)
+PRESENT_RESULT = re.compile(
+    r'\b(?:we (?:also |have |here |now )*(?:report|present|determined?|describe|obtained?|solved?|show|reveal)\w*|'
+    r'here[, ]|this (?:work|study)|we crystall[iy][sz]ed|(?:crystalli[sz]es? only at|determined at .{0,30}resolution|'
+    r'(?:apo states?|structural studies|crystal structures?|co-crystallization).{0,110}?reveal(?:s|ed)?\b)|'
+    r'(?:was|were|have been|has been) (?:also )?(?:determined|solved|obtained|reported)|'
+    r'(?:the|a) (?:first )?(?:crystal |x[- ]ray )?structures? (?:of|in) .{0,80} (?:is|are) (?:presented|reported))\b', re.I)
+
+
 def reported_apo_structure(abstract):
     for sentence in re.split(r'(?<=[.!?])\s+(?=[A-Z])', abstract):
-        if APO_STATE.search(sentence) and STRUCTURE_REPORT.search(sentence) and not NONEXPERIMENTAL.search(sentence):
+        if (APO_STATE.search(sentence) and STRUCTURE_REPORT.search(sentence) and PRESENT_RESULT.search(sentence)
+                and not NONEXPERIMENTAL.search(sentence) and not BACKGROUND_STATE.search(sentence)
+                and not re.search(r'\b(?:not|never|no)\b.{0,34}\b' + APO_WORDS + r'\b', sentence, re.I)):
             return sentence
     return None
+
+
+def fixed_relation_support(experiment, source):
+    """A relation labels the accession on its own row, never the structure containing it."""
+    if not source or experiment.get('preparation_conflicts_or_unresolved_additions'):
+        return None
+    entry = experiment['source_entry'].upper()
+    if entry == source['entry'] or BOUND_STATE.search(experiment['title']) or ACTIVE_SITE_INHIBITED.search(experiment['title']):
+        return None
+    rows = [(i, note) for i, pdb, note in source['rows'] if pdb == entry]
+    if not rows or not all(note and explicitly_unbound(note) and not BACKGROUND_STATE.search(note)
+                           and not re.search(r'\b(?:hypothes\w*|predicted|cofactor[- ]free|metal[- ]free|'
+                                             r'apolipoprotein|apo[- ](?:heme|zinc|calcium|metal)|by analogy)\b', note, re.I)
+                           for _, note in rows):
+        return None
+    return {'basis': 'FIXED_HOLO_DEPOSITION_NAMES_CANDIDATE_STATE', 'entry': entry,
+            'source_entry': source['entry'], 'source_sha256': source['sha256'], 'source_revision': source['revision'],
+            'field': '_pdbx_database_related.details', 'row_numbers': [i for i, _ in rows], 'excerpt': rows[0][1]}
 
 
 def author_deposition_state(text, entry, paragraphs):
@@ -544,6 +576,46 @@ def wait_for_ncbi(shared_cache):
         handle.flush()
 
 
+class AuthorDocuments:
+    """Index explicit experimental groups in archived publisher files once per process."""
+    def __init__(self, manifest):
+        self.by_entry = {}
+        manifest = Path(manifest)
+        for doc in json.loads(manifest.read_text(encoding='utf8'))['documents']:
+            path = Path(doc['path'])
+            payload = path.read_bytes()
+            url = urlsplit(doc['url'])
+            if (url.scheme != 'https' or url.hostname != 'journals.iucr.org' or not doc['doi'].startswith('10.1107/')
+                    or sha256(payload).hexdigest() != doc['sha256'] or not payload.startswith(b'%PDF-')):
+                raise ValueError('unverified author supplement')
+            layout = pdf_layout(payload)
+            if layout is None:
+                raise ValueError('author supplement could not be read')
+            for page, text in enumerate(layout.split('\f'), 1):
+                for paragraph in re.split(r'(?=^\s*(?:Figure|Table)\s+S?\d+\b)', text, flags=re.M):
+                    caption = ' '.join(paragraph.split())
+                    figure = re.match(r'^(Figure\s+S?\d+)\b', caption, re.I)
+                    if not figure or not re.search(r'(?<![a-z])in (?:the |an? )?(?:unligated|unliganded|apo|unbound) (?:state|form) for\b', caption, re.I):
+                        continue
+                    group = re.search(r'\bstructures (?:represented|shown) are PDB (?:codes|entries)\s+([^.;]{4,330})(?:\.|;)', caption, re.I)
+                    if not group or BACKGROUND_STATE.search(caption[:group.end()]) or BOUND_STATE.search(caption[:group.end()]):
+                        continue
+                    codes = [m.group().upper() for m in PDB_ID.finditer(group[1])]
+                    if not 2 <= len(codes) <= 20 or len(codes) != len(set(codes)):
+                        continue
+                    # Only one unbound group, with accession/color labels and no competing arm.
+                    stripped = re.sub(r'\([A-Za-z -]{2,24}\)', '', PDB_ID.sub('', group[1]))
+                    if not re.fullmatch(r'[\s,]*(?:and[\s,]*)?', stripped, re.I):
+                        continue
+                    for code in codes:
+                        self.by_entry.setdefault(code, []).append({'basis':'AUTHOR_SUPPLEMENT_ENUMERATES_UNBOUND_STRUCTURES',
+                            'entry':code, 'doi':doc['doi'], 'source_receipt':dict(doc), 'excerpt':caption[:group.end()],
+                            'location':{'page':page,'figure':figure[1], 'accessions':codes}})
+
+    def support(self, entry):
+        return next(iter(self.by_entry.get(entry, [])), None)
+
+
 class PrimaryLiterature:
     """Reuse verified responses across Runs and read full text only for unresolved evidence."""
 
@@ -893,7 +965,7 @@ class PrimaryLiterature:
                         'source_receipt': receipt}
         return None
 
-    def assess(self, experiment, *, fixed_fingerprint=None):
+    def assess(self, experiment, *, fixed_fingerprint=None, source_deposit=None):
         entry = experiment['source_entry'].upper()
         attempts = []
         outcome = {'status': 'PRIMARY_CITATION_UNAVAILABLE', 'source_attempts': attempts}
@@ -978,6 +1050,12 @@ class PrimaryLiterature:
                         'basis': basis, 'excerpt': excerpt[:600], 'location': location}}
         except (requests.RequestException, RuntimeError, ValueError, ET.ParseError, KeyError) as exc:
             outcome['fetch_error'] = type(exc).__name__
+        if support := fixed_relation_support(experiment, source_deposit):
+            return outcome | {'support': support}
+        documents = getattr(self, 'author_documents', None)
+        if (documents and not BOUND_STATE.search(experiment['title']) and not ACTIVE_SITE_INHIBITED.search(experiment['title'])
+                and not experiment.get('preparation_conflicts_or_unresolved_additions') and (support := documents.support(entry))):
+            return outcome | {'support': support}
         if issue_support is not None:
             return outcome | {'support': issue_support}
         if supplement_source is not None and fixed_fingerprint is not None:

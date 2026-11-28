@@ -440,6 +440,39 @@ def apo_trial_section(root, source, supplemental_source=None):
 '''
 
 
+def apo_first_yield_section(root, source):
+    trial, _ = receipt(root, source)
+    c = trial['counts']
+    values = {name: count(c[name]) for name in ('targets', 'first_before', 'first_after', 'gained', 'lost',
+                                                 'pairs_before', 'pairs_after', 'pairs_gained', 'pairs_lost', 'copies_after')}
+    require(values['first_after'] == values['first_before'] + values['gained'] - values['lost'] and
+            values['pairs_after'] == values['pairs_before'] + values['pairs_gained'] - values['pairs_lost'] and
+            values['first_after'] <= values['targets'] and values['first_after'] <= values['pairs_after'] <= values['copies_after'] and
+            trial['fixed_parents_preserved'] and SHA.fullmatch(trial['new_seal']), 'Apo yield counts or output seal disagree')
+    fresh = trial['fresh_studies']
+    scored = fresh['confirmed_by_family']
+    require(sum(row['denominator'] for row in scored) == count(fresh['denominator']) and
+            sum(row['verified_reference_first'] for row in scored) == count(fresh['accepted']) and
+            all(0 <= row['verified_reference_first'] <= row['denominator'] for row in scored), 'New blind panels disagree')
+    plan = count(fresh['plan'])
+    require(0 < fresh['denominator'] <= plan and
+            count(c['targets_rerun']) + count(c['outcome_inherited']) == values['targets'],
+            'Apo panels or replay coverage disagree')
+    drill = trial['resume']
+    require(drill['forced_exit'] < 0 and drill['first_before_interrupt'] > 0 and
+            drill['resumed_targets'] >= drill['first_before_interrupt'] and
+            drill['missing'] == drill['duplicate_results'] == 0 and drill['replayed_first_unchanged'] is True,
+            'Apo worker restart was not verified')
+    copies = values['copies_after']
+    return f'''## Apo · First-pair recovery on fixed targets ({utc(trial['created_utc'])[:10]})
+
+- The same **{values['targets']}** target sites yielded a first usable Apo for **{values['first_before']} → {values['first_after']}** sites. **{values['pairs_after']}** distinct target–Apo pairs and **{copies}** chain copies passed structural readback.
+- Separately enrolled, previously unseen families yielded a first verified Apo for **{fresh['accepted']}/{fresh['denominator']}** known-positive targets. The planned reference denominator was **{fresh['plan']}**. Both panels use site-level counts. Overall recall remains unmeasured.
+- A bounded search extension inspected **{sum(trial['actions_by_mode']['tail'].values())}** extra candidates in **{trial['selected_tail_targets']}** targets. **{trial['actions_by_mode']['tail'].get('SUPPORTED_RESEARCH_PAIR', 0)}** extra pairs passed. **{trial['shared_originals']}** fixed source files were reused across shards. A forced worker exit preserved completed results when the drill restarted the same command.
+
+'''
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -513,6 +546,8 @@ def render(root: Path, current_runtime: str):
     through100 = through100_section(root, src['m3_through100']) if src.get('m3_through100') else ''
     through200 = through200_section(root, src['m3_through200']) if src.get('m3_through200') else ''
     apo = apo_trial_section(root, src['apo_trial'], src.get('apo_hidden_trial')) if src.get('apo_trial') else ''
+    if src.get('apo_first_yield'):
+        apo += apo_first_yield_section(root, src['apo_first_yield'])
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 

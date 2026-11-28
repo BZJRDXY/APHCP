@@ -9,6 +9,8 @@ import hashlib
 import html
 import io
 import json
+import os
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 import re
 import shutil
@@ -36,11 +38,27 @@ def sha(path):
     return digest.hexdigest()
 
 
-def write_json(path, data):
+def publish_bytes(path, payload):
+    """Expose a fully written file without replacing an existing receipt."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise FileExistsError(f'refusing to overwrite evidence: {path}')
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf8')
+    with NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+        staging = Path(tmp.name)
+        try:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except BaseException:
+            tmp.close()
+            staging.unlink(missing_ok=True)
+            raise
+    try:
+        os.link(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def write_json(path, data):
+    publish_bytes(path, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode('utf8'))
 
 
 def read_json(path):
@@ -59,8 +77,8 @@ def cache_get(run, name, url, params=None, timeout=25, accepted=(200, 204), vali
         if validate:
             validate(payload, info['status'])
         return payload, info
-    if body.exists() or meta.exists():
-        raise RuntimeError(f'incomplete cache entry: {base}')
+    if meta.exists():
+        raise RuntimeError(f'committed response lacks its body: {base}')
     started, clock = now(), time.monotonic()
     r = requests.get(url, params=params, timeout=(8, timeout), headers={'User-Agent': 'APHCP-apo-research-pilot/0.1'})
     elapsed = time.monotonic() - clock
@@ -69,8 +87,11 @@ def cache_get(run, name, url, params=None, timeout=25, accepted=(200, 204), vali
     if validate:
         validate(r.content, r.status_code)
     base.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(body, 'xb') as f:
-        f.write(r.content)
+    if body.exists():
+        if gzip.decompress(body.read_bytes()) != r.content:
+            raise RuntimeError(f'orphan response differs on retry: {base}; recover in a successor Run')
+    else:
+        publish_bytes(body, gzip.compress(r.content))
     info = {'url': r.url, 'status': r.status_code, 'started_utc': started, 'elapsed_s': round(elapsed, 3),
             'response_bytes': len(r.content), 'response_sha256': hashlib.sha256(r.content).hexdigest(),
             'content_type': r.headers.get('content-type')}

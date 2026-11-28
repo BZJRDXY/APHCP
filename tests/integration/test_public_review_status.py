@@ -221,6 +221,30 @@ class PublicReviewStatusTest(unittest.TestCase):
             render(self.root, self.runtime)
 
 
+    def test_apo_yield_checks_distinct_panels_and_actual_recovery(self):
+        counts = dict(targets=10, first_before=3, first_after=4, gained=1, lost=0,
+                      pairs_before=4, pairs_after=6, pairs_gained=2, pairs_lost=0,
+                      copies_after=8, targets_rerun=5, outcome_inherited=5)
+        drill = dict(forced_exit=-9, first_before_interrupt=1, resumed_targets=2, missing=0,
+                     duplicate_results=0, replayed_first_unchanged=True)
+        fresh = dict(accepted=1, denominator=2, plan=4,
+                     confirmed_by_family=[dict(denominator=2, verified_reference_first=1)])
+        row = dict(counts=counts, fresh_studies=fresh, new_seal='b'*64, fixed_parents_preserved=True,
+                   resume=drill, actions_by_mode={'tail': {'REVIEW': 3}}, selected_tail_targets=2,
+                   shared_originals=1, created_utc='2026-02-01T00:00:00Z', private='PRIVATE_TRIAL_PATH')
+        self.write(self.root / SOURCES, self.sources | {'apo_first_yield': 'yield.json'})
+        self.put('yield.json', row)
+        page = render(self.root, self.runtime)
+        for text in ('**3 → 4**', '**1/2**', 'Overall recall remains unmeasured'):
+            self.assertIn(text, page)
+        self.assertNotIn('PRIVATE_TRIAL_PATH', page)
+        for mismatch in ({'counts': counts | {'first_after': 5}},
+                         {'fresh_studies': fresh | {'denominator': 4}},
+                         {'resume': drill | {'missing': 1}}):
+            self.put('yield.json', row | mismatch)
+            with self.assertRaises(ValueError):
+                render(self.root, self.runtime)
+
     def test_batch_200_requires_verified_stop_and_separates_the_two_denominators(self):
         checks = dict(accepted=True, same_input_replay=True, provenance_and_foreign_keys_ok=True)
         gate = dict(checks, window_start=101, sealed=105, plan_entries_this_window=9,

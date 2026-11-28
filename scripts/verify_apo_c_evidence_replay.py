@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from fractions import Fraction
 from functools import cache
 import json
+import re
+import subprocess
 from pathlib import Path
 
 import gemmi
@@ -237,6 +239,39 @@ def check_mapped_atoms(sample, candidate_source, observation):
     return len(mapped)
 
 
+def check_experimental_citation(fact, delivery):
+    """Independent rejection of an absent result and verification of source-row direction."""
+    basis = fact.get('basis')
+    text = ' '.join(str(fact.get('excerpt') or '').split())
+    entry = delivery['candidate']
+    if basis == 'MATCHED_APO_DEPOSITION_AND_PRIMARY_ABSTRACT':
+        absence = re.compile(r'\b(?:no|neither|never|lack(?:ed|ing)?)\b.{0,65}\b(?:structures?|available|reported)\b|'
+                             r'\b(?:structures?|data)\b.{0,60}\b(?:unavailable|unknown|not (?:yet )?(?:known|available|reported))\b', re.I)
+        require(bool(text) and not absence.search(text), 'cited abstract describes missing or unavailable evidence')
+    if basis == 'FIXED_HOLO_DEPOSITION_NAMES_CANDIDATE_STATE':
+        source = Path(delivery['holo_original'])
+        require(fact['entry'] == entry and source_digest(source) == fact['source_sha256'] == delivery['holo_identity']['source_sha256']
+                and fact['source_revision'] == delivery['holo_identity']['revision'], 'wrong fixed deposit for the experimental state')
+        block = gemmi.cif.read(str(source)).sole_block()
+        rows = block.get_mmcif_category('_pdbx_database_related.')
+        reported = [(i, str(d)) for i, (db, k, d) in enumerate(zip(rows['db_name'], rows['db_id'], rows['details']), 1)
+                    if str(db).upper() == 'PDB' and str(k).upper() == entry]
+        require(str(block.find_value('_entry.id')).upper() == fact['source_entry'] and reported and
+                [i for i, _ in reported] == fact['row_numbers'] and text == ' '.join(reported[0][1].split()) and
+                all(re.search(r'\b(?:apo|unbound|unliganded|uninhibited|(?:ligand|inhibitor)[- ]free)\b', d, re.I)
+                    and not re.search(r'\b(?:not|negated|template|complexed|bound to|inhibited|occupied)\b', d, re.I) for _, d in reported),
+                'deposition row does not identify this candidate as experimentally unbound')
+    if basis == 'AUTHOR_SUPPLEMENT_ENUMERATES_UNBOUND_STRUCTURES':
+        loc = fact['location']; src = fact['source_receipt']; pdf = Path(src['path'])
+        require(src['doi'] == fact['doi'] and source_digest(pdf) == src['sha256'], 'supplement hash or paper identity mismatch')
+        content = subprocess.run(['pdftotext', '-layout', '-f', str(loc['page']), '-l', str(loc['page']), str(pdf), '-'],
+                                 check=True, capture_output=True, timeout=30).stdout.decode('utf8')
+        normalized = ' '.join(content.split())
+        require(text in normalized and text.startswith(loc['figure'] + ' ') and re.search(r'(?:unligated|unbound|apo|unliganded) (?:form|state)', text, re.I)
+                and 'PDB' in text and entry in re.findall(r'\b[0-9][A-Z0-9]{3}\b', text.split('PDB')[-1]),
+                'figure and candidate group cannot be reproduced from the cited page')
+
+
 def check_delivery(sample, result, evidence, delivery):
     code = delivery['candidate']
     source = evidence['candidate_source']
@@ -251,6 +286,8 @@ def check_delivery(sample, result, evidence, delivery):
             experiment['fixed_revision'] == source['revision'] and experiment['source_sha256'] == source['sha256'] and
             experiment['evidence'] and not experiment.get('literature', {}).get('conflict'),
             'unbound evidence is missing, conflicting, or belongs to another candidate')
+    for fact in experiment['evidence']:
+        check_experimental_citation(fact, delivery)
     matches = [(entity, obs) for entity in evidence['entities'] for obs in entity['assembly_observations']
                if all(obs.get(key) == copy[key] for key in OBS_KEYS)]
     require(len(matches) == 1, 'delivery does not identify exactly one inspected chain copy')

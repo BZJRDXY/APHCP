@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `1d964c5866a41e94f369b8a6dd6548248365faa5e947607cc1e29462f1a52828`
+Public runtime fingerprint (SHA-256): `2e7078f9df23594f8e9d522aa47195c8ff8a95257ce84fce73202cab9fcabc7a`
 
 ## M1 · Metadata inventory
 
@@ -98,10 +98,16 @@ Public runtime fingerprint (SHA-256): `1d964c5866a41e94f369b8a6dd6548248365faa5e
 
 ## Apo · Bounded first-run research trial
 
-- Independently checked on **2026-11-28T07:05:09+00:00**. Matches the synchronized Apo entry point.
+- Independently checked on **2026-11-28T07:05:09+00:00**. Earlier Apo entry point used.
 - Natural cohort: **56/980** targets obtained a first Apo passing structural readback. **980** targets had a terminal result. **64** distinct target–Apo relations and **170** assembly-chain copies passed readback.
 - Author-source audit confirmed **20/20** sampled relations. Review found **3** incorrect excerpts and confirmed their underlying pairs. A separate audit verified at least **2** missed targets among **10** non-deliveries checked. **0** natural-cohort copy readbacks failed.
 - Hidden positives: The main run enrolled zero verified positives. A separately sealed blind run recovered **1/3** positives. The planned enrollment was 20. The natural run took **1.83 hours**, yielding **30.5** targets with a first readback per elapsed hour.
+
+## Apo · First-pair recovery on fixed targets (2026-11-28)
+
+- The same **980** target sites yielded a first usable Apo for **56 → 63** sites. **72** distinct target–Apo pairs and **198** chain copies passed structural readback.
+- Separately enrolled, previously unseen families yielded a first verified Apo for **2/2** known-positive targets. The planned reference denominator was **20**. Both panels use site-level counts. Overall recall remains unmeasured.
+- A bounded search extension inspected **95** extra candidates in **20** targets. **0** extra pairs passed. **16** fixed source files were reused across shards. A forced worker exit preserved completed results when the drill restarted the same command.
 
 ## Open review
 
