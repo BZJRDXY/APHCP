@@ -176,18 +176,48 @@ class PublicReviewStatusTest(unittest.TestCase):
         counts = dict(natural_targets=980, natural_targets_with_terminal_results=980,
                       natural_first_readback_passed=35, natural_delivered_pairs=39, natural_chain_copies=43,
                       natural_pairs_sampled=20, natural_pairs_author_confirmed=19, natural_readback_errors=0,
+                      natural_sampled_author_unresolved=1, natural_sampled_readback_failed=0,
                       hidden_expected=20, hidden_actual=0, hidden_first_verified=0)
-        row = dict(counts=counts, created_utc='2026-01-04T09:00:00+08:00', run_elapsed_s=3600,
+        row = dict(counts=counts, created_utc='2026-01-04T09:00:00+08:00', run_elapsed_s=3600, rule='trial-rule',
                    formal_pair_acceptances=0, fixed_controls_all_pass=True, final_output_seal_sha256='a'*64,
                    autopilot_sha256=sha256(code.read_bytes()).hexdigest(), run='PRIVATE_RUN_PATH')
         self.write(self.root / SOURCES, self.sources | {'apo_trial': 'apo-trial.json'})
         self.put('apo-trial.json', row)
         page = render(self.root, self.runtime)
         self.assertIn('**35/980**', page)
+        self.assertIn('**1** author checks remained unresolved.', page)
         self.assertIn('Zero independently verified hidden positives enrolled. Recall unavailable.', page)
         self.assertNotIn('PRIVATE_RUN_PATH', page)
         self.put('apo-trial.json', row | {'counts': counts | {'hidden_first_verified': 1}})
         with self.assertRaisesRegex(ValueError, 'Apo trial aggregates do not reconcile'):
+            render(self.root, self.runtime)
+
+        self.put('apo-trial.json', row)
+        self.write(self.root / SOURCES, self.sources | {'apo_trial': 'apo-trial.json', 'apo_hidden_trial': 'hidden.json'})
+        supplemental = dict(denominator=3, reference_delivered=1, terminal_targets=3,
+                            reference_searched=3, reference_selected=3, reference_inspected=3,
+                            scientific_rule=row['rule'], autopilot_sha256=row['autopilot_sha256'],
+                            parent_final_output_seal_sha256=row['final_output_seal_sha256'],
+                            production_final_seal_sha256='b'*64, private_evidence='PRIVATE_REFERENCE_KEY')
+        self.put('hidden.json', supplemental)
+        page = render(self.root, self.runtime)
+        self.assertIn('separately sealed blind run recovered **1/3** positives', page)
+        self.assertNotIn('PRIVATE_REFERENCE_KEY', page)
+        review = dict(automated_confirmed=19, adjudicated_additional_confirmed=1, misleading_excerpt_references=3,
+                      evidence_sha256='d'*64, failure_sample_count=10, verified_missed_targets=2)
+        reviewed = row | {'counts': counts | {'natural_pairs_author_confirmed': 20, 'natural_sampled_author_unresolved': 0},
+                          'independent_author_review': review, 'verified_missed_delivery_lower_bound': 2}
+        self.put('apo-trial.json', reviewed)
+        page = render(self.root, self.runtime)
+        self.assertIn('**20/20** sampled relations', page)
+        self.assertIn('**3** incorrect excerpts', page)
+        self.assertIn('**2** missed targets among **10**', page)
+        self.put('apo-trial.json', reviewed | {'verified_missed_delivery_lower_bound': 3})
+        with self.assertRaisesRegex(ValueError, 'Apo independent author adjudication does not reconcile'):
+            render(self.root, self.runtime)
+        self.put('apo-trial.json', reviewed)
+        self.put('hidden.json', supplemental | {'parent_final_output_seal_sha256': 'c'*64})
+        with self.assertRaisesRegex(ValueError, 'Supplemental Apo trial aggregates do not reconcile'):
             render(self.root, self.runtime)
 
 

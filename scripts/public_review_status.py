@@ -368,7 +368,7 @@ def through200_section(root, source):
 '''
 
 
-def apo_trial_section(root, source):
+def apo_trial_section(root, source, supplemental_source=None):
     trial, _ = receipt(root, source)
     natural = counts(trial['counts'], ('natural_targets', 'natural_targets_with_terminal_results',
                                      'natural_first_readback_passed', 'natural_delivered_pairs', 'natural_chain_copies',
@@ -378,10 +378,12 @@ def apo_trial_section(root, source):
     hidden = count(cohort['hidden_actual'])
     reference = count(cohort['hidden_first_verified'])
     confirmed = natural['natural_first_readback_passed']
+    author_confirmed = natural['natural_pairs_author_confirmed']
+    sampled = natural['natural_pairs_sampled']
     require(0 < natural['natural_targets'] and confirmed <= natural['natural_targets_with_terminal_results'] <= natural['natural_targets'] and
             confirmed <= natural['natural_delivered_pairs'] <= natural['natural_chain_copies'] and
             natural['natural_delivered_pairs'] <= program_pairs and
-            natural['natural_pairs_author_confirmed'] <= natural['natural_pairs_sampled'] <= program_pairs and
+            author_confirmed <= sampled <= program_pairs and
             reference <= hidden <= count(cohort['hidden_expected']) and trial['formal_pair_acceptances'] == 0 and
             trial['fixed_controls_all_pass'] is True and SHA.fullmatch(trial['final_output_seal_sha256']),
             'Apo trial aggregates do not reconcile')
@@ -389,15 +391,51 @@ def apo_trial_section(root, source):
     require(SHA.fullmatch(frozen), 'Invalid verified Apo entry point digest')
     actual = sha256((root / 'scripts/apo_c_autopilot.py').read_bytes()).hexdigest()
     code = 'Matches the synchronized Apo entry point.' if actual == frozen else 'Earlier Apo entry point used.'
+    author_audit = f'Author-source audit confirmed **{author_confirmed}/{sampled}** sampled relations.'
+    if 'natural_sampled_author_unresolved' in cohort:
+        unresolved = count(cohort['natural_sampled_author_unresolved'])
+        failed = count(cohort['natural_sampled_readback_failed'])
+        require(author_confirmed + unresolved + failed == sampled, 'Apo author sample outcomes do not reconcile')
+        if unresolved:
+            author_audit += f' **{unresolved}** author checks remained unresolved.'
+    if (review := trial.get('independent_author_review')) is not None:
+        extra_confirmed = count(review['adjudicated_additional_confirmed'])
+        excerpt_defects = count(review['misleading_excerpt_references'])
+        missed = count(review['verified_missed_targets'])
+        sampled_failures = count(review['failure_sample_count'])
+        require(count(review['automated_confirmed']) + extra_confirmed == author_confirmed and
+                excerpt_defects <= author_confirmed and missed <= sampled_failures <= natural['natural_targets'] - confirmed and
+                SHA.fullmatch(review['evidence_sha256']) and
+                missed == count(trial['verified_missed_delivery_lower_bound']),
+                'Apo independent author adjudication does not reconcile')
+        author_audit += (f' Review found **{excerpt_defects}** incorrect excerpts and confirmed their underlying pairs.'
+                         f' A separate audit verified at least **{missed}** missed targets among **{sampled_failures}** non-deliveries checked.')
     recovery = f'{reference}/{hidden} hidden positives recovered.' if hidden else 'Zero independently verified hidden positives enrolled. Recall unavailable.'
+    if supplemental_source:
+        supplemental, _ = receipt(root, supplemental_source)
+        held = count(supplemental['denominator'])
+        recovered = count(supplemental['reference_delivered'])
+        inspected = count(supplemental['reference_inspected'])
+        selected = count(supplemental['reference_selected'])
+        searched = count(supplemental['reference_searched'])
+        planned = count(cohort['hidden_expected'])
+        require(hidden == 0 and 0 < held <= planned and recovered <= inspected <= selected <= searched <= held and
+                held == count(supplemental['terminal_targets']) and
+                supplemental['autopilot_sha256'] == frozen and supplemental['scientific_rule'] == trial['rule'] and
+                supplemental['parent_final_output_seal_sha256'] == trial['final_output_seal_sha256'] and
+                SHA.fullmatch(supplemental['production_final_seal_sha256']) and
+                supplemental['production_final_seal_sha256'] != trial['final_output_seal_sha256'],
+                'Supplemental Apo trial aggregates do not reconcile')
+        recovery = (f'The main run enrolled zero verified positives. A separately sealed blind run recovered '
+                    f'**{recovered}/{held}** positives. The planned enrollment was {planned}.')
     hours = trial['run_elapsed_s'] / 3600
     require(hours > 0, 'Invalid Apo trial duration')
     return f'''## Apo · Bounded first-run research trial
 
 - Independently checked on **{utc(trial['created_utc'])}**. {code}
-- Natural cohort: **{confirmed:,}/{natural['natural_targets']:,}** targets obtained a first Apo passing structural readback. **{natural['natural_delivered_pairs']:,}** distinct target–Apo relations and **{natural['natural_chain_copies']:,}** assembly-chain copies passed readback.
-- Author-source audit confirmed **{natural['natural_pairs_author_confirmed']}/{natural['natural_pairs_sampled']}** sampled relations. **{count(cohort['natural_readback_errors'])}** natural-cohort copy readbacks failed.
-- Hidden positives: {recovery} Running time **{hours:.2f} hours**, with **{confirmed / hours:.1f}** targets reaching a first readback per elapsed hour.
+- Natural cohort: **{confirmed:,}/{natural['natural_targets']:,}** targets obtained a first Apo passing structural readback. **{natural['natural_targets_with_terminal_results']:,}** targets had a terminal result. **{natural['natural_delivered_pairs']:,}** distinct target–Apo relations and **{natural['natural_chain_copies']:,}** assembly-chain copies passed readback.
+- {author_audit} **{count(cohort['natural_readback_errors'])}** natural-cohort copy readbacks failed.
+- Hidden positives: {recovery} The natural run took **{hours:.2f} hours**, yielding **{confirmed / hours:.1f}** targets with a first readback per elapsed hour.
 
 '''
 
@@ -474,7 +512,7 @@ def render(root: Path, current_runtime: str):
     speed = pipeline_speed_section(root, src['m3_pipeline_speed']) if src.get('m3_pipeline_speed') else ''
     through100 = through100_section(root, src['m3_through100']) if src.get('m3_through100') else ''
     through200 = through200_section(root, src['m3_through200']) if src.get('m3_through200') else ''
-    apo = apo_trial_section(root, src['apo_trial']) if src.get('apo_trial') else ''
+    apo = apo_trial_section(root, src['apo_trial'], src.get('apo_hidden_trial')) if src.get('apo_trial') else ''
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 

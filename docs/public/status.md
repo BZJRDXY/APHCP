@@ -96,6 +96,13 @@ Public runtime fingerprint (SHA-256): `1d964c5866a41e94f369b8a6dd6548248365faa5e
 - The unpublished catalog has **681,283** retrievable systems, including **22,143** confirmed in staging. PDB entries and systems use different denominators. Formal releases: **0**.
 - Net throughput including retries and catalog merges: **2,588.29 entries/hour** in batches 101–105 with the backup feed; **3,340.21 entries/hour** in batches 106–200 after switching to the server-only feed. Execution code: `29691cdfadd5576639f52652692682fe77a38cdb`.
 
+## Apo · Bounded first-run research trial
+
+- Independently checked on **2026-11-28T07:05:09+00:00**. Matches the synchronized Apo entry point.
+- Natural cohort: **56/980** targets obtained a first Apo passing structural readback. **980** targets had a terminal result. **64** distinct target–Apo relations and **170** assembly-chain copies passed readback.
+- Author-source audit confirmed **20/20** sampled relations. Review found **3** incorrect excerpts and confirmed their underlying pairs. A separate audit verified at least **2** missed targets among **10** non-deliveries checked. **0** natural-cohort copy readbacks failed.
+- Hidden positives: The main run enrolled zero verified positives. A separately sealed blind run recovered **1/3** positives. The planned enrollment was 20. The natural run took **1.83 hours**, yielding **30.5** targets with a first readback per elapsed hour.
+
 ## Open review
 
 - Measure sustained whole-catalog throughput and allocated storage; the bounded scale gate is not a completion date.
