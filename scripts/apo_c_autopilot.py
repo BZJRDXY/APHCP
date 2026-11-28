@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 import requests
 from scipy.spatial import cKDTree
 
+import apo_c_author_documents
 import apo_c_literature
 import apo_c_pair
 import apo_c_pilot
@@ -535,7 +536,7 @@ def has_technical_gap(evidence):
             or any(o.get('status') == 'TECHNICAL_FAILURE' for e in evidence.get('entities', [])
                    for o in e.get('assembly_observations', []))
             or bool(evidence.get('candidate_sifts_error'))
-            or bool((literature.get('fetch_error') or literature.get('related_deposit_fetch_error'))
+            or bool((literature.get('fetch_error') or literature.get('related_deposit_fetch_error') or literature.get('publisher_source_unavailable'))
                     and not science.get('delivery_eligible')))
 
 
@@ -833,6 +834,8 @@ def main():
     p.add_argument('--max-unique-per-holo', type=int, default=6)
     p.add_argument('--max-candidate-download-attempts', type=int, default=10)
     p.add_argument('--author-documents', help='hash-verified manifest of raw publisher supplements')
+    p.add_argument('--max-publisher-candidates', type=int, default=6,
+                   help='maximum unresolved candidates per new shard to look up in publisher supplements (0 disables lookup)')
     p.add_argument('--shared-originals', help='directory of fixed-revision, hash-verified source receipts shared between shards')
     p.add_argument('--literature-cache', help='shared author-source cache, defaults to the parent of the Run directory')
     retry = p.add_mutually_exclusive_group()
@@ -843,6 +846,8 @@ def main():
     args = p.parse_args()
     if not 1 <= args.per_source_rank <= 10 or not 1 <= args.max_unique_per_holo <= 30:
         p.error('invalid candidate inspection budget')
+    if not 0 <= args.max_publisher_candidates <= 30:
+        p.error('publisher candidate budget must be between 0 and 30')
     if args.max_candidate_download_attempts < 0:
         p.error('invalid candidate download budget')
     if args.replay_evidence_run and (args.retry_failed or args.retry_inspection or args.reuse_search_run or args.reuse_run):
@@ -855,6 +860,9 @@ def main():
             Path(apo_c_rank_audit.__file__), Path(apo_c_science.__file__), Path(apo_c_triplet_regression.__file__),
             Path(apo_c_union_triage.__file__), Path(holo_source_mapping.__file__), Path(apo_c_literature.__file__),
             Path(apo_c_priority.__file__)]
+    live_publisher_lookup = args.max_publisher_candidates if not (args.author_documents or args.replay_evidence_run or args.rerank_from_run) else 0
+    if live_publisher_lookup:
+        deps.append(Path(apo_c_author_documents.__file__))
     config = {'sample_spec_sha256': sha(sample_path), 'catalog': str(Path(args.catalog).resolve()),
               'index': str(Path(args.index).resolve()), 'per_source_rank': args.per_source_rank,
               'max_unique_per_holo': args.max_unique_per_holo, 'max_compressed_bytes': 20000000,
@@ -868,6 +876,8 @@ def main():
               'literature_cache': str(literature_cache),
               'code_sha256': {x.name: sha(x) for x in deps},
               'scientific_rule': apo_c_science.RULE, 'formal_pair_acceptance': False}
+    if live_publisher_lookup:
+        config['max_publisher_candidates'] = live_publisher_lookup
     if args.author_documents:
         config['author_documents'] = {'path': str(Path(args.author_documents).resolve()), 'sha256': sha(Path(args.author_documents))}
     if not args.replay_evidence_run:
@@ -940,6 +950,8 @@ def main():
     literature = apo_c_literature.PrimaryLiterature(run, literature_cache, prior_cache=prior_cache)
     if args.author_documents:
         literature.author_documents = apo_c_literature.AuthorDocuments(args.author_documents)
+    elif live_publisher_lookup:
+        literature.publisher_discovery = apo_c_author_documents.CandidateDocuments(run, literature_cache, live_publisher_lookup)
     results = run_in_download_order(
         run_case(run, case, config, literature, baseline) for case, baseline in zip(cases, baselines))
     if previous is not None and any(result['holo_evidence']['status'] != 'HOLO_OBSERVED_SITE_READY' for result in results):

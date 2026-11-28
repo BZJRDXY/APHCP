@@ -2,7 +2,7 @@
 
 Generated during GitHub synchronization from accepted local receipts. The dates below are **evidence dates**, not the time this page was generated. This snapshot describes inventory and unpublished staging; it is not a dataset release or a live service status.
 
-Public runtime fingerprint (SHA-256): `2e7078f9df23594f8e9d522aa47195c8ff8a95257ce84fce73202cab9fcabc7a`
+Public runtime fingerprint (SHA-256): `9b82b2bef8fa7d349104809e16d185bae7053ff957298228b51a1a6402ac2e7e`
 
 ## M1 · Metadata inventory
 
@@ -108,6 +108,8 @@ Public runtime fingerprint (SHA-256): `2e7078f9df23594f8e9d522aa47195c8ff8a95257
 - The same **980** target sites yielded a first usable Apo for **56 → 63** sites. **72** distinct target–Apo pairs and **198** chain copies passed structural readback.
 - Separately enrolled, previously unseen families yielded a first verified Apo for **2/2** known-positive targets. The planned reference denominator was **20**. Both panels use site-level counts. Overall recall remains unmeasured.
 - A bounded search extension inspected **95** extra candidates in **20** targets. **0** extra pairs passed. **16** fixed source files were reused across shards. A forced worker exit preserved completed results when the drill restarted the same command.
+
+On 2026-11-28, a subsequent test supplied only Holo inputs for **2** previously reviewed targets. The ordinary search and assessment workflow delivered **2** target–Apo pairs with publisher figures and verified structures. Publisher discovery used **6** HTTP requests. These controls add no new blind cases.
 
 ## Open review
 

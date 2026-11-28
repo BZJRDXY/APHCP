@@ -473,6 +473,27 @@ def apo_first_yield_section(root, source):
 '''
 
 
+def apo_publisher_entry_section(root, source):
+    control, _ = receipt(root, source)
+    rows = control['rows']
+    require(control['unblinded_engineering_controls'] is True and rows and
+            len({r['holo'] for r in rows}) == len(rows), 'Apo publisher control scope does not reconcile')
+    for r in rows:
+        delivered = set(r['delivered'])
+        require(r['input_fields'] == ['id', 'question', 'split'] and
+                SHA.fullmatch(r['result_sha256']) and SHA.fullmatch(r['config_sha256']) and
+                delivered == {k for k, v in r['decisions'].items() if v == 'SUPPORTED_RESEARCH_PAIR'} and
+                len(delivered) <= count(r['copies_read_back']) and
+                all(v and all(p['basis'] == 'AUTHOR_SUPPLEMENT_ENUMERATES_UNBOUND_STRUCTURES' and p['page'] > 0
+                              for p in v) for v in r['delivered'].values()), 'Apo publisher entry readback disagrees')
+    pairs = sum(len(r['delivered']) for r in rows)
+    requests = sum(count(r['publisher_cost'].get('requests', 0)) for r in rows)
+    return (f'On {utc(control["created_utc"])[:10]}, a subsequent test supplied only Holo inputs for '
+            f'**{len(rows)}** previously reviewed targets. The ordinary search and assessment workflow '
+            f'delivered **{pairs}** target–Apo pairs with publisher figures and verified structures. '
+            f'Publisher discovery used **{requests}** HTTP requests. These controls add no new blind cases.\n\n')
+
+
 def render(root: Path, current_runtime: str):
     require(SHA.fullmatch(current_runtime), 'Invalid current public runtime fingerprint')
     src = json.loads((root / SOURCES).read_text(encoding='utf-8-sig'))
@@ -548,6 +569,8 @@ def render(root: Path, current_runtime: str):
     apo = apo_trial_section(root, src['apo_trial'], src.get('apo_hidden_trial')) if src.get('apo_trial') else ''
     if src.get('apo_first_yield'):
         apo += apo_first_yield_section(root, src['apo_first_yield'])
+    if src.get('apo_publisher_entry'):
+        apo += apo_publisher_entry_section(root, src['apo_publisher_entry'])
     pending = '\n'.join(f'- {PENDING[k]}' for k in src['open_review']) or '- None listed in this snapshot.'
     return f'''# APHCP public verification snapshot
 

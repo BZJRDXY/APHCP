@@ -1053,8 +1053,9 @@ class PrimaryLiterature:
         if support := fixed_relation_support(experiment, source_deposit):
             return outcome | {'support': support}
         documents = getattr(self, 'author_documents', None)
-        if (documents and not BOUND_STATE.search(experiment['title']) and not ACTIVE_SITE_INHIBITED.search(experiment['title'])
-                and not experiment.get('preparation_conflicts_or_unresolved_additions') and (support := documents.support(entry))):
+        can_use_supplement = (not BOUND_STATE.search(experiment['title']) and not ACTIVE_SITE_INHIBITED.search(experiment['title'])
+                              and not experiment.get('preparation_conflicts_or_unresolved_additions'))
+        if documents and can_use_supplement and (support := documents.support(entry)):
             return outcome | {'support': support}
         if issue_support is not None:
             return outcome | {'support': issue_support}
@@ -1070,4 +1071,13 @@ class PrimaryLiterature:
                 return outcome | {'support': support}
         except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
             outcome['related_deposit_fetch_error'] = type(exc).__name__
+        discovery = getattr(self, 'publisher_discovery', None)
+        if discovery and can_use_supplement:
+            support, record = discovery.lookup(entry)
+            attempts.append({'kind': 'PUBLISHER_REFERENCING_CANDIDATE', 'entry': entry, **record})
+            self.stats['publisher_lookup_' + record['status'].lower()] += 1
+            if support:
+                return outcome | {'support': support}
+            if record['status'] == 'SOURCE_UNAVAILABLE':
+                outcome['publisher_source_unavailable'] = True
         return outcome

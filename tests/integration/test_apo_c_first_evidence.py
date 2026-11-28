@@ -30,6 +30,34 @@ class FirstApoEvidence(unittest.TestCase):
         for bad in ['not apo', 'apo or ligand-bound', 'apo template']:
             self.assertIsNone(fixed_relation_support(ex,source|{'rows':source['rows']+[(3,'1ABC',bad)]}))
 
+    def test_optional_discovery_bounds_and_reuses_unresolved_accessions(self):
+        from apo_c_author_documents import CandidateDocuments
+
+        def unavailable(candidates, out, **options):
+            self.assertEqual(candidates, ['1ABC'])
+            self.assertLessEqual(options['max_requests'], 8)
+            write_json(out / 'documents.json', {'documents': []})
+            write_json(out / 'collection.json', {'http': {'requests': 1}, 'unavailable': {'Timeout': 1}})
+
+        def no_documents(candidates, out, **options):
+            write_json(out / 'documents.json', {'documents': []})
+            write_json(out / 'collection.json', {'http': {'requests': 1}, 'unavailable': {}})
+
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            resolver = CandidateDocuments(root, root / 'cache', 1)
+            with patch('apo_c_author_documents.discover', side_effect=unavailable) as discover:
+                self.assertEqual(resolver.lookup('1ABC')[1]['status'], 'SOURCE_UNAVAILABLE')
+                self.assertEqual(resolver.lookup('1ABC')[1]['status'], 'SOURCE_UNAVAILABLE')
+                self.assertEqual(resolver.lookup('2ABC')[1]['status'], 'CANDIDATE_BUDGET')
+                self.assertEqual(discover.call_count, 1)
+            with patch('apo_c_author_documents.discover', side_effect=no_documents) as discover:
+                resumed = CandidateDocuments(root, root / 'cache', 1)
+                self.assertEqual(resumed.lookup('1ABC')[1]['status'], 'COMPLETE')
+                second = CandidateDocuments(root, root / 'cache', 1)
+                self.assertEqual(second.lookup('1ABC')[1]['status'], 'COMPLETE')
+                self.assertEqual(discover.call_count, 1)
+
     def test_fixed_revision_and_provenance_survive_shard_reuse(self):
         from test_apo_c_recovery import fixed_cif
         with TemporaryDirectory() as td:

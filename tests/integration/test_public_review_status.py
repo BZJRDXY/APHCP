@@ -245,6 +245,21 @@ class PublicReviewStatusTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 render(self.root, self.runtime)
 
+    def test_publisher_controls_exclude_reference_ids_and_check_delivered_states(self):
+        row = dict(holo='PRIVATE_TARGET', result_sha256='a'*64, config_sha256='b'*64,
+                   input_fields=['id','question','split'], copies_read_back=1,
+                   delivered={'1ABC': [{'basis': 'AUTHOR_SUPPLEMENT_ENUMERATES_UNBOUND_STRUCTURES', 'page': 2}]},
+                   decisions={'1ABC': 'SUPPORTED_RESEARCH_PAIR'}, publisher_cost={'requests': 2})
+        control = dict(unblinded_engineering_controls=True, rows=[row], created_utc='2026-02-01T00:00:00Z')
+        self.write(self.root / SOURCES, self.sources | {'apo_publisher_entry': 'entry.json'})
+        self.put('entry.json', control)
+        page = render(self.root, self.runtime)
+        self.assertIn('add no new blind cases', page)
+        self.assertNotIn('PRIVATE_TARGET', page)
+        self.put('entry.json', control | {'rows': [row | {'decisions': {'1ABC': 'REVIEW'}}]})
+        with self.assertRaisesRegex(ValueError, 'readback disagrees'):
+            render(self.root, self.runtime)
+
     def test_batch_200_requires_verified_stop_and_separates_the_two_denominators(self):
         checks = dict(accepted=True, same_input_replay=True, provenance_and_foreign_keys_ok=True)
         gate = dict(checks, window_start=101, sealed=105, plan_entries_this_window=9,
