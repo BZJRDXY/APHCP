@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from fractions import Fraction
 from functools import cache
 import json
 from pathlib import Path
@@ -19,6 +20,10 @@ ASSEMBLY_CHECKS = ('source_identity_revision_and_hash_ok', 'output_model_matches
                    'applicable_connection_endpoints_ok', 'hash_ok')
 GEOMETRY_CHECKS = ('holo_site_matches_source', 'candidate_site_observed_count_matches',
                    'candidate_contact_set_and_distances_match')
+RRF_K = 60
+RANKING_CONTROLS = (('3Q71', '4ABK', 'SCIENTIFIC_EXCLUSION', 'OCCUPIED', 'OCCUPIED_MAPPED_SUBSITE'),
+                    ('2E3N', '2E3S', 'REVIEW', 'INCOMPLETE', 'MAPPED_SITE_NOT_FULLY_OBSERVED'))
+RANKING_REFERENCE_REQUESTS = (('1AQ1', '3PXR'), ('1AQ1', '1HCL'), ('1AQ1', '1BUH'), ('1AQ1', '5IF1'))
 source_digest = cache(digest)
 
 
@@ -92,6 +97,116 @@ def compare_cases(baseline, replay):
             require(source == source_identity(candidates[code]), f'{target}/{code}: frozen candidate source differs')
             checked_sources += source is not None
     return checked_sources
+
+
+def frozen_source_ranks(search, holo):
+    plinder = sorted(search['plinder'].get('links', []), key=lambda row: (row['rank'], row['linked_structure_id']))
+    routes = {
+        'PLINDER': (row['source_entry_id'] for row in plinder),
+        'AHoJ': (row['pdb'] for match in search['ahoj'].get('matches', []) for row in match['apo']),
+        'RCSB': (hit['identifier'].split('_', 1)[0] for query in search['sifts_rcsb'].get('searches', [])
+                 for hit in query['hits']),
+    }
+    ranks = defaultdict(dict)
+    for route, entries in routes.items():
+        unique = dict.fromkeys(entry.upper() for entry in entries if entry.upper() != holo)
+        for rank, entry in enumerate(unique, 1):
+            ranks[entry][route] = rank
+    return ranks
+
+
+def rrf_score(source_ranks):
+    return sum(Fraction(1, RRF_K + rank) for rank in source_ranks.values())
+
+
+def independent_fusion(ranks):
+    return sorted(ranks, key=lambda entry: (-rrf_score(ranks[entry]), min(ranks[entry].values()), entry))
+
+
+@cache
+def check_ranked_source(path, code, revision):
+    block = gemmi.cif.read(path).sole_block()
+    rows = block.find('_pdbx_audit_revision_history.', ['data_content_type', 'major_revision', 'minor_revision'])
+    versions = [(int(row[1]), int(row[2])) for row in rows
+                if gemmi.cif.as_string(row[0]).casefold() == 'structure model']
+    require(gemmi.cif.as_string(block.find_value('_entry.id') or '').upper() == code and versions and
+            '.'.join(map(str, max(versions))) == revision, f'{path}: source Entry or revision differs')
+
+
+def ranking_configs(baseline_root, replay_root, shards):
+    for shard in sorted(shards):
+        before, after = baseline_root / shard, replay_root / shard
+        old, new = (read_json(p / 'frozen_config.json') for p in (before, after))
+        require(new['rerank_from_run'] == str(before) and new['prior_literature_cache'] == old['literature_cache'],
+                f'{shard}: ranking input or prior literature cache differs')
+        for key in ('catalog', 'index', 'sample_spec_sha256', 'scientific_rule', 'formal_pair_acceptance'):
+            require(old[key] == new[key], f'{shard}: frozen configuration changed: {key}')
+        old_code, new_code = (dict(config['code_sha256']) for config in (old, new))
+        for code in (old_code, new_code):
+            del code['apo_c_autopilot.py']
+        require(old_code == new_code, f'{shard}: frozen scientific or search dependency changed')
+
+
+def compare_ranking(baseline, replay):
+    require(list(baseline) == list(replay), 'Holo order or identity differs across shards')
+    fixed_entries = defaultdict(set)
+    for _, _, candidates, _ in baseline.values():
+        for code, evidence in candidates.items():
+            if source := source_identity(evidence):
+                fixed_entries[code].add(source)
+    counts, statuses, cases, ranks_by_target = Counter(), Counter(), [], {}
+    for target, (old_sample, old, old_candidates, old_shard) in baseline.items():
+        sample, result, candidates, shard = replay[target]
+        require(old_sample == sample and old_shard == shard, f'{target}: frozen Holo input or shard differs')
+        require(old['holo_system']['sha256'] == result['holo_system']['sha256'] and
+                old['holo_evidence'] == result['holo_evidence'], f'{target}: frozen Holo evidence differs')
+        require(old['search_sha256'] == result['search_sha256'], f'{target}: frozen search differs')
+        ranks = frozen_source_ranks(read_json(old['search_evidence']), sample['pdb'])
+        fused = independent_fusion(ranks)
+        ranks_by_target[target] = {entry: rank for rank, entry in enumerate(fused, 1)}
+        quota = len(old_candidates)
+        priority = {'method': 'reciprocal_rank_fusion', 'k': RRF_K, 'candidate_quota': quota}
+        require(list(candidates) == fused[:quota] and len(candidates) == quota and
+                result['candidate_priority'] == priority,
+                f'{target}: order or metadata disagrees with independent RRF and frozen quota')
+        for selection in result['selected_candidates']:
+            actual = {route: row['entry_rank'] for route, row in selection['sources'].items()}
+            require(actual == ranks[selection['pdb']],
+                    f'{target}/{selection["pdb"]}: selected source ranks differ from frozen search')
+        added = [code for code in candidates if code not in old_candidates]
+        dropped = [code for code in old_candidates if code not in candidates]
+        counts['replaced_slots'] += len(added)
+        counts['targets_with_replacements'] += bool(added)
+        old_deliveries = {delivery['candidate'] for delivery in old['deliveries']}
+        new_deliveries = {delivery['candidate'] for delivery in result['deliveries']}
+        rows = []
+        for rank, (code, evidence) in enumerate(candidates.items(), 1):
+            require(evidence['pdb'] == code, f'{target}/{code}: candidate evidence Entry differs')
+            source = source_identity(evidence)
+            outcome = relation_outcome(evidence)
+            if code in old_candidates:
+                previous = old_candidates[code]
+                require(source == source_identity(previous), f'{target}/{code}: frozen candidate source differs')
+                ignored = {'replayed_from', 'materialized_assemblies'}
+                current_fields = {key: evidence[key] for key in evidence.keys() - ignored}
+                previous_fields = {key: previous[key] for key in previous.keys() - ignored}
+                require(current_fields == previous_fields, f'{target}/{code}: frozen observation evidence differs')
+                source_kind = 'overlap_fixed' if source else 'overlap_gap'
+            elif source:
+                check_ranked_source(evidence['candidate_source']['path'], code, source[0])
+                source_kind = 'added_reuses_baseline_entry' if source in fixed_entries[code] else 'added_original'
+            else:
+                source_kind = 'added_gap'
+            counts[source_kind] += 1
+            statuses[outcome['scientific_status']] += 1
+            rows.append({'pdb': code, 'rank': rank, 'source_ranks': ranks[code],
+                         'rrf_score': str(rrf_score(ranks[code])), 'source_kind': source_kind,
+                         'delivered': code in new_deliveries, **outcome})
+        cases.append({'target': target, 'holo': sample['pdb'], 'quota': quota, 'search_sha256': old['search_sha256'],
+                      'baseline_candidates': list(old_candidates), 'selected': rows, 'added': added, 'dropped': dropped,
+                      'retained_pairs': sorted(old_deliveries & new_deliveries),
+                      'new_pairs': sorted(new_deliveries - old_deliveries), 'lost_pairs': sorted(old_deliveries - new_deliveries)})
+    return {'counts': dict(counts), 'scientific_status_counts': dict(statuses), 'cases': cases}, ranks_by_target
 
 
 def atom_names(residue):
@@ -193,6 +308,47 @@ def target_outcomes(cases, pairs, requests):
     return outcomes
 
 
+def check_ranking_controls(baseline, replay, pairs, ranks_by_target):
+    controls = []
+    for holo, code, status, site_status, reason in RANKING_CONTROLS:
+        matching = [target for target, (sample, _, candidates, _) in baseline.items()
+                    if sample['pdb'] == holo and code in candidates]
+        require(len(matching) == 1, f'{holo}/{code}: frozen control is not unique')
+        target = matching[0]
+        selected = code in replay[target][2]
+        sample, result, candidates, _ = (replay if selected else baseline)[target]
+        evidence = candidates[code]
+        require((target, code) not in pairs and evidence['scientific_decision']['status'] == status,
+                f'{target}/{code}: control was delivered or changed scientific status')
+        observations = []
+        for entity in evidence['entities']:
+            for observation in entity['assembly_observations']:
+                decision = observation.get('decision', {})
+                if decision.get('site_observation', {}).get('status') != site_status or reason not in decision['reasons']:
+                    continue
+                geometry = check_observation(sample, result['holo_evidence'], evidence, entity, observation)
+                require(all(geometry[key] for key in GEOMETRY_CHECKS), f'{target}/{code}: control geometry differs')
+                recorded_missing = decision['unknown_holo_positions']
+                if site_status == 'OCCUPIED':
+                    require(geometry['actual_nonwater_within_4A'] > 0, f'{target}/{code}: no actual occupied site')
+                else:
+                    candidate = gemmi.read_structure(evidence['candidate_source']['path'])
+                    _, rows = instances(candidate, observation['assembly'])[observation['instance']]
+                    residues = {res.label_seq: res for _, res in rows if res.label_seq is not None}
+                    missing = [row['holo_label_seq'] for row in observation['mapped_site']
+                               if row['candidate_label_seq'] not in residues or
+                               not atom_names(residues[row['candidate_label_seq']])]
+                    require(132 in recorded_missing and 132 in missing, f'{target}/{code}: position 132 is not absent')
+                observations.append({'geometry': geometry, 'unknown_holo_positions': recorded_missing,
+                                     'reasons': decision['reasons']})
+        require(observations, f'{target}/{code}: no observation established control status {site_status}')
+        controls.append({'target': target, 'holo': holo, 'candidate': code, 'selected': selected,
+                         'rrf_rank': ranks_by_target[target].get(code), 'delivered': False, 'status': status,
+                         'site_status': site_status, 'geometry_input': 'replay' if selected else 'baseline_only',
+                         'observations': observations})
+    return controls
+
+
 def relation_outcome(evidence):
     scientific = evidence['scientific_decision']
     decisions = [row['decision'] for entity in evidence.get('entities', [])
@@ -221,6 +377,7 @@ def main():
     parser.add_argument('--baseline', required=True, type=Path)
     parser.add_argument('--replay', required=True, type=Path)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--ranking-replay', action='store_true', help='audit an equal-quota RRF selection replay')
     parser.add_argument('--target', action='append', nargs=2, metavar=('HOLO', 'CANDIDATE'), default=[])
     parser.add_argument('--expected-shards', type=int, default=10)
     parser.add_argument('--expected-holo', type=int, default=100)
@@ -228,7 +385,8 @@ def main():
     parser.add_argument('--expected-sources', type=int, default=415)
     args = parser.parse_args()
     baseline_root, replay_root = args.baseline.resolve(), args.replay.resolve()
-    output = (args.output or replay_root / 'quality' / 'evidence_replay_audit.json').resolve()
+    default_output = 'ranking_replay_audit.json' if args.ranking_replay else 'evidence_replay_audit.json'
+    output = (args.output or replay_root / 'quality' / default_output).resolve()
     if baseline_root == replay_root or output.is_relative_to(baseline_root) or output.exists():
         parser.error('choose a distinct replay Run and an unused audit path outside the baseline')
     receipt = {'created_utc': datetime.now(timezone.utc).isoformat(), 'code_sha256': digest(__file__),
@@ -242,11 +400,18 @@ def main():
         selected_count = sum(len(candidates) for _, _, candidates, _ in replay.values())
         require(len(baseline) == len(replay) == args.expected_holo and selected_count == args.expected_candidates,
                 'unexpected target or inspected candidate count')
-        source_count = compare_cases(baseline, replay)
-        require(source_count == args.expected_sources, f'unexpected frozen candidate source count: {source_count}')
+        if args.ranking_replay:
+            ranking_configs(baseline_root, replay_root, seconds)
+            receipt['ranking'], ranks_by_target = compare_ranking(baseline, replay)
+            source_count = receipt['ranking']['counts'].get('overlap_fixed', 0)
+        else:
+            source_count = compare_cases(baseline, replay)
+            require(source_count == args.expected_sources, f'unexpected frozen candidate source count: {source_count}')
         old_pairs, pairs = delivered_pairs(baseline), delivered_pairs(replay)
         old_holo, now_holo = {h for h, _ in old_pairs}, {h for h, _ in pairs}
         targets = [(holo.upper(), candidate.upper()) for holo, candidate in args.target]
+        if args.ranking_replay:
+            targets = list(dict.fromkeys([*targets, *RANKING_REFERENCE_REQUESTS]))
         receipt.update(shards=shards, holo=len(replay), candidates=selected_count, fixed_sources=source_count,
                        prior_holo=len(old_holo), replay_holo=len(now_holo), prior_pairs=len(old_pairs),
                        replay_pairs=len(pairs), prior_delivery_copies=delivered_copy_count(baseline),
@@ -254,8 +419,16 @@ def main():
                        new_holo=sorted(now_holo - old_holo), lost_holo=sorted(old_holo - now_holo),
                        new_pairs=sorted(pairs - old_pairs), lost_pairs=sorted(old_pairs - pairs),
                        targets=target_outcomes(replay, pairs, targets), literature=literature,
-                       baseline_literature=baseline_literature, shard_seconds=seconds,
-                       relation_changes=relation_changes(baseline, replay))
+                       baseline_literature=baseline_literature, shard_seconds=seconds)
+        if args.ranking_replay:
+            receipt.update(retained_holo=sorted(now_holo & old_holo), net_holo=len(now_holo) - len(old_holo),
+                           retained_pairs=sorted(pairs & old_pairs),
+                           controls=check_ranking_controls(baseline, replay, pairs, ranks_by_target))
+            for row in receipt['targets']:
+                for match in row['matches']:
+                    match['rrf_rank'] = ranks_by_target[match['target']].get(row['candidate'])
+        else:
+            receipt['relation_changes'] = relation_changes(baseline, replay)
         for sample, result, candidates, _ in replay.values():
             seen = set()
             for delivery in result['deliveries']:
